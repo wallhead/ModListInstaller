@@ -50,6 +50,14 @@ The `Start` button runs the install pipeline on a background thread:
 - automatically run a second extraction pass when a split `.7z.001` contains one inner `.7z`
 - extract with bundled 7-Zip into the selected install folder
 
+The GUI is organized as a three-step wizard:
+
+- welcome page
+- folder selection page
+- download and validation page
+
+The welcome text is intentionally placeholder copy for now.
+
 The default build reports a clear error until libtorrent-rasterbar is linked with `xmake f --use_libtorrent=y`.
 
 ## Ready Binary

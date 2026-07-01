@@ -13,6 +13,10 @@ Put exactly one `.torrent` file in `InstallerApp/dist/package`, then run the exe
 ## Current Features
 
 - Native Windows GUI.
+- Three-step wizard with Previous/Next navigation.
+- Welcome page with placeholder greeting text.
+- Folder selection page.
+- Download and validation page.
 - Auto-detects one `.torrent` from the `package` folder.
 - Torrent download through libtorrent-rasterbar.
 - DHT, PEX, and local service discovery enabled.

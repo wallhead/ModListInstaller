@@ -39,18 +39,34 @@ constexpr int kStatusLabel = 1011;
 constexpr int kPauseButton = 1012;
 constexpr int kStopButton = 1013;
 constexpr int kUnpackButton = 1014;
+constexpr int kPreviousButton = 1015;
+constexpr int kNextButton = 1016;
 
 constexpr UINT kLogMessage = WM_APP + 1;
 constexpr UINT kProgressMessage = WM_APP + 2;
 constexpr UINT kWorkerFinishedMessage = WM_APP + 3;
 constexpr UINT kStatusMessage = WM_APP + 4;
 
+enum class WizardPage {
+  Welcome,
+  Folders,
+  Activity,
+};
+
 HINSTANCE g_instance = nullptr;
+HWND g_stepLabel = nullptr;
+HWND g_welcomeTitle = nullptr;
+HWND g_welcomeBody = nullptr;
+HWND g_downloadLabel = nullptr;
+HWND g_installLabel = nullptr;
 HWND g_downloadEdit = nullptr;
 HWND g_installEdit = nullptr;
 HWND g_logEdit = nullptr;
 HWND g_progress = nullptr;
 HWND g_statusLabel = nullptr;
+HWND g_previousButton = nullptr;
+HWND g_nextButton = nullptr;
+WizardPage g_page = WizardPage::Welcome;
 std::atomic_bool g_workerRunning{false};
 std::atomic_bool g_closeAfterWorker{false};
 std::mutex g_downloaderMutex;
@@ -207,30 +223,65 @@ HWND CreateButton(HWND parent, int id, const wchar_t* text, int x, int y, int wi
                          x, y, width, height, parent, reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), g_instance, nullptr);
 }
 
+void ShowControl(HWND hwnd, bool visible) {
+  if (hwnd != nullptr) {
+    ShowWindow(hwnd, visible ? SW_SHOW : SW_HIDE);
+  }
+}
+
+void ShowControl(HWND parent, int id, bool visible) {
+  ShowControl(GetDlgItem(parent, id), visible);
+}
+
+std::wstring WizardPageTitle(WizardPage page) {
+  switch (page) {
+    case WizardPage::Welcome:
+      return L"Step 1 of 3 - Welcome";
+    case WizardPage::Folders:
+      return L"Step 2 of 3 - Folders";
+    case WizardPage::Activity:
+      return L"Step 3 of 3 - Download and validation";
+  }
+  return L"Modlist Installer";
+}
+
 void Layout(HWND hwnd) {
   RECT rect{};
   GetClientRect(hwnd, &rect);
   const int width = rect.right - rect.left;
+  const int height = rect.bottom - rect.top;
   const int margin = 16;
-  const int labelWidth = 105;
+  const int navY = height - 48;
+  const int labelWidth = 115;
   const int buttonWidth = 88;
   const int rowHeight = 25;
   const int editX = margin + labelWidth;
   const int editWidth = width - editX - buttonWidth - margin * 2;
   const int buttonX = editX + editWidth + 8;
 
-  MoveWindow(GetDlgItem(hwnd, kDownloadEdit), editX, 22, editWidth, rowHeight, TRUE);
-  MoveWindow(GetDlgItem(hwnd, kDownloadBrowse), buttonX, 22, buttonWidth, rowHeight, TRUE);
-  MoveWindow(GetDlgItem(hwnd, kInstallEdit), editX, 57, editWidth, rowHeight, TRUE);
-  MoveWindow(GetDlgItem(hwnd, kInstallBrowse), buttonX, 57, buttonWidth, rowHeight, TRUE);
-  MoveWindow(GetDlgItem(hwnd, kValidateButton), editX, 96, 120, 30, TRUE);
-  MoveWindow(GetDlgItem(hwnd, kStartButton), editX + 132, 96, 120, 30, TRUE);
-  MoveWindow(GetDlgItem(hwnd, kUnpackButton), editX + 264, 96, 120, 30, TRUE);
-  MoveWindow(GetDlgItem(hwnd, kPauseButton), editX + 396, 96, 120, 30, TRUE);
-  MoveWindow(GetDlgItem(hwnd, kStopButton), editX + 528, 96, 92, 30, TRUE);
-  MoveWindow(g_progress, margin, 142, width - margin * 2, 20, TRUE);
-  MoveWindow(g_statusLabel, margin, 170, width - margin * 2, 22, TRUE);
-  MoveWindow(g_logEdit, margin, 202, width - margin * 2, rect.bottom - 218, TRUE);
+  MoveWindow(g_stepLabel, margin, 18, width - margin * 2, 24, TRUE);
+
+  MoveWindow(g_welcomeTitle, margin, 92, width - margin * 2, 38, TRUE);
+  MoveWindow(g_welcomeBody, margin, 146, width - margin * 2, 90, TRUE);
+
+  MoveWindow(g_downloadLabel, margin, 112, labelWidth, 20, TRUE);
+  MoveWindow(GetDlgItem(hwnd, kDownloadEdit), editX, 108, editWidth, rowHeight, TRUE);
+  MoveWindow(GetDlgItem(hwnd, kDownloadBrowse), buttonX, 108, buttonWidth, rowHeight, TRUE);
+  MoveWindow(g_installLabel, margin, 154, labelWidth, 20, TRUE);
+  MoveWindow(GetDlgItem(hwnd, kInstallEdit), editX, 150, editWidth, rowHeight, TRUE);
+  MoveWindow(GetDlgItem(hwnd, kInstallBrowse), buttonX, 150, buttonWidth, rowHeight, TRUE);
+
+  MoveWindow(GetDlgItem(hwnd, kValidateButton), margin, 70, 120, 30, TRUE);
+  MoveWindow(GetDlgItem(hwnd, kStartButton), margin + 132, 70, 120, 30, TRUE);
+  MoveWindow(GetDlgItem(hwnd, kUnpackButton), margin + 264, 70, 120, 30, TRUE);
+  MoveWindow(GetDlgItem(hwnd, kPauseButton), margin + 396, 70, 120, 30, TRUE);
+  MoveWindow(GetDlgItem(hwnd, kStopButton), margin + 528, 70, 92, 30, TRUE);
+  MoveWindow(g_progress, margin, 118, width - margin * 2, 20, TRUE);
+  MoveWindow(g_statusLabel, margin, 146, width - margin * 2, 22, TRUE);
+  MoveWindow(g_logEdit, margin, 178, width - margin * 2, navY - 194, TRUE);
+
+  MoveWindow(g_previousButton, width - 228, navY, 100, 30, TRUE);
+  MoveWindow(g_nextButton, width - 116, navY, 100, 30, TRUE);
 }
 
 modlist::Result<modlist::PackageDiscovery> ReadPackageFromUi() {
@@ -415,6 +466,68 @@ std::wstring FormatDownloadStatus(const modlist::DownloadStatus& status) {
         << L" / " << FormatBytes(static_cast<uintmax_t>(status.totalBytes));
   }
   return out.str();
+}
+
+void ShowWizardPage(HWND hwnd, WizardPage page) {
+  g_page = page;
+  SetText(g_stepLabel, WizardPageTitle(page));
+
+  const bool welcome = page == WizardPage::Welcome;
+  const bool folders = page == WizardPage::Folders;
+  const bool activity = page == WizardPage::Activity;
+  const bool running = g_workerRunning.load();
+
+  ShowControl(g_welcomeTitle, welcome);
+  ShowControl(g_welcomeBody, welcome);
+
+  ShowControl(g_downloadLabel, folders);
+  ShowControl(hwnd, kDownloadEdit, folders);
+  ShowControl(hwnd, kDownloadBrowse, folders);
+  ShowControl(g_installLabel, folders);
+  ShowControl(hwnd, kInstallEdit, folders);
+  ShowControl(hwnd, kInstallBrowse, folders);
+
+  ShowControl(hwnd, kValidateButton, activity);
+  ShowControl(hwnd, kStartButton, activity);
+  ShowControl(hwnd, kUnpackButton, activity);
+  ShowControl(hwnd, kPauseButton, activity);
+  ShowControl(hwnd, kStopButton, activity);
+  ShowControl(g_progress, activity);
+  ShowControl(g_statusLabel, activity);
+  ShowControl(g_logEdit, activity);
+
+  EnableWindow(g_previousButton, page != WizardPage::Welcome && !running);
+  EnableWindow(g_nextButton, page != WizardPage::Activity && !running);
+
+  EnableWindow(GetDlgItem(hwnd, kDownloadBrowse), folders && !running);
+  EnableWindow(GetDlgItem(hwnd, kInstallBrowse), folders && !running);
+  EnableWindow(GetDlgItem(hwnd, kValidateButton), activity && !running);
+  EnableWindow(GetDlgItem(hwnd, kStartButton), activity && !running);
+  EnableWindow(GetDlgItem(hwnd, kUnpackButton), activity && !running);
+  EnableWindow(GetDlgItem(hwnd, kPauseButton), activity && running);
+  EnableWindow(GetDlgItem(hwnd, kStopButton), activity && running);
+}
+
+void GoToPreviousPage(HWND hwnd) {
+  if (g_workerRunning) {
+    return;
+  }
+  if (g_page == WizardPage::Folders) {
+    ShowWizardPage(hwnd, WizardPage::Welcome);
+  } else if (g_page == WizardPage::Activity) {
+    ShowWizardPage(hwnd, WizardPage::Folders);
+  }
+}
+
+void GoToNextPage(HWND hwnd) {
+  if (g_workerRunning) {
+    return;
+  }
+  if (g_page == WizardPage::Welcome) {
+    ShowWizardPage(hwnd, WizardPage::Folders);
+  } else if (g_page == WizardPage::Folders) {
+    ShowWizardPage(hwnd, WizardPage::Activity);
+  }
 }
 
 void FinishWorker(HWND hwnd, const std::shared_ptr<modlist::LibtorrentDownloader>& downloader) {
@@ -740,14 +853,9 @@ void ValidatePackage() {
 }
 
 void SetControlsRunning(HWND hwnd, bool running) {
-  EnableWindow(GetDlgItem(hwnd, kStartButton), running ? FALSE : TRUE);
-  EnableWindow(GetDlgItem(hwnd, kValidateButton), running ? FALSE : TRUE);
-  EnableWindow(GetDlgItem(hwnd, kUnpackButton), running ? FALSE : TRUE);
-  EnableWindow(GetDlgItem(hwnd, kDownloadBrowse), running ? FALSE : TRUE);
-  EnableWindow(GetDlgItem(hwnd, kInstallBrowse), running ? FALSE : TRUE);
-  EnableWindow(GetDlgItem(hwnd, kPauseButton), running ? TRUE : FALSE);
-  EnableWindow(GetDlgItem(hwnd, kStopButton), running ? TRUE : FALSE);
+  (void)running;
   SetWindowTextW(GetDlgItem(hwnd, kPauseButton), L"Pause");
+  ShowWizardPage(hwnd, g_page);
 }
 
 std::shared_ptr<modlist::LibtorrentDownloader> ActiveDownloader() {
@@ -875,6 +983,7 @@ void UnpackOnly(HWND hwnd) {
     return;
   }
 
+  g_workerRunning = true;
   SetControlsRunning(hwnd, true);
   g_closeAfterWorker = false;
   std::thread(RunUnpackWorker, hwnd, *archive, installFolder).detach();
@@ -892,8 +1001,11 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
       std::filesystem::create_directories(DownloadsFolder());
       std::filesystem::create_directories(ExeFolder() / "tools" / "7zip");
 
-      CreateLabel(hwnd, L"Download", 16, 26, 100, 20);
-      CreateLabel(hwnd, L"Install", 16, 61, 100, 20);
+      g_stepLabel = CreateLabel(hwnd, L"", 16, 18, 720, 24);
+      g_welcomeTitle = CreateLabel(hwnd, L"Modlist Installer", 16, 92, 720, 38);
+      g_welcomeBody = CreateLabel(hwnd, L"Welcome text will be added later.", 16, 146, 720, 90);
+      g_downloadLabel = CreateLabel(hwnd, L"Download", 16, 112, 100, 20);
+      g_installLabel = CreateLabel(hwnd, L"Install", 16, 154, 100, 20);
       g_downloadEdit = CreateEdit(hwnd, kDownloadEdit, 120, 22, 420, 25);
       g_installEdit = CreateEdit(hwnd, kInstallEdit, 120, 57, 420, 25);
       CreateButton(hwnd, kDownloadBrowse, L"Browse", 550, 22, 88, 25);
@@ -903,6 +1015,8 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
       CreateButton(hwnd, kUnpackButton, L"Unpack", 384, 96, 120, 30);
       CreateButton(hwnd, kPauseButton, L"Pause", 516, 96, 120, 30);
       CreateButton(hwnd, kStopButton, L"Stop", 648, 96, 92, 30);
+      g_previousButton = CreateButton(hwnd, kPreviousButton, L"Previous", 632, 450, 100, 30);
+      g_nextButton = CreateButton(hwnd, kNextButton, L"Next", 744, 450, 100, 30);
       g_progress = CreateWindowExW(0, PROGRESS_CLASSW, L"", WS_CHILD | WS_VISIBLE,
                                    16, 142, 622, 20, hwnd,
                                    reinterpret_cast<HMENU>(static_cast<INT_PTR>(kProgress)), g_instance, nullptr);
@@ -933,7 +1047,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
       }
       AppendLog(L"Use a short install path near the drive root, for example D:\\Sky.");
       Layout(hwnd);
-      SetControlsRunning(hwnd, false);
+      ShowWizardPage(hwnd, WizardPage::Welcome);
       return 0;
     }
     case WM_SIZE:
@@ -959,6 +1073,10 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
         TogglePause(hwnd);
       } else if (id == kStopButton) {
         StopInstall();
+      } else if (id == kPreviousButton) {
+        GoToPreviousPage(hwnd);
+      } else if (id == kNextButton) {
+        GoToNextPage(hwnd);
       }
       return 0;
     }
