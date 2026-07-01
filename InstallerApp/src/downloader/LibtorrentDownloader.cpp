@@ -3,6 +3,7 @@
 #if defined(MODLIST_HAVE_LIBTORRENT)
 #include <libtorrent/add_torrent_params.hpp>
 #include <libtorrent/magnet_uri.hpp>
+#include <libtorrent/posix_disk_io.hpp>
 #include <libtorrent/session.hpp>
 #include <libtorrent/session_params.hpp>
 #include <libtorrent/settings_pack.hpp>
@@ -27,11 +28,13 @@ lt::session MakeSession() {
   settings.set_int(lt::settings_pack::connections_limit, 80);
   settings.set_int(lt::settings_pack::aio_threads, 2);
   settings.set_int(lt::settings_pack::hashing_threads, 1);
-  settings.set_int(lt::settings_pack::checking_mem_usage, 512);
-  settings.set_int(lt::settings_pack::max_queued_disk_bytes, 16 * 1024 * 1024);
+  settings.set_int(lt::settings_pack::checking_mem_usage, 64);
+  settings.set_int(lt::settings_pack::max_queued_disk_bytes, 4 * 1024 * 1024);
   settings.set_int(lt::settings_pack::disk_io_read_mode, lt::settings_pack::disable_os_cache);
   settings.set_int(lt::settings_pack::disk_io_write_mode, lt::settings_pack::write_through);
-  return lt::session(settings);
+  lt::session_params params(settings);
+  params.disk_io_constructor = lt::posix_disk_io_constructor;
+  return lt::session(std::move(params));
 }
 
 }  // namespace
