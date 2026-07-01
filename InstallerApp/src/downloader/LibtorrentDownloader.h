@@ -16,6 +16,7 @@ public:
   ~LibtorrentDownloader() override;
 
   void Start(const DownloadConfig& config) override;
+  void StartLocalValidation(const DownloadConfig& config);
   void Cancel() override;
   void Pause() override;
   void Resume() override;

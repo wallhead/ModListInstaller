@@ -267,11 +267,7 @@ std::filesystem::path ExeFolder() {
 }
 
 std::filesystem::path PackageFolder() {
-  return ExeFolder() / "package";
-}
-
-std::filesystem::path DownloadsFolder() {
-  return ExeFolder() / "downloads";
+  return ExeFolder();
 }
 
 void WriteLastSevenZipLog(const std::string& output) {
@@ -600,7 +596,7 @@ std::wstring WizardPageTitle(WizardPage page) {
     case WizardPage::Folders:
       return L"Step 2 of 3 - Folders";
     case WizardPage::Activity:
-      return L"Step 3 of 3 - Download and validation";
+      return L"Step 3 of 3 - Validation and install";
   }
   return L"Modlist Installer";
 }
@@ -631,18 +627,18 @@ void Layout(HWND hwnd) {
   MoveWindow(g_downloadLabel, contentX, 94, labelWidth, 20, TRUE);
   MoveWindow(GetDlgItem(hwnd, kDownloadEdit), editX, 90, editWidth, rowHeight, TRUE);
   MoveWindow(GetDlgItem(hwnd, kDownloadBrowse), buttonX, 90, buttonWidth, rowHeight, TRUE);
-  MoveWindow(g_unpackDriveLabel, contentX, 136, labelWidth, 20, TRUE);
-  MoveWindow(g_unpackDriveCombo, editX, 132, 120, 180, TRUE);
-  MoveWindow(g_unpackTargetLabel, editX + 136, 136, editWidth - 136 + buttonWidth + 8, 20, TRUE);
-  MoveWindow(g_installLabel, contentX, 178, labelWidth, 20, TRUE);
-  MoveWindow(GetDlgItem(hwnd, kInstallEdit), editX, 174, editWidth, rowHeight, TRUE);
-  MoveWindow(GetDlgItem(hwnd, kInstallBrowse), buttonX, 174, buttonWidth, rowHeight, TRUE);
+  MoveWindow(g_unpackDriveLabel, contentX, 94, labelWidth, 20, TRUE);
+  MoveWindow(g_unpackDriveCombo, editX, 90, 120, 180, TRUE);
+  MoveWindow(g_unpackTargetLabel, editX + 136, 94, editWidth - 136 + buttonWidth + 8, 20, TRUE);
+  MoveWindow(g_installLabel, contentX, 136, labelWidth, 20, TRUE);
+  MoveWindow(GetDlgItem(hwnd, kInstallEdit), editX, 132, editWidth, rowHeight, TRUE);
+  MoveWindow(GetDlgItem(hwnd, kInstallBrowse), buttonX, 132, buttonWidth, rowHeight, TRUE);
 
   MoveWindow(GetDlgItem(hwnd, kValidateButton), contentX, 74, 120, 30, TRUE);
   MoveWindow(GetDlgItem(hwnd, kStartButton), contentX + 132, 74, 120, 30, TRUE);
   MoveWindow(GetDlgItem(hwnd, kUnpackButton), contentX + 264, 74, 120, 30, TRUE);
   MoveWindow(GetDlgItem(hwnd, kPauseButton), contentX + 396, 74, 120, 30, TRUE);
-  MoveWindow(GetDlgItem(hwnd, kStopButton), contentX + 528, 74, 92, 30, TRUE);
+  MoveWindow(GetDlgItem(hwnd, kStopButton), contentX + 264, 74, 92, 30, TRUE);
   MoveWindow(g_progress, contentX, 122, contentWidth, 20, TRUE);
   MoveWindow(g_statusLabel, contentX, 150, contentWidth, 22, TRUE);
   MoveWindow(g_logEdit, contentX, 182, contentWidth, navY - 198, TRUE);
@@ -822,12 +818,7 @@ bool HasEnoughSpace(const std::filesystem::path& folder, uintmax_t requiredBytes
 std::wstring FormatDownloadStatus(const modlist::DownloadStatus& status) {
   std::wostringstream out;
   out << StageToText(status.stage)
-      << L" | " << static_cast<int>(status.progress * 100.0f) << L"%"
-      << L" | Down " << FormatBytesPerSecond(status.downloadRateBytesPerSecond)
-      << L" | Up " << FormatBytesPerSecond(status.uploadRateBytesPerSecond)
-      << L" | Seeds " << status.seedCount
-      << L" | Peers " << status.peerCount
-      << L" | ETA " << FormatEta(status.etaSeconds);
+      << L" | " << static_cast<int>(status.progress * 100.0f) << L"%";
   if (status.totalBytes > 0) {
     out << L" | " << FormatBytes(static_cast<uintmax_t>(status.downloadedBytes))
         << L" / " << FormatBytes(static_cast<uintmax_t>(status.totalBytes));
@@ -847,9 +838,9 @@ void ShowWizardPage(HWND hwnd, WizardPage page) {
   ShowControl(g_welcomeTitle, welcome);
   ShowControl(g_welcomeBody, welcome);
 
-  ShowControl(g_downloadLabel, folders);
-  ShowControl(hwnd, kDownloadEdit, folders);
-  ShowControl(hwnd, kDownloadBrowse, folders);
+  ShowControl(g_downloadLabel, false);
+  ShowControl(hwnd, kDownloadEdit, false);
+  ShowControl(hwnd, kDownloadBrowse, false);
   ShowControl(g_unpackDriveLabel, folders);
   ShowControl(g_unpackDriveCombo, folders);
   ShowControl(g_unpackTargetLabel, folders);
@@ -859,8 +850,8 @@ void ShowWizardPage(HWND hwnd, WizardPage page) {
 
   ShowControl(hwnd, kValidateButton, activity);
   ShowControl(hwnd, kStartButton, activity);
-  ShowControl(hwnd, kUnpackButton, activity);
-  ShowControl(hwnd, kPauseButton, activity);
+  ShowControl(hwnd, kUnpackButton, false);
+  ShowControl(hwnd, kPauseButton, false);
   ShowControl(hwnd, kStopButton, activity);
   ShowControl(g_progress, activity);
   ShowControl(g_statusLabel, activity);
@@ -869,13 +860,13 @@ void ShowWizardPage(HWND hwnd, WizardPage page) {
   EnableWindow(g_previousButton, page != WizardPage::Welcome && !running);
   EnableWindow(g_nextButton, page != WizardPage::Activity && !running);
 
-  EnableWindow(GetDlgItem(hwnd, kDownloadBrowse), folders && !running);
+  EnableWindow(GetDlgItem(hwnd, kDownloadBrowse), false);
   EnableWindow(g_unpackDriveCombo, folders && !running);
   EnableWindow(GetDlgItem(hwnd, kInstallBrowse), folders && !running);
   EnableWindow(GetDlgItem(hwnd, kValidateButton), activity && !running);
   EnableWindow(GetDlgItem(hwnd, kStartButton), activity && !running);
-  EnableWindow(GetDlgItem(hwnd, kUnpackButton), activity && !running);
-  EnableWindow(GetDlgItem(hwnd, kPauseButton), activity && running);
+  EnableWindow(GetDlgItem(hwnd, kUnpackButton), false);
+  EnableWindow(GetDlgItem(hwnd, kPauseButton), false);
   EnableWindow(GetDlgItem(hwnd, kStopButton), activity && running);
 }
 
@@ -987,7 +978,9 @@ bool ExtractArchiveChain(HWND hwnd,
                          modlist::SevenZipExtractor& extractor,
                          const std::filesystem::path& sevenZipExe,
                          std::filesystem::path archiveFirstPart,
-                         std::filesystem::path installFolder) {
+                         std::filesystem::path installFolder,
+                         int progressBase = 0,
+                         int progressSpan = 100) {
   modlist::ExtractionConfig extraction;
   extraction.sevenZipExe = sevenZipExe;
   extraction.archiveFirstPart = std::move(archiveFirstPart);
@@ -995,8 +988,8 @@ bool ExtractArchiveChain(HWND hwnd,
   extraction.useSameDiskTemp = true;
 
   const bool splitArchive = IsFirstSplitArchivePart(extraction.archiveFirstPart);
-  const int firstSpan = splitArchive ? 50 : 100;
-  if (!RunExtractionStep(hwnd, extractor, extraction, L"Unpacking", 0, firstSpan)) {
+  const int firstSpan = splitArchive ? progressSpan / 2 : progressSpan;
+  if (!RunExtractionStep(hwnd, extractor, extraction, L"Unpacking", progressBase, firstSpan)) {
     return false;
   }
 
@@ -1012,100 +1005,57 @@ bool ExtractArchiveChain(HWND hwnd,
   PostLog(hwnd, L"Detected inner archive, starting second extraction: " + PathToDisplay(innerArchives.front()));
   extraction.archiveFirstPart = innerArchives.front();
   extraction.installFolder = innerArchives.front().parent_path();
-  return RunExtractionStep(hwnd, extractor, extraction, L"Unpacking inner archive", 50, 50);
+  const int secondSpan = progressSpan - firstSpan;
+  return RunExtractionStep(hwnd, extractor, extraction, L"Unpacking inner archive", progressBase + firstSpan, secondSpan);
 }
 
 void RunInstallWorker(HWND hwnd,
                       modlist::PackageDiscovery package,
-                      std::filesystem::path downloadFolder,
                       std::filesystem::path unpackFolder,
                       std::filesystem::path installFolder,
                       std::shared_ptr<modlist::LibtorrentDownloader> downloader) {
   g_workerRunning = true;
   PostProgress(hwnd, 0);
-  PostLog(hwnd, L"Starting torrent download...");
-  PostLog(hwnd, L"Existing files in the selected download folder will be checked before downloading.");
+  PostLog(hwnd, L"Starting local package validation...");
+  PostLog(hwnd, L"The torrent will validate files already beside the installer. Missing files stop the install.");
 
   modlist::DownloadConfig config;
   config.torrent.type = modlist::TorrentSourceType::TorrentFile;
   config.torrent.source = package.torrentFile.string();
-  config.downloadFolder = std::move(downloadFolder);
-  config.features.enableDht = true;
-  config.features.enablePex = true;
-  config.features.enableLsd = true;
+  config.downloadFolder = PackageFolder();
+  config.features.enableDht = false;
+  config.features.enablePex = false;
+  config.features.enableLsd = false;
 
-  downloader->Start(config);
-
+  downloader->StartLocalValidation(config);
   modlist::DownloadStage lastStage = modlist::DownloadStage::Idle;
-  bool checkedTorrentSpace = false;
   while (true) {
     const auto status = downloader->GetStatus();
     if (status.stage != lastStage) {
       lastStage = status.stage;
-      PostLog(hwnd, L"Torrent stage: " + StageToText(status.stage));
+      PostLog(hwnd, L"Validation stage: " + StageToText(status.stage));
     }
-    PostProgress(hwnd, static_cast<int>(status.progress * 100.0f));
+    PostProgress(hwnd, static_cast<int>(status.progress * 35.0f));
     PostStatus(hwnd, FormatDownloadStatus(status));
 
-    if (!checkedTorrentSpace && status.totalBytes > 0) {
-      checkedTorrentSpace = true;
-      const uintmax_t remaining = static_cast<uintmax_t>(status.totalBytes - status.downloadedBytes);
-      const uintmax_t free = FreeBytes(config.downloadFolder);
-      PostLog(hwnd, L"Download free space: " + FormatBytes(free) + L"; remaining torrent bytes: " + FormatBytes(remaining));
-      if (free < remaining) {
-        downloader->Cancel();
-        PostLog(hwnd, L"Not enough free space in the download folder.");
-        FinishWorker(hwnd, downloader);
-        return;
-      }
-    }
-
     if (status.stage == modlist::DownloadStage::Completed) {
+      PostLog(hwnd, L"Local package validation completed.");
       break;
     }
     if (status.stage == modlist::DownloadStage::Failed) {
-      PostLog(hwnd, L"Torrent error: " + Widen(status.error));
+      PostLog(hwnd, L"Validation error: " + Widen(status.error));
       FinishWorker(hwnd, downloader);
       return;
     }
     if (status.stage == modlist::DownloadStage::Cancelled) {
-      PostLog(hwnd, L"Torrent cancelled.");
+      PostLog(hwnd, L"Validation cancelled.");
       FinishWorker(hwnd, downloader);
       return;
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(500));
   }
 
-  PostLog(hwnd, L"Torrent finished. Validating downloaded files...");
-  downloader->ForceRecheck();
-  lastStage = modlist::DownloadStage::Idle;
-  while (true) {
-    const auto status = downloader->GetStatus();
-    if (status.stage != lastStage) {
-      lastStage = status.stage;
-      PostLog(hwnd, L"Torrent validation stage: " + StageToText(status.stage));
-    }
-    PostProgress(hwnd, static_cast<int>(status.progress * 100.0f));
-    PostStatus(hwnd, FormatDownloadStatus(status));
-
-    if (status.stage == modlist::DownloadStage::Completed) {
-      PostLog(hwnd, L"Download validation completed.");
-      break;
-    }
-    if (status.stage == modlist::DownloadStage::Failed) {
-      PostLog(hwnd, L"Torrent validation error: " + Widen(status.error));
-      FinishWorker(hwnd, downloader);
-      return;
-    }
-    if (status.stage == modlist::DownloadStage::Cancelled) {
-      PostLog(hwnd, L"Torrent validation cancelled.");
-      FinishWorker(hwnd, downloader);
-      return;
-    }
-    std::this_thread::sleep_for(std::chrono::milliseconds(500));
-  }
-
-  PostLog(hwnd, L"Torrent finished. Releasing downloaded files before unpacking...");
+  PostLog(hwnd, L"Releasing validated files before unpacking...");
   {
     std::lock_guard<std::mutex> lock(g_downloaderMutex);
     if (g_activeDownloader == downloader) {
@@ -1114,13 +1064,13 @@ void RunInstallWorker(HWND hwnd,
   }
   downloader->ReleaseFiles();
 
-  PostLog(hwnd, L"Torrent finished. Looking for first .7z.001 archive part...");
+  PostLog(hwnd, L"Looking for first .7z.001 archive part...");
   auto firstArchivePart = package.firstArchivePart;
   if (!firstArchivePart.has_value()) {
-    firstArchivePart = FindFirstArchivePart(config.downloadFolder);
+    firstArchivePart = FindFirstArchivePart(PackageFolder());
   }
   if (!firstArchivePart.has_value()) {
-    PostLog(hwnd, L"No .7z.001 archive part found after download. Cannot extract automatically.");
+    PostLog(hwnd, L"No .7z.001 archive part found beside the installer. Cannot extract automatically.");
     FinishWorker(hwnd, downloader);
     return;
   }
@@ -1146,7 +1096,7 @@ void RunInstallWorker(HWND hwnd,
     return;
   }
 
-  const bool extracted = ExtractArchiveChain(hwnd, extractor, sevenZip.value(), *firstArchivePart, std::move(unpackFolder));
+  const bool extracted = ExtractArchiveChain(hwnd, extractor, sevenZip.value(), *firstArchivePart, std::move(unpackFolder), 35, 65);
   PostProgress(hwnd, extracted ? 100 : 0);
   FinishWorker(hwnd, downloader);
 }
@@ -1154,19 +1104,6 @@ void RunInstallWorker(HWND hwnd,
 bool ValidateFolders(uintmax_t knownRequiredBytes = 0) {
   modlist::PathValidator validator;
   bool ok = true;
-
-  const auto downloadText = GetText(g_downloadEdit);
-  if (!downloadText.empty()) {
-    const auto result = validator.ValidateDownloadFolder(std::filesystem::path(downloadText), knownRequiredBytes);
-    AppendLog(L"Download folder: " + Widen(result.message));
-    if (result.warning) {
-      AppendLog(L"Warning: " + Widen(result.message));
-    }
-    ok = ok && result.ok;
-  } else {
-    AppendLog(L"Download folder: not selected yet.");
-    ok = false;
-  }
 
   const auto installText = GetText(g_installEdit);
   const auto unpackFolder = SelectedUnpackFolder();
@@ -1194,15 +1131,6 @@ bool ValidateFolders(uintmax_t knownRequiredBytes = 0) {
     ok = false;
   }
 
-  if (!downloadText.empty() && !unpackFolder.empty()) {
-    if (!validator.IsSameDrive(std::filesystem::path(downloadText), unpackFolder)) {
-      AppendLog(L"Note: download and unpack folders are on different drives. Extraction temp will stay under the unpack folder.");
-    }
-  }
-
-  if (!downloadText.empty() && !HasEnoughSpace(std::filesystem::path(downloadText), knownRequiredBytes, L"Download folder")) {
-    ok = false;
-  }
   if (!unpackFolder.empty() && !HasEnoughSpace(unpackFolder, knownRequiredBytes, L"Unpack folder")) {
     ok = false;
   }
@@ -1226,7 +1154,7 @@ void ValidatePackage() {
   if (package.value().firstArchivePart.has_value()) {
     AppendLog(L"Archive first part: " + PathToDisplay(*package.value().firstArchivePart));
   } else {
-    AppendLog(L"No .7z.001 found next to the torrent yet. That is OK before download.");
+    AppendLog(L"No .7z.001 found beside the installer.");
   }
 
   const uintmax_t knownRequiredBytes = EstimateRequiredBytes(package.value());
@@ -1256,7 +1184,7 @@ std::shared_ptr<modlist::LibtorrentDownloader> ActiveDownloader() {
 void TogglePause(HWND hwnd) {
   auto downloader = ActiveDownloader();
   if (!downloader) {
-    AppendLog(L"No active download to pause.");
+    AppendLog(L"No active validation to pause.");
     return;
   }
 
@@ -1264,22 +1192,22 @@ void TogglePause(HWND hwnd) {
   if (status.stage == modlist::DownloadStage::Paused) {
     downloader->Resume();
     SetWindowTextW(GetDlgItem(hwnd, kPauseButton), L"Pause");
-    AppendLog(L"Download resumed.");
+    AppendLog(L"Validation resumed.");
   } else {
     downloader->Pause();
     SetWindowTextW(GetDlgItem(hwnd, kPauseButton), L"Resume");
-    AppendLog(L"Download paused.");
+    AppendLog(L"Validation paused.");
   }
 }
 
 void StopInstall() {
   auto downloader = ActiveDownloader();
   if (!downloader) {
-    AppendLog(L"No active download to stop.");
+    AppendLog(L"No active validation to stop.");
     return;
   }
   downloader->Cancel();
-  AppendLog(L"Stopping download. Existing files are left in the download folder.");
+  AppendLog(L"Stopping validation. Existing package files are left untouched.");
 }
 
 void StartInstall(HWND hwnd) {
@@ -1299,7 +1227,6 @@ void StartInstall(HWND hwnd) {
     return;
   }
 
-  const auto downloadFolder = std::filesystem::path(GetText(g_downloadEdit));
   const auto unpackFolder = SelectedUnpackFolder();
   const auto installFolder = std::filesystem::path(GetText(g_installEdit));
   auto downloader = std::make_shared<modlist::LibtorrentDownloader>();
@@ -1310,7 +1237,7 @@ void StartInstall(HWND hwnd) {
   g_workerRunning = true;
   SetControlsRunning(hwnd, true);
   g_closeAfterWorker = false;
-  std::thread(RunInstallWorker, hwnd, std::move(package.value()), downloadFolder, unpackFolder, installFolder, downloader).detach();
+  std::thread(RunInstallWorker, hwnd, std::move(package.value()), unpackFolder, installFolder, downloader).detach();
 }
 
 void RunUnpackWorker(HWND hwnd, std::filesystem::path archiveFirstPart, std::filesystem::path unpackFolder) {
@@ -1351,11 +1278,10 @@ void UnpackOnly(HWND hwnd) {
     return;
   }
 
-  const auto downloadFolder = std::filesystem::path(GetText(g_downloadEdit));
   const auto unpackFolder = SelectedUnpackFolder();
   const auto installFolder = std::filesystem::path(GetText(g_installEdit));
-  if (downloadFolder.empty() || unpackFolder.empty() || installFolder.empty()) {
-    AppendLog(L"Select download, unpack drive, and install folder before unpacking.");
+  if (unpackFolder.empty() || installFolder.empty()) {
+    AppendLog(L"Select unpack drive and install folder before unpacking.");
     return;
   }
 
@@ -1371,12 +1297,9 @@ void UnpackOnly(HWND hwnd) {
     return;
   }
 
-  auto archive = FindFirstArchivePart(downloadFolder);
+  auto archive = FindFirstArchivePart(PackageFolder());
   if (!archive.has_value()) {
-    archive = FindFirstArchivePart(PackageFolder());
-  }
-  if (!archive.has_value()) {
-    AppendLog(L"No .7z.001 archive part found in the download folder or package folder.");
+    AppendLog(L"No .7z.001 archive part found beside the installer.");
     return;
   }
 
@@ -1394,8 +1317,6 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
       controls.dwICC = ICC_PROGRESS_CLASS;
       InitCommonControlsEx(&controls);
       std::filesystem::create_directories(ExeFolder() / "logs");
-      std::filesystem::create_directories(PackageFolder());
-      std::filesystem::create_directories(DownloadsFolder());
       std::filesystem::create_directories(ExeFolder() / "tools" / "7zip");
       ApplyWindowFrameTheme(hwnd);
       g_contentBrush = CreateSolidBrush(kContentColor);
@@ -1411,7 +1332,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
       g_stepLabel = CreateLabel(hwnd, L"", 16, 18, 720, 24);
       g_welcomeTitle = CreateLabel(hwnd, L"Modlist Installer", 16, 92, 720, 38);
       g_welcomeBody = CreateLabel(hwnd, L"Welcome text will be added later.", 16, 146, 720, 90);
-      g_downloadLabel = CreateLabel(hwnd, L"Download", 16, 112, 100, 20);
+      g_downloadLabel = CreateLabel(hwnd, L"Package", 16, 112, 100, 20);
       g_unpackDriveLabel = CreateLabel(hwnd, L"Unpack drive", 16, 136, 100, 20);
       g_unpackTargetLabel = CreateLabel(hwnd, L"Target: choose a drive", 160, 136, 420, 20);
       g_installLabel = CreateLabel(hwnd, L"Install", 16, 178, 100, 20);
@@ -1421,7 +1342,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
       CreateButton(hwnd, kDownloadBrowse, L"Browse", 550, 22, 88, 25);
       CreateButton(hwnd, kInstallBrowse, L"Browse", 550, 57, 88, 25);
       CreateButton(hwnd, kValidateButton, L"Validate", 120, 96, 120, 30);
-      CreateButton(hwnd, kStartButton, L"Start", 252, 96, 120, 30);
+      CreateButton(hwnd, kStartButton, L"Install", 252, 96, 120, 30);
       CreateButton(hwnd, kUnpackButton, L"Unpack", 384, 96, 120, 30);
       CreateButton(hwnd, kPauseButton, L"Pause", 516, 96, 120, 30);
       CreateButton(hwnd, kStopButton, L"Stop", 648, 96, 92, 30);
@@ -1430,7 +1351,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
       g_progress = CreateWindowExW(0, PROGRESS_CLASSW, L"", WS_CHILD | WS_VISIBLE,
                                    16, 142, 622, 20, hwnd,
                                    reinterpret_cast<HMENU>(static_cast<INT_PTR>(kProgress)), g_instance, nullptr);
-      g_statusLabel = CreateWindowExW(0, L"STATIC", L"Idle | Down 0 B/s | Up 0 B/s | Seeds 0 | Peers 0 | ETA unknown",
+      g_statusLabel = CreateWindowExW(0, L"STATIC", L"Idle | Ready for local validation",
                                       WS_CHILD | WS_VISIBLE,
                                       16, 170, 622, 22, hwnd,
                                       reinterpret_cast<HMENU>(static_cast<INT_PTR>(kStatusLabel)), g_instance, nullptr);
@@ -1462,11 +1383,11 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
       SendMessageW(g_progress, PBM_SETRANGE, 0, MAKELPARAM(0, 100));
       SendMessageW(g_progress, PBM_SETBARCOLOR, 0, static_cast<LPARAM>(RGB(159, 196, 216)));
       SendMessageW(g_progress, PBM_SETBKCOLOR, 0, static_cast<LPARAM>(kContentColor));
-      SetText(g_downloadEdit, DownloadsFolder().wstring());
+      SetText(g_downloadEdit, PackageFolder().wstring());
       PopulateDriveCombo();
       SetText(g_installEdit, L"");
       AppendLog(L"App log: " + PathToDisplay(AppLogPath()));
-      AppendLog(L"Place exactly one .torrent file in: " + PathToDisplay(PackageFolder()));
+      AppendLog(L"Place exactly one .torrent file and all archive parts beside this exe: " + PathToDisplay(PackageFolder()));
       auto package = ReadPackageFromUi();
       if (package.ok()) {
         AppendLog(L"Found torrent: " + PathToDisplay(package.value().torrentFile));
@@ -1541,11 +1462,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
       return 0;
     case WM_COMMAND: {
       const int id = LOWORD(wParam);
-      if (id == kDownloadBrowse) {
-        if (auto path = PickFolder(hwnd)) {
-          SetText(g_downloadEdit, path->wstring());
-        }
-      } else if (id == kInstallBrowse) {
+      if (id == kInstallBrowse) {
         if (auto path = PickFolder(hwnd)) {
           SetText(g_installEdit, path->wstring());
         }
@@ -1592,7 +1509,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
         g_closeAfterWorker = true;
         StopInstall();
         SetWindowTextW(hwnd, L"Modlist Installer - stopping...");
-        AppendLog(L"Waiting for downloader to stop before closing.");
+        AppendLog(L"Waiting for validation to stop before closing.");
         return 0;
       }
       DestroyWindow(hwnd);

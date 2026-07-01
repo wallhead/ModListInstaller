@@ -8,7 +8,7 @@ The ready-to-run build is included at:
 InstallerApp/dist/modlist-installer.exe
 ```
 
-Put exactly one `.torrent` file in `InstallerApp/dist/package`, then run the exe. The app auto-detects that torrent, lets the user choose download and install folders, validates the torrent payload, and unpacks the downloaded archive with bundled 7-Zip.
+Put exactly one `.torrent` file and the complete multi-volume archive beside `modlist-installer.exe`, then run the exe. The app validates the local archive files against the torrent, then unpacks them with bundled 7-Zip.
 
 ## Current Features
 
@@ -18,19 +18,15 @@ Put exactly one `.torrent` file in `InstallerApp/dist/package`, then run the exe
 - Owner-drawn installer-style buttons with hover, pressed, focus, and disabled states.
 - Welcome page with placeholder greeting text.
 - Folder selection page.
-- Separate choices for download folder, unpack drive, and final install folder.
+- Separate choices for unpack drive and final install folder.
 - Unpack drive selection automatically resolves to `X:\Sky`.
-- Download and validation page.
-- Auto-detects one `.torrent` from the `package` folder.
-- Torrent download through libtorrent-rasterbar.
-- Torrent data is written to disk with bounded libtorrent queues; the installer does not load full payloads into RAM.
-- DHT, PEX, and local service discovery enabled.
-- Download progress, speed, seeds, peers, and ETA.
-- Pause, resume, and stop controls.
-- Reuses existing downloaded files when the same folder is selected again.
-- Force-rechecks torrent data after download before unpacking.
+- Validation and install page.
+- Auto-detects one `.torrent` beside the exe.
+- Validates local archive files through libtorrent-rasterbar without starting a network download.
+- Shows local validation progress before unpacking.
+- Stop control for active validation.
+- Force-checks torrent data before unpacking.
 - Releases torrent file handles before extraction.
-- Unpack-only button for already downloaded `.7z.001` archives.
 - Live unpack progress percentage.
 - Supports split `.7z.001` packages that contain an inner `.7z` archive.
 - Keeps full 7-Zip diagnostics in `dist/logs`, while the GUI log stays concise.
@@ -42,16 +38,15 @@ Put exactly one `.torrent` file in `InstallerApp/dist/package`, then run the exe
 ```text
 MyPack/
   modlist-installer.exe
-  package/
-    MyPack.torrent
+  MyPack.torrent
+  MyPack.7z.001
+  MyPack.7z.002
   tools/
     7zip/
       7z.exe
 ```
 
-Run `modlist-installer.exe`, choose a download folder, choose the drive to unpack to, choose the final install folder, then press `Start`. The unpack target is always generated as `<drive>:\Sky`.
-
-Use `Unpack` when the archive is already downloaded and you want to skip torrent validation/download.
+Run `modlist-installer.exe`, choose the drive to unpack to, choose the final install folder, then press `Install`. The unpack target is always generated as `<drive>:\Sky`.
 
 ## Build Setup
 

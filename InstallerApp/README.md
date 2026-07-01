@@ -28,24 +28,20 @@ The GUI executable is built as:
 InstallerApp\build\windows\x64\release\modlist-installer-gui.exe
 ```
 
-Copy it into `dist`, then put exactly one `.torrent` file in `dist\package`. The GUI does not ask for a torrent path; it automatically scans the package folder and requires exactly one `.torrent` file there.
+Copy it into `dist`, then put exactly one `.torrent` file and all archive parts beside the exe. The GUI does not ask for a torrent path; it automatically scans the exe folder and requires exactly one `.torrent` file there.
 
-The `Start` button runs the install pipeline on a background thread:
+The `Install` button runs the install pipeline on a background thread:
 
-- detect the torrent in the package folder
-- validate download, unpack, and install folders
+- detect the torrent beside the exe
+- validate unpack and install folders
 - check known archive size against free space when local archive parts are present
-- read total payload size directly from the `.torrent` file before downloading
-- check remaining torrent size against download free space once torrent metadata is available
-- start the torrent downloader
-- write torrent payloads to disk through bounded libtorrent queues instead of keeping full payloads in RAM
-- show progress, download speed, upload speed, seeds, peers, and ETA
-- pause/resume or stop the active download
-- force-check existing files when starting, so closing the exe mid-download and choosing the same download folder resumes after validation
-- force-recheck the completed torrent payload before extraction
+- read total payload size directly from the `.torrent` file
+- validate local archive files through libtorrent without starting a network download
+- show local validation progress
+- stop active validation
+- force-check torrent data before extraction
 - release torrent file handles before 7-Zip starts
-- unpack directly from an existing `.7z.001` with the `Unpack` button, skipping torrent validation/download
-- look for a `.7z.001` archive after download
+- look for a `.7z.001` archive beside the exe
 - check unpack free space again before extraction
 - show live unpack percentage in the progress bar and status line
 - stream full 7-Zip diagnostics to `dist\logs` while keeping only a small in-memory tail for the GUI
@@ -56,8 +52,8 @@ The `Start` button runs the install pipeline on a background thread:
 The GUI is organized as a three-step wizard:
 
 - welcome page
-- folder selection page with download folder, unpack drive, and final install folder
-- download and validation page
+- folder selection page with unpack drive and final install folder
+- validation and install page
 
 The window uses a dark Nordic-inspired color scheme with charcoal panels, cool grey text, icy blue accents, and owner-drawn buttons with hover/pressed/focus states. The welcome text is intentionally placeholder copy for now.
 
@@ -78,12 +74,12 @@ The runtime layout is:
 ```text
 InstallerApp\dist\
   modlist-installer.exe
-  package\
-    YourPack.torrent
+  YourPack.torrent
+  YourPack.7z.001
+  YourPack.7z.002
   tools\
     7zip\
       7z.exe
-  downloads\
   logs\
 ```
 
@@ -130,14 +126,6 @@ Place one of these in `InstallerApp/third_party/7zip/`:
 - `7za.exe`
 - `7zz.exe`
 
-## Try Manifest Validation
-
-```powershell
-InstallerApp/build/src/Debug/modlist-installer.exe InstallerApp/examples/example-manifest.json D:\Downloads D:\Sky
-```
-
-Use a short install path near the drive root. Avoid paths under `C:\Users\...` for Skyrim modlists.
-
 ## Simple Torrent Package Mode
 
 You can skip the manifest for a basic GUI package layout:
@@ -145,8 +133,9 @@ You can skip the manifest for a basic GUI package layout:
 ```text
 MyPack/
   modlist-installer.exe
-  package/
-    MyPack.torrent
+  MyPack.torrent
+  MyPack.7z.001
+  MyPack.7z.002
   tools/
     7zip/
       7z.exe
@@ -158,7 +147,7 @@ Run from that folder:
 modlist-installer.exe
 ```
 
-The GUI scans `package` for exactly one `.torrent` file. If a `.7z.001` file is already next to the torrent, it detects that too.
+The GUI scans the exe folder for exactly one `.torrent` file and validates the local archive parts against it. It does not fetch missing pieces from the network.
 
 The console harness can still pass a torrent explicitly for testing:
 
@@ -166,4 +155,4 @@ The console harness can still pass a torrent explicitly for testing:
 modlist-installer.exe MyPack.torrent D:\Downloads D:\Sky
 ```
 
-The tradeoff: without a manifest, the installer does not know expected SHA256 hashes, exact archive names, cleanup rules, or version/update metadata. Torrent piece checks still protect torrent content during download, but the stronger post-download SHA256 verification needs a manifest or a separate hash file.
+The tradeoff: without a manifest, the installer does not know expected SHA256 hashes, exact archive names, cleanup rules, or version/update metadata. Torrent piece checks still protect local package content, but stronger SHA256 verification needs a manifest or a separate hash file.

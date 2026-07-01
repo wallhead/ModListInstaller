@@ -41,6 +41,7 @@ struct LibtorrentDownloader::Impl {
   lt::torrent_handle handle;
   bool recheckRequested{false};
   bool recheckObserved{false};
+  bool validationOnly{false};
 
   Impl() : session(MakeSession()) {}
 };
@@ -80,6 +81,9 @@ void LibtorrentDownloader::Start(const DownloadConfig& config) {
   status_.dhtEnabled = config.features.enableDht;
 
 #if defined(MODLIST_HAVE_LIBTORRENT)
+  if (impl_) {
+    impl_->validationOnly = false;
+  }
   lt::add_torrent_params params;
   params.save_path = config.downloadFolder.string();
   params.trackers = config.trackers;
@@ -105,6 +109,51 @@ void LibtorrentDownloader::Start(const DownloadConfig& config) {
   impl_->handle.force_recheck();
   status_.stage = DownloadStage::Checking;
   status_.stateText = "Checking existing files";
+#else
+  (void)config;
+  SetFailure("libtorrent-rasterbar backend is not enabled. Configure with -DMODLIST_USE_LIBTORRENT=ON after installing libtorrent.");
+#endif
+}
+
+void LibtorrentDownloader::StartLocalValidation(const DownloadConfig& config) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  status_ = {};
+  status_.stage = DownloadStage::Loading;
+  status_.trackerCount = static_cast<int>(config.trackers.size());
+  status_.dhtEnabled = config.features.enableDht;
+
+#if defined(MODLIST_HAVE_LIBTORRENT)
+  if (impl_) {
+    impl_->validationOnly = true;
+  }
+  lt::add_torrent_params params;
+  params.save_path = config.downloadFolder.string();
+  params.trackers = config.trackers;
+
+  lt::error_code ec;
+  if (config.torrent.type == TorrentSourceType::Magnet) {
+    params = lt::parse_magnet_uri(config.torrent.source, ec);
+    params.save_path = config.downloadFolder.string();
+    params.trackers.insert(params.trackers.end(), config.trackers.begin(), config.trackers.end());
+  } else {
+    params.ti = std::make_shared<lt::torrent_info>(config.torrent.source, ec);
+  }
+  params.flags |= lt::torrent_flags::paused;
+  if (ec) {
+    SetFailure("Unable to load torrent: " + ec.message());
+    return;
+  }
+
+  impl_->handle = impl_->session.add_torrent(params, ec);
+  if (ec) {
+    SetFailure("Unable to start torrent validation: " + ec.message());
+    return;
+  }
+  impl_->handle.force_recheck();
+  impl_->recheckRequested = true;
+  impl_->recheckObserved = false;
+  status_.stage = DownloadStage::Checking;
+  status_.stateText = "Validating local files";
 #else
   (void)config;
   SetFailure("libtorrent-rasterbar backend is not enabled. Configure with -DMODLIST_USE_LIBTORRENT=ON after installing libtorrent.");
@@ -198,15 +247,19 @@ DownloadStatus LibtorrentDownloader::GetStatus() const {
     } else if (impl_->recheckRequested && checking) {
       impl_->recheckObserved = true;
       current.stage = DownloadStage::Checking;
-      current.stateText = "Validating downloaded files";
-    } else if (impl_->recheckRequested && !impl_->recheckObserved) {
-      current.stage = DownloadStage::Checking;
-      current.stateText = "Starting validation";
-    } else if (impl_->recheckRequested && impl_->recheckObserved && complete) {
+      current.stateText = impl_->validationOnly ? "Validating local files" : "Validating downloaded files";
+    } else if (impl_->recheckRequested && complete) {
       impl_->recheckRequested = false;
       impl_->recheckObserved = false;
       current.stage = DownloadStage::Completed;
       current.stateText = "Validated";
+    } else if (impl_->validationOnly && impl_->recheckRequested && !checking && !complete) {
+      current.stage = DownloadStage::Failed;
+      current.error = "Local package validation failed. Archive files are missing or incomplete.";
+      current.stateText = "Failed";
+    } else if (impl_->recheckRequested && !impl_->recheckObserved) {
+      current.stage = DownloadStage::Checking;
+      current.stateText = "Starting validation";
     } else if (checking) {
       current.stage = DownloadStage::Checking;
       current.stateText = "Checking existing files";
