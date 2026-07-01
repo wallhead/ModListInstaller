@@ -373,6 +373,50 @@ bool IsNumericVolumeSuffix(const std::wstring& suffix) {
          });
 }
 
+std::wstring Lower(std::wstring text) {
+  for (auto& ch : text) {
+    ch = static_cast<wchar_t>(std::towlower(ch));
+  }
+  return text;
+}
+
+bool EndsWithInsensitive(const std::wstring& text, const std::wstring& suffix) {
+  const auto lowerText = Lower(text);
+  const auto lowerSuffix = Lower(suffix);
+  return lowerText.size() >= lowerSuffix.size() &&
+         lowerText.compare(lowerText.size() - lowerSuffix.size(), lowerSuffix.size(), lowerSuffix) == 0;
+}
+
+std::optional<std::wstring> ArchiveBaseNameFromFileName(const std::wstring& name) {
+  const auto lower = Lower(name);
+  for (const auto* extension : {L".7z", L".zip"}) {
+    const std::wstring ext(extension);
+    if (EndsWithInsensitive(name, ext)) {
+      return name;
+    }
+
+    const auto splitMarker = ext + L".";
+    const auto markerPos = lower.rfind(splitMarker);
+    if (markerPos != std::wstring::npos) {
+      const auto suffix = name.substr(markerPos + splitMarker.size());
+      if (IsNumericVolumeSuffix(suffix)) {
+        return name.substr(0, markerPos + ext.size());
+      }
+    }
+  }
+  return std::nullopt;
+}
+
+std::wstring ArchiveNameFromBaseName(const std::wstring& baseName) {
+  if (EndsWithInsensitive(baseName, L".7z")) {
+    return baseName.substr(0, baseName.size() - 3);
+  }
+  if (EndsWithInsensitive(baseName, L".zip")) {
+    return baseName.substr(0, baseName.size() - 4);
+  }
+  return baseName;
+}
+
 std::wstring BuildSevenZipCommand(const PackerConfig& config) {
   std::wstring command = Quote(config.sevenZipExe) + L" a " + Quote(ArchivePath(config)) + L" " +
                          Quote(config.sourceFolder / L"*") + L" -t" + config.format +
@@ -539,11 +583,16 @@ bool HashArchiveFile(HWND hwnd,
   return !g_cancelRequested;
 }
 
-std::vector<std::filesystem::path> FindArchiveParts(const PackerConfig& config) {
+struct ArchiveSet {
+  std::wstring baseName;
+  std::wstring archiveName;
+  std::vector<std::filesystem::path> files;
+};
+
+std::vector<std::filesystem::path> FindArchivePartsForBase(const std::filesystem::path& folder, const std::wstring& base) {
   std::vector<std::filesystem::path> files;
   std::error_code ec;
-  const auto base = config.archiveName + SelectArchiveExtension(config);
-  for (const auto& entry : std::filesystem::directory_iterator(config.releaseFolder, ec)) {
+  for (const auto& entry : std::filesystem::directory_iterator(folder, ec)) {
     if (ec) {
       break;
     }
@@ -562,8 +611,93 @@ std::vector<std::filesystem::path> FindArchiveParts(const PackerConfig& config) 
   return files;
 }
 
+std::vector<ArchiveSet> FindArchiveSets(const std::filesystem::path& folder) {
+  std::vector<ArchiveSet> sets;
+  std::error_code ec;
+  for (const auto& entry : std::filesystem::directory_iterator(folder, ec)) {
+    if (ec) {
+      break;
+    }
+    if (!entry.is_regular_file(ec) || ec) {
+      ec.clear();
+      continue;
+    }
+
+    const auto name = entry.path().filename().wstring();
+    auto baseName = ArchiveBaseNameFromFileName(name);
+    if (!baseName.has_value()) {
+      continue;
+    }
+
+    auto existing = std::find_if(sets.begin(), sets.end(), [&](const ArchiveSet& set) {
+      return Lower(set.baseName) == Lower(*baseName);
+    });
+    if (existing == sets.end()) {
+      ArchiveSet set;
+      set.baseName = *baseName;
+      set.archiveName = ArchiveNameFromBaseName(*baseName);
+      set.files.push_back(entry.path());
+      sets.push_back(std::move(set));
+    } else {
+      existing->files.push_back(entry.path());
+    }
+  }
+
+  for (auto& set : sets) {
+    std::sort(set.files.begin(), set.files.end());
+  }
+  std::sort(sets.begin(), sets.end(), [](const ArchiveSet& left, const ArchiveSet& right) {
+    return Lower(left.baseName) < Lower(right.baseName);
+  });
+  return sets;
+}
+
+std::optional<ArchiveSet> SelectArchiveSet(HWND hwnd, const PackerConfig& config) {
+  if (config.archiveFirst) {
+    ArchiveSet set;
+    set.baseName = config.archiveName + SelectArchiveExtension(config);
+    set.archiveName = config.archiveName;
+    set.files = FindArchivePartsForBase(config.releaseFolder, set.baseName);
+    return set;
+  }
+
+  auto sets = FindArchiveSets(config.releaseFolder);
+  if (sets.empty()) {
+    return std::nullopt;
+  }
+
+  if (!config.archiveName.empty()) {
+    std::vector<ArchiveSet> namedMatches;
+    for (const auto& set : sets) {
+      if (Lower(set.archiveName) == Lower(config.archiveName)) {
+        namedMatches.push_back(set);
+      }
+    }
+    if (namedMatches.size() == 1) {
+      return namedMatches.front();
+    }
+  }
+
+  if (sets.size() == 1) {
+    PostLog(hwnd, L"Manifest Only auto-detected archive: " + sets.front().baseName);
+    return sets.front();
+  }
+
+  PostLog(hwnd, L"More than one archive set was found. Enter the wanted archive name first:");
+  for (const auto& set : sets) {
+    PostLog(hwnd, L"  " + set.archiveName + L" (" + std::to_wstring(set.files.size()) + L" file(s))");
+  }
+  return std::nullopt;
+}
+
 bool WriteManifest(HWND hwnd, const PackerConfig& config) {
-  const auto files = FindArchiveParts(config);
+  const auto archiveSet = SelectArchiveSet(hwnd, config);
+  if (!archiveSet.has_value()) {
+    PostLog(hwnd, L"No archive parts found in release folder.");
+    return false;
+  }
+
+  const auto& files = archiveSet->files;
   if (files.empty()) {
     PostLog(hwnd, L"No archive parts found in release folder.");
     return false;
@@ -606,7 +740,7 @@ bool WriteManifest(HWND hwnd, const PackerConfig& config) {
 
   output << "{\n";
   output << "  \"schema\": \"modlist-manifest-chunks-v1\",\n";
-  output << "  \"archive_name\": \"" << JsonEscape(Narrow(config.archiveName)) << "\",\n";
+  output << "  \"archive_name\": \"" << JsonEscape(Narrow(archiveSet->archiveName)) << "\",\n";
   output << "  \"hash\": {\n";
   output << "    \"algorithm\": \"sha256\",\n";
   output << "    \"chunk_size\": " << config.chunkSize << "\n";
