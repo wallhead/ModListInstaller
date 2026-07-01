@@ -266,8 +266,12 @@ std::filesystem::path ExeFolder() {
   return ModuleFolder();
 }
 
-std::filesystem::path PackageFolder() {
+std::filesystem::path ArchiveFolder() {
   return ExeFolder();
+}
+
+std::filesystem::path PackageFolder() {
+  return ExeFolder() / "package";
 }
 
 void WriteLastSevenZipLog(const std::string& output) {
@@ -647,12 +651,17 @@ void Layout(HWND hwnd) {
   MoveWindow(g_nextButton, width - 116, navY, 100, 30, TRUE);
 }
 
-modlist::Result<modlist::PackageDiscovery> ReadPackageFromUi() {
-  return modlist::DiscoverPackageNear(PackageFolder());
-}
-
 std::wstring StageToText(modlist::DownloadStage stage);
 std::wstring FormatBytes(uintmax_t bytes);
+std::optional<std::filesystem::path> FindFirstArchivePart(const std::filesystem::path& folder);
+
+modlist::Result<modlist::PackageDiscovery> ReadPackageFromUi() {
+  auto package = modlist::DiscoverPackageNear(PackageFolder());
+  if (package.ok() && !package.value().firstArchivePart.has_value()) {
+    package.value().firstArchivePart = FindFirstArchivePart(ArchiveFolder());
+  }
+  return package;
+}
 
 std::optional<std::filesystem::path> FindFirstArchivePart(const std::filesystem::path& folder) {
   std::error_code ec;
@@ -744,7 +753,7 @@ uintmax_t EstimateRequiredBytes(const modlist::PackageDiscovery& package) {
   }
 
   AppendLog(L"Torrent size warning: " + Widen(torrentSize.error()));
-  const uintmax_t archiveBytes = EstimateNearbyArchiveBytes(PackageFolder());
+  const uintmax_t archiveBytes = EstimateNearbyArchiveBytes(ArchiveFolder());
   if (archiveBytes > 0) {
     AppendLog(L"Using nearby archive size estimate: " + FormatBytes(archiveBytes));
   }
@@ -1022,7 +1031,7 @@ void RunInstallWorker(HWND hwnd,
   modlist::DownloadConfig config;
   config.torrent.type = modlist::TorrentSourceType::TorrentFile;
   config.torrent.source = package.torrentFile.string();
-  config.downloadFolder = PackageFolder();
+  config.downloadFolder = ArchiveFolder();
   config.features.enableDht = false;
   config.features.enablePex = false;
   config.features.enableLsd = false;
@@ -1067,7 +1076,7 @@ void RunInstallWorker(HWND hwnd,
   PostLog(hwnd, L"Looking for first .7z.001 archive part...");
   auto firstArchivePart = package.firstArchivePart;
   if (!firstArchivePart.has_value()) {
-    firstArchivePart = FindFirstArchivePart(PackageFolder());
+    firstArchivePart = FindFirstArchivePart(ArchiveFolder());
   }
   if (!firstArchivePart.has_value()) {
     PostLog(hwnd, L"No .7z.001 archive part found beside the installer. Cannot extract automatically.");
@@ -1297,7 +1306,7 @@ void UnpackOnly(HWND hwnd) {
     return;
   }
 
-  auto archive = FindFirstArchivePart(PackageFolder());
+  auto archive = FindFirstArchivePart(ArchiveFolder());
   if (!archive.has_value()) {
     AppendLog(L"No .7z.001 archive part found beside the installer.");
     return;
@@ -1317,6 +1326,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
       controls.dwICC = ICC_PROGRESS_CLASS;
       InitCommonControlsEx(&controls);
       std::filesystem::create_directories(ExeFolder() / "logs");
+      std::filesystem::create_directories(PackageFolder());
       std::filesystem::create_directories(ExeFolder() / "tools" / "7zip");
       ApplyWindowFrameTheme(hwnd);
       g_contentBrush = CreateSolidBrush(kContentColor);
@@ -1387,7 +1397,8 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
       PopulateDriveCombo();
       SetText(g_installEdit, L"");
       AppendLog(L"App log: " + PathToDisplay(AppLogPath()));
-      AppendLog(L"Place exactly one .torrent file and all archive parts beside this exe: " + PathToDisplay(PackageFolder()));
+      AppendLog(L"Place exactly one .torrent file in: " + PathToDisplay(PackageFolder()));
+      AppendLog(L"Place all archive parts beside this exe: " + PathToDisplay(ArchiveFolder()));
       auto package = ReadPackageFromUi();
       if (package.ok()) {
         AppendLog(L"Found torrent: " + PathToDisplay(package.value().torrentFile));

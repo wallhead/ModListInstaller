@@ -8,7 +8,7 @@ The ready-to-run build is included at:
 InstallerApp/dist/modlist-installer.exe
 ```
 
-Put exactly one `.torrent` file and the complete multi-volume archive beside `modlist-installer.exe`, then run the exe. The app validates the local archive files against the torrent, then unpacks them with bundled 7-Zip.
+Put exactly one `.torrent` file in `package\` and the complete multi-volume archive beside `modlist-installer.exe`, then run the exe. The app validates the local archive files against the torrent, then unpacks them with bundled 7-Zip.
 
 ## Current Features
 
@@ -21,7 +21,7 @@ Put exactly one `.torrent` file and the complete multi-volume archive beside `mo
 - Separate choices for unpack drive and final install folder.
 - Unpack drive selection automatically resolves to `X:\Sky`.
 - Validation and install page.
-- Auto-detects one `.torrent` beside the exe.
+- Auto-detects one `.torrent` from the `package` folder.
 - Validates local archive files through libtorrent-rasterbar without starting a network download.
 - Shows local validation progress before unpacking.
 - Stop control for active validation.
@@ -38,9 +38,10 @@ Put exactly one `.torrent` file and the complete multi-volume archive beside `mo
 ```text
 MyPack/
   modlist-installer.exe
-  MyPack.torrent
   MyPack.7z.001
   MyPack.7z.002
+  package/
+    MyPack.torrent
   tools/
     7zip/
       7z.exe

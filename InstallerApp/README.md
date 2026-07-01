@@ -28,11 +28,11 @@ The GUI executable is built as:
 InstallerApp\build\windows\x64\release\modlist-installer-gui.exe
 ```
 
-Copy it into `dist`, then put exactly one `.torrent` file and all archive parts beside the exe. The GUI does not ask for a torrent path; it automatically scans the exe folder and requires exactly one `.torrent` file there.
+Copy it into `dist`, then put exactly one `.torrent` file in `dist\package` and all archive parts beside the exe. The GUI does not ask for a torrent path; it automatically scans the package folder and requires exactly one `.torrent` file there.
 
 The `Install` button runs the install pipeline on a background thread:
 
-- detect the torrent beside the exe
+- detect the torrent in the package folder
 - validate unpack and install folders
 - check known archive size against free space when local archive parts are present
 - read total payload size directly from the `.torrent` file
@@ -74,9 +74,10 @@ The runtime layout is:
 ```text
 InstallerApp\dist\
   modlist-installer.exe
-  YourPack.torrent
   YourPack.7z.001
   YourPack.7z.002
+  package\
+    YourPack.torrent
   tools\
     7zip\
       7z.exe
@@ -133,9 +134,10 @@ You can skip the manifest for a basic GUI package layout:
 ```text
 MyPack/
   modlist-installer.exe
-  MyPack.torrent
   MyPack.7z.001
   MyPack.7z.002
+  package/
+    MyPack.torrent
   tools/
     7zip/
       7z.exe
@@ -147,7 +149,7 @@ Run from that folder:
 modlist-installer.exe
 ```
 
-The GUI scans the exe folder for exactly one `.torrent` file and validates the local archive parts against it. It does not fetch missing pieces from the network.
+The GUI scans `package` for exactly one `.torrent` file and validates the archive parts beside the exe against it. It does not fetch missing pieces from the network.
 
 The console harness can still pass a torrent explicitly for testing:
 
