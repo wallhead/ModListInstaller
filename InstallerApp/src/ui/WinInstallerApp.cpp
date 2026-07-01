@@ -731,7 +731,7 @@ bool VerifyPackageManifest(HWND hwnd, const modlist::Manifest& manifest) {
   const uintmax_t totalBytes = ManifestRequiredBytes(manifest);
   uintmax_t doneBytes = 0;
   const auto startedAt = std::chrono::steady_clock::now();
-  std::array<uint8_t, 4 * 1024 * 1024> buffer{};
+  std::vector<uint8_t> buffer(4 * 1024 * 1024);
 
   for (const auto& expected : manifest.files) {
     if (g_stopRequested) {
