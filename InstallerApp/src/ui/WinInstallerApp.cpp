@@ -11,11 +11,13 @@
 #include <commctrl.h>
 #include <shlobj.h>
 
+#include <algorithm>
 #include <atomic>
 #include <array>
 #include <chrono>
 #include <ctime>
 #include <cwctype>
+#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -729,82 +731,127 @@ bool VerifyPackageManifest(HWND hwnd, const modlist::Manifest& manifest) {
   PostLog(hwnd, L"Verifying manifest SHA-256 for " + std::to_wstring(manifest.files.size()) + L" archive file(s)...");
 
   const uintmax_t totalBytes = ManifestRequiredBytes(manifest);
-  uintmax_t doneBytes = 0;
+  std::atomic<uintmax_t> doneBytes{0};
+  std::atomic_bool failed{false};
   const auto startedAt = std::chrono::steady_clock::now();
-  std::vector<uint8_t> buffer(4 * 1024 * 1024);
+  std::mutex jobsMutex;
+  std::deque<modlist::ManifestFile> jobs;
+  for (const auto& file : manifest.files) {
+    jobs.push_back(file);
+  }
 
-  for (const auto& expected : manifest.files) {
-    if (g_stopRequested) {
-      PostLog(hwnd, L"Manifest verification stopped.");
-      return false;
-    }
-    if (!modlist::IsSafeManifestRelativePath(expected.path)) {
-      PostLog(hwnd, L"Manifest verification failed for " + PathToDisplay(expected.path) + L": unsafe path");
+  auto reportFailure = [&](std::wstring message) {
+    bool expected = false;
+    if (failed.compare_exchange_strong(expected, true)) {
+      PostLog(hwnd, std::move(message));
       PostValidationFailed(hwnd);
-      return false;
     }
+  };
 
-    const auto fullPath = ArchiveFolder() / expected.path;
-    std::error_code ec;
-    if (!std::filesystem::exists(fullPath, ec) || !std::filesystem::is_regular_file(fullPath, ec)) {
-      PostLog(hwnd, L"Manifest verification failed for " + PathToDisplay(expected.path) + L": missing file");
-      PostValidationFailed(hwnd);
-      return false;
-    }
-    const auto actualSize = std::filesystem::file_size(fullPath, ec);
-    if (ec || actualSize != expected.size) {
-      PostLog(hwnd, L"Manifest verification failed for " + PathToDisplay(expected.path) + L": file size mismatch");
-      PostValidationFailed(hwnd);
-      return false;
-    }
-
-    PostLog(hwnd, L"Checking " + PathToDisplay(expected.path));
-    std::ifstream input(fullPath, std::ios::binary);
-    if (!input) {
-      PostLog(hwnd, L"Manifest verification failed for " + PathToDisplay(expected.path) + L": unable to open file");
-      PostValidationFailed(hwnd);
-      return false;
-    }
-
-    modlist::Sha256 sha;
-    while (input && !g_stopRequested) {
-      input.read(reinterpret_cast<char*>(buffer.data()), static_cast<std::streamsize>(buffer.size()));
-      const auto read = input.gcount();
-      if (read <= 0) {
-        break;
+  auto postProgress = [&]() {
+    const uintmax_t done = doneBytes.load();
+    const int percent = totalBytes > 0 ? static_cast<int>((done * 100) / totalBytes) : 0;
+    const auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::steady_clock::now() - startedAt).count();
+    uintmax_t speed = 0;
+    int eta = -1;
+    if (elapsed > 0 && done > 0) {
+      speed = done / static_cast<uintmax_t>(elapsed);
+      if (speed > 0 && totalBytes > done) {
+        eta = static_cast<int>((totalBytes - done) / speed);
       }
-      sha.Update(buffer.data(), static_cast<size_t>(read));
-      doneBytes += static_cast<uintmax_t>(read);
-      const int percent = totalBytes > 0 ? static_cast<int>((doneBytes * 100) / totalBytes) : 0;
-      const auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
-          std::chrono::steady_clock::now() - startedAt).count();
-      uintmax_t speed = 0;
-      int eta = -1;
-      if (elapsed > 0 && doneBytes > 0) {
-        speed = doneBytes / static_cast<uintmax_t>(elapsed);
-        if (speed > 0 && totalBytes > doneBytes) {
-          eta = static_cast<int>((totalBytes - doneBytes) / speed);
+    }
+    PostProgress(hwnd, (percent * 35) / 100);
+    PostStatus(hwnd,
+               L"Validating " + std::to_wstring(percent) + L"% | " +
+                   FormatBytes(done) + L" / " + FormatBytes(totalBytes) +
+                   L" | " + FormatBytesPerSecond(speed) +
+                   L" | ETA " + FormatEta(eta) +
+                   L" | Elapsed " + FormatEta(static_cast<int>(elapsed)));
+  };
+
+  const unsigned int hardwareThreads = std::max(1u, std::thread::hardware_concurrency());
+  const size_t workerCount = std::max<size_t>(
+      1, std::min<size_t>(manifest.files.size(), std::min<size_t>(4, hardwareThreads)));
+  PostLog(hwnd, L"Manifest validation workers: " + std::to_wstring(workerCount));
+
+  auto worker = [&]() {
+    std::vector<uint8_t> buffer(4 * 1024 * 1024);
+    while (!g_stopRequested.load() && !failed.load()) {
+      modlist::ManifestFile expected;
+      {
+        std::lock_guard<std::mutex> lock(jobsMutex);
+        if (jobs.empty()) {
+          return;
         }
+        expected = jobs.front();
+        jobs.pop_front();
       }
-      PostProgress(hwnd, (percent * 35) / 100);
-      PostStatus(hwnd,
-                 L"Validating " + std::to_wstring(percent) + L"% | " +
-                     FormatBytes(doneBytes) + L" / " + FormatBytes(totalBytes) +
-                     L" | " + FormatBytesPerSecond(speed) +
-                     L" | ETA " + FormatEta(eta) +
-                     L" | Elapsed " + FormatEta(static_cast<int>(elapsed)));
-    }
-    if (g_stopRequested) {
-      PostLog(hwnd, L"Manifest verification stopped.");
-      return false;
-    }
 
-    const auto actualHash = HexDigest(sha.Final());
-    if (actualHash != expected.sha256) {
-      PostLog(hwnd, L"Manifest verification failed for " + PathToDisplay(expected.path) + L": SHA256 mismatch");
-      PostValidationFailed(hwnd);
-      return false;
+      if (!modlist::IsSafeManifestRelativePath(expected.path)) {
+        reportFailure(L"Manifest verification failed for " + PathToDisplay(expected.path) + L": unsafe path");
+        return;
+      }
+
+      const auto fullPath = ArchiveFolder() / expected.path;
+      std::error_code ec;
+      if (!std::filesystem::exists(fullPath, ec) || !std::filesystem::is_regular_file(fullPath, ec)) {
+        reportFailure(L"Manifest verification failed for " + PathToDisplay(expected.path) + L": missing file");
+        return;
+      }
+      const auto actualSize = std::filesystem::file_size(fullPath, ec);
+      if (ec || actualSize != expected.size) {
+        reportFailure(L"Manifest verification failed for " + PathToDisplay(expected.path) + L": file size mismatch");
+        return;
+      }
+
+      PostLog(hwnd, L"Checking " + PathToDisplay(expected.path));
+      std::ifstream input(fullPath, std::ios::binary);
+      if (!input) {
+        reportFailure(L"Manifest verification failed for " + PathToDisplay(expected.path) + L": unable to open file");
+        return;
+      }
+
+      modlist::Sha256 sha;
+      while (input && !g_stopRequested.load() && !failed.load()) {
+        input.read(reinterpret_cast<char*>(buffer.data()), static_cast<std::streamsize>(buffer.size()));
+        const auto read = input.gcount();
+        if (read <= 0) {
+          break;
+        }
+        sha.Update(buffer.data(), static_cast<size_t>(read));
+        doneBytes += static_cast<uintmax_t>(read);
+        postProgress();
+      }
+      if (g_stopRequested.load() || failed.load()) {
+        return;
+      }
+
+      const auto actualHash = HexDigest(sha.Final());
+      if (actualHash != expected.sha256) {
+        reportFailure(L"Manifest verification failed for " + PathToDisplay(expected.path) + L": SHA256 mismatch");
+        return;
+      }
     }
+  };
+
+  std::vector<std::thread> workers;
+  workers.reserve(workerCount);
+  for (size_t i = 0; i < workerCount; ++i) {
+    workers.emplace_back(worker);
+  }
+  for (auto& thread : workers) {
+    if (thread.joinable()) {
+      thread.join();
+    }
+  }
+
+  if (g_stopRequested.load()) {
+    PostLog(hwnd, L"Manifest verification stopped.");
+    return false;
+  }
+  if (failed.load()) {
+    return false;
   }
 
   PostProgress(hwnd, 35);
