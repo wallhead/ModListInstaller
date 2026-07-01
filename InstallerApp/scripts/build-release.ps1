@@ -20,16 +20,10 @@ try {
   New-Item -ItemType Directory -Path ".\dist\package" -Force | Out-Null
   New-Item -ItemType Directory -Path ".\dist\downloads" -Force | Out-Null
   New-Item -ItemType Directory -Path ".\dist\logs" -Force | Out-Null
-  New-Item -ItemType Directory -Path ".\dist\tools\7zip" -Force | Out-Null
   Copy-Item ".\build\windows\x64\release\modlist-installer-gui.exe" ".\dist\modlist-installer.exe" -Force
 
-  $BundledSevenZip = ".\third_party\7zip\7z.exe"
-  if (Test-Path $BundledSevenZip) {
-    Copy-Item $BundledSevenZip ".\dist\tools\7zip\7z.exe" -Force
-  } elseif (Test-Path ".\dist\7z.exe") {
-    Move-Item ".\dist\7z.exe" ".\dist\tools\7zip\7z.exe" -Force
-  } elseif (-not (Test-Path ".\dist\tools\7zip\7z.exe")) {
-    Write-Warning "7z.exe is not present. Put 7z.exe in dist\tools\7zip or third_party\7zip before packaging."
+  if (Test-Path ".\dist\tools\7zip\7z.exe") {
+    Remove-Item ".\dist\tools\7zip\7z.exe" -Force
   }
 
   Get-Item ".\dist\modlist-installer.exe"

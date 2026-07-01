@@ -38,7 +38,7 @@ end
 
 target("installer_core")
     set_kind("static")
-    add_includedirs("src", {public = true})
+    add_includedirs("src", "resources", {public = true})
     add_files(
         "src/app/PackageDiscovery.cpp",
         "src/downloader/LibtorrentDownloader.cpp",

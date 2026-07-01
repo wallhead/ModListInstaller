@@ -47,6 +47,7 @@ The `Install` button runs the install pipeline on a background thread:
 - show live unpack percentage, speed, and ETA in the progress bar and status line
 - show live install percentage, speed, ETA, and elapsed time in the status line
 - install from the unpack folder into the final install folder, using same-drive move/cut semantics instead of copying when both folders are on the same drive
+- embed 7-Zip inside the installer exe and extract it to a per-user cache when needed
 - stream full 7-Zip diagnostics to `dist\logs` while keeping only a small in-memory tail for the GUI
 - run 7-Zip inside a memory-limited child process so oversized archives fail cleanly instead of exhausting system RAM
 - automatically run a second extraction pass when a split `.7z.001` contains one inner `.7z`
@@ -81,9 +82,6 @@ InstallerApp\dist\
   YourPack.7z.002
   package\
     YourPack.torrent
-  tools\
-    7zip\
-      7z.exe
   logs\
 ```
 
@@ -122,14 +120,6 @@ xmake f --use_libtorrent=y
 xmake
 ```
 
-## Bundle 7-Zip
-
-Place one of these in `InstallerApp/third_party/7zip/`:
-
-- `7z.exe`
-- `7za.exe`
-- `7zz.exe`
-
 ## Simple Torrent Package Mode
 
 You can skip the manifest for a basic GUI package layout:
@@ -141,9 +131,6 @@ MyPack/
   MyPack.7z.002
   package/
     MyPack.torrent
-  tools/
-    7zip/
-      7z.exe
 ```
 
 Run from that folder:

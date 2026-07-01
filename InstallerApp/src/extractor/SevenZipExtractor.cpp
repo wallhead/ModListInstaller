@@ -1,6 +1,7 @@
 #include "extractor/SevenZipExtractor.h"
 
 #include "paths/PathValidator.h"
+#include "resource.h"
 
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -13,6 +14,7 @@
 #include <fstream>
 #include <optional>
 #include <sstream>
+#include <vector>
 
 namespace modlist {
 
@@ -32,13 +34,87 @@ std::string Quote(const std::filesystem::path& path) {
   return "\"" + escaped + "\"";
 }
 
+std::filesystem::path ModuleFolder() {
+  std::wstring buffer(MAX_PATH, L'\0');
+  DWORD size = 0;
+  while (true) {
+    size = GetModuleFileNameW(nullptr, buffer.data(), static_cast<DWORD>(buffer.size()));
+    if (size == 0) {
+      return std::filesystem::current_path();
+    }
+    if (size < buffer.size() - 1) {
+      buffer.resize(size);
+      break;
+    }
+    buffer.resize(buffer.size() * 2);
+  }
+  return std::filesystem::path(buffer).parent_path();
+}
+
+std::filesystem::path LocalToolCacheFolder(const std::filesystem::path& appRoot) {
+  std::wstring localAppData(MAX_PATH, L'\0');
+  const DWORD localAppDataSize = GetEnvironmentVariableW(
+      L"LOCALAPPDATA", localAppData.data(), static_cast<DWORD>(localAppData.size()));
+  if (localAppDataSize > 0 && localAppDataSize < localAppData.size()) {
+    localAppData.resize(localAppDataSize);
+    return std::filesystem::path(localAppData) / "ModlistInstaller" / "tools" / "7zip";
+  }
+
+  std::error_code ec;
+  auto temp = std::filesystem::temp_directory_path(ec);
+  if (!ec) {
+    return temp / "ModlistInstaller" / "tools" / "7zip";
+  }
+
+  return appRoot / "tools" / "7zip";
+}
+
+Result<std::filesystem::path> ExtractEmbeddedSevenZip(const std::filesystem::path& appRoot) {
+  HMODULE module = GetModuleHandleW(nullptr);
+  HRSRC resource = FindResourceW(module, MAKEINTRESOURCEW(IDR_7ZIP_EXE), MAKEINTRESOURCEW(10));
+  if (resource == nullptr) {
+    return Result<std::filesystem::path>::Error("Embedded 7-Zip resource was not found.");
+  }
+
+  HGLOBAL loaded = LoadResource(module, resource);
+  const DWORD size = SizeofResource(module, resource);
+  const void* data = LockResource(loaded);
+  if (loaded == nullptr || data == nullptr || size == 0) {
+    return Result<std::filesystem::path>::Error("Embedded 7-Zip resource could not be loaded.");
+  }
+
+  auto outputFolder = LocalToolCacheFolder(appRoot);
+  std::error_code ec;
+  std::filesystem::create_directories(outputFolder, ec);
+  if (ec) {
+    return Result<std::filesystem::path>::Error("Unable to create 7-Zip cache folder: " + ec.message());
+  }
+
+  const auto outputPath = outputFolder / "7z.exe";
+  bool writeFile = true;
+  if (std::filesystem::exists(outputPath, ec) && !ec) {
+    const auto existingSize = std::filesystem::file_size(outputPath, ec);
+    writeFile = ec || existingSize != size;
+  }
+
+  if (writeFile) {
+    std::ofstream output(outputPath, std::ios::binary | std::ios::trunc);
+    if (!output) {
+      return Result<std::filesystem::path>::Error("Unable to write embedded 7-Zip executable.");
+    }
+    output.write(static_cast<const char*>(data), size);
+    if (!output) {
+      return Result<std::filesystem::path>::Error("Unable to finish writing embedded 7-Zip executable.");
+    }
+  }
+
+  return Result<std::filesystem::path>::Ok(outputPath);
+}
+
 std::filesystem::path MakeOutputCapturePath(const std::filesystem::path& sevenZipExe) {
   const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
-  auto logFolder = sevenZipExe.parent_path() / "logs";
-  if (sevenZipExe.parent_path().filename() == "7zip" &&
-      sevenZipExe.parent_path().parent_path().filename() == "tools") {
-    logFolder = sevenZipExe.parent_path().parent_path().parent_path() / "logs";
-  }
+  (void)sevenZipExe;
+  auto logFolder = ModuleFolder() / "logs";
   std::error_code ec;
   std::filesystem::create_directories(logFolder, ec);
   if (ec) {
@@ -274,6 +350,11 @@ int RunProcessAndCapture(const std::string& command,
 }  // namespace
 
 Result<std::filesystem::path> SevenZipExtractor::LocateExecutable(const std::filesystem::path& appRoot) const {
+  auto embedded = ExtractEmbeddedSevenZip(appRoot);
+  if (embedded.ok()) {
+    return embedded;
+  }
+
   const std::array<std::filesystem::path, 9> candidates = {
       appRoot / "tools" / "7zip" / "7z.exe",
       appRoot / "tools" / "7zip" / "7za.exe",
@@ -292,7 +373,7 @@ Result<std::filesystem::path> SevenZipExtractor::LocateExecutable(const std::fil
       return Result<std::filesystem::path>::Ok(candidate);
     }
   }
-  return Result<std::filesystem::path>::Error("7-Zip executable not found. Bundle it under tools\\7zip.");
+  return Result<std::filesystem::path>::Error("7-Zip executable not found. Embedded copy could not be extracted: " + embedded.error());
 }
 
 ExtractionResult SevenZipExtractor::Extract(const ExtractionConfig& config, ProgressCallback progressCallback) const {
