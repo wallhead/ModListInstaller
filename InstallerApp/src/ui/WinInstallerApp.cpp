@@ -48,6 +48,7 @@ constexpr UINT kLogMessage = WM_APP + 1;
 constexpr UINT kProgressMessage = WM_APP + 2;
 constexpr UINT kWorkerFinishedMessage = WM_APP + 3;
 constexpr UINT kStatusMessage = WM_APP + 4;
+constexpr UINT kValidationFailedMessage = WM_APP + 5;
 
 enum class WizardPage {
   Welcome,
@@ -257,6 +258,10 @@ void PostProgress(HWND hwnd, int progress) {
 
 void PostStatus(HWND hwnd, std::wstring text) {
   PostMessageW(hwnd, kStatusMessage, 0, reinterpret_cast<LPARAM>(new std::wstring(std::move(text))));
+}
+
+void PostValidationFailed(HWND hwnd) {
+  PostMessageW(hwnd, kValidationFailedMessage, 0, 0);
 }
 
 std::wstring PathToDisplay(const std::filesystem::path& path) {
@@ -1247,6 +1252,7 @@ void RunInstallWorker(HWND hwnd,
     }
     if (status.stage == modlist::DownloadStage::Failed) {
       PostLog(hwnd, L"Validation error: " + Widen(status.error));
+      PostValidationFailed(hwnd);
       FinishWorker(hwnd, downloader);
       return;
     }
@@ -1710,6 +1716,9 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
       SetWindowTextW(g_statusLabel, text->c_str());
       return 0;
     }
+    case kValidationFailedMessage:
+      MessageBoxW(hwnd, L"Rehash torrent", L"Validation failed", MB_OK | MB_ICONERROR);
+      return 0;
     case kWorkerFinishedMessage:
       SetControlsRunning(hwnd, false);
       if (g_closeAfterWorker) {
