@@ -846,37 +846,12 @@ bool IsArchiveVolume(const std::filesystem::path& path) {
          name.ends_with(L".zip");
 }
 
-bool IsPlainSevenZipArchive(const std::filesystem::path& path) {
-  std::wstring name = path.filename().wstring();
-  for (auto& ch : name) {
-    ch = static_cast<wchar_t>(std::towlower(ch));
-  }
-  return name.ends_with(L".7z") && name.find(L".7z.") == std::wstring::npos;
-}
-
 bool IsFirstSplitArchivePart(const std::filesystem::path& path) {
   std::wstring name = path.filename().wstring();
   for (auto& ch : name) {
     ch = static_cast<wchar_t>(std::towlower(ch));
   }
   return name.ends_with(L".001");
-}
-
-std::vector<std::filesystem::path> FindPlainSevenZipArchives(const std::filesystem::path& folder) {
-  std::vector<std::filesystem::path> archives;
-  std::error_code ec;
-  if (!std::filesystem::exists(folder, ec) || !std::filesystem::is_directory(folder, ec)) {
-    return archives;
-  }
-  for (const auto& entry : std::filesystem::recursive_directory_iterator(folder, ec)) {
-    if (ec) {
-      break;
-    }
-    if (entry.is_regular_file() && IsPlainSevenZipArchive(entry.path())) {
-      archives.push_back(entry.path());
-    }
-  }
-  return archives;
 }
 
 uintmax_t EstimateNearbyArchiveBytes(const std::filesystem::path& folder) {
@@ -1161,22 +1136,7 @@ bool ExtractArchiveChain(HWND hwnd,
     return false;
   }
 
-  const auto innerArchives = FindPlainSevenZipArchives(installFolder);
-  if (innerArchives.empty()) {
-    return true;
-  }
-  if (innerArchives.size() != 1) {
-    PostLog(hwnd, L"Found more than one inner .7z archive, so automatic second extraction was skipped.");
-    return true;
-  }
-
-  PostLog(hwnd, L"Detected inner archive, starting second extraction: " + PathToDisplay(innerArchives.front()));
-  extraction.archiveFirstPart = innerArchives.front();
-  extraction.installFolder = innerArchives.front().parent_path();
-  const int secondSpan = progressSpan - firstSpan;
-  std::error_code ec;
-  const uintmax_t secondBytes = std::filesystem::file_size(extraction.archiveFirstPart, ec);
-  return RunExtractionStep(hwnd, extractor, extraction, L"Unpacking inner archive", progressBase + firstSpan, secondSpan, ec ? 0 : secondBytes);
+  return true;
 }
 
 std::wstring NormalizedPathText(const std::filesystem::path& path) {
