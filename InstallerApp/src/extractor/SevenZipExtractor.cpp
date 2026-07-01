@@ -58,7 +58,72 @@ void AppendBoundedTail(std::string& tail, const char* data, size_t size, size_t 
   }
 }
 
+std::string BytesToDisplay(DWORDLONG bytes) {
+  std::ostringstream out;
+  constexpr DWORDLONG kGiB = 1024ull * 1024ull * 1024ull;
+  constexpr DWORDLONG kMiB = 1024ull * 1024ull;
+  if (bytes >= kGiB) {
+    out << (bytes / kGiB) << " GiB";
+  } else {
+    out << (bytes / kMiB) << " MiB";
+  }
+  return out.str();
+}
+
+SIZE_T SevenZipMemoryLimitBytes() {
+  constexpr DWORDLONG kGiB = 1024ull * 1024ull * 1024ull;
+  constexpr DWORDLONG kMinLimit = 1ull * kGiB;
+  constexpr DWORDLONG kPreferredFloor = 4ull * kGiB;
+  constexpr DWORDLONG kMaxLimit = 16ull * kGiB;
+
+  MEMORYSTATUSEX memory{};
+  memory.dwLength = sizeof(memory);
+  if (!GlobalMemoryStatusEx(&memory) || memory.ullTotalPhys == 0) {
+    return static_cast<SIZE_T>(kPreferredFloor);
+  }
+
+  const DWORDLONG total = memory.ullTotalPhys;
+  DWORDLONG limit = (total >= 8ull * kGiB) ? (total * 3 / 4) : (total / 2);
+  if (total >= 8ull * kGiB && limit < kPreferredFloor) {
+    limit = kPreferredFloor;
+  }
+  if (limit < kMinLimit) {
+    limit = kMinLimit;
+  }
+  if (limit > kMaxLimit) {
+    limit = kMaxLimit;
+  }
+  if (limit >= total) {
+    limit = total > kGiB ? total - kGiB : total / 2;
+  }
+  return static_cast<SIZE_T>(limit);
+}
+
+HANDLE CreateMemoryLimitedJob(SIZE_T memoryLimitBytes, std::ofstream& log) {
+  HANDLE job = CreateJobObjectW(nullptr, nullptr);
+  if (job == nullptr) {
+    if (log) {
+      log << "Warning: unable to create 7-Zip memory limit job: " << GetLastError() << "\n";
+    }
+    return nullptr;
+  }
+
+  JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};
+  limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_PROCESS_MEMORY | JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+  limits.ProcessMemoryLimit = memoryLimitBytes;
+  if (!SetInformationJobObject(job, JobObjectExtendedLimitInformation, &limits, sizeof(limits))) {
+    if (log) {
+      log << "Warning: unable to apply 7-Zip memory limit: " << GetLastError() << "\n";
+    }
+    CloseHandle(job);
+    return nullptr;
+  }
+  return job;
+}
+
 std::string SevenZipExitMessage(int code) {
+  constexpr int kStatusNoMemory = static_cast<int>(0xC0000017u);
+  constexpr int kStatusCommitmentLimit = static_cast<int>(0xC000012Du);
   switch (code) {
     case 0:
       return "Extraction completed.";
@@ -69,9 +134,12 @@ std::string SevenZipExitMessage(int code) {
     case 7:
       return "7-Zip command line error (exit code 7).";
     case 8:
-      return "7-Zip ran out of memory (exit code 8).";
+      return "7-Zip ran out of memory or hit the installer memory limit (exit code 8).";
     case 255:
       return "7-Zip was stopped by the user (exit code 255).";
+    case kStatusNoMemory:
+    case kStatusCommitmentLimit:
+      return "7-Zip was stopped because it exceeded available or allowed memory.";
     default:
       return "7-Zip extraction failed with exit code " + std::to_string(code) + ".";
   }
@@ -105,8 +173,12 @@ int RunProcessAndCapture(const std::string& command,
   constexpr size_t kOutputTailLimit = 64 * 1024;
 
   std::ofstream log(outputPath, std::ios::binary);
+  const SIZE_T memoryLimitBytes = SevenZipMemoryLimitBytes();
   if (log) {
-    log << "Command:\n" << command << "\n\n7-Zip output:\n";
+    log << "Command:\n" << command << "\n\n";
+    log << "7-Zip process memory limit:\n" << BytesToDisplay(memoryLimitBytes)
+        << " (" << memoryLimitBytes << " bytes)\n\n";
+    log << "7-Zip output:\n";
   }
 
   SECURITY_ATTRIBUTES security{};
@@ -129,12 +201,13 @@ int RunProcessAndCapture(const std::string& command,
 
   PROCESS_INFORMATION process{};
   std::string mutableCommand = command;
+  HANDLE job = CreateMemoryLimitedJob(memoryLimitBytes, log);
   const BOOL created = CreateProcessA(nullptr,
                                       mutableCommand.data(),
                                       nullptr,
                                       nullptr,
                                       TRUE,
-                                      CREATE_NO_WINDOW,
+                                      CREATE_NO_WINDOW | CREATE_SUSPENDED,
                                       nullptr,
                                       nullptr,
                                       &startup,
@@ -142,10 +215,23 @@ int RunProcessAndCapture(const std::string& command,
   CloseHandle(writePipe);
   if (!created) {
     CloseHandle(readPipe);
+    if (job != nullptr) {
+      CloseHandle(job);
+    }
     if (log) {
       log << "\n\nCreateProcess failed: " << GetLastError() << "\n";
     }
     return static_cast<int>(GetLastError());
+  }
+  if (job != nullptr && !AssignProcessToJobObject(job, process.hProcess) && log) {
+    log << "Warning: unable to assign 7-Zip to memory limit job: " << GetLastError() << "\n";
+  }
+  if (ResumeThread(process.hThread) == static_cast<DWORD>(-1)) {
+    const DWORD resumeError = GetLastError();
+    if (log) {
+      log << "Unable to resume 7-Zip process: " << resumeError << "\n";
+    }
+    TerminateProcess(process.hProcess, resumeError);
   }
 
   std::string parseTail;
@@ -175,6 +261,9 @@ int RunProcessAndCapture(const std::string& command,
   GetExitCodeProcess(process.hProcess, &exitCode);
   CloseHandle(process.hThread);
   CloseHandle(process.hProcess);
+  if (job != nullptr) {
+    CloseHandle(job);
+  }
   CloseHandle(readPipe);
   if (log) {
     log << "\n\nExit code:\n" << exitCode << "\n";

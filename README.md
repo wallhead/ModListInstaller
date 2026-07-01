@@ -35,6 +35,7 @@ Put exactly one `.torrent` file in `InstallerApp/dist/package`, then run the exe
 - Supports split `.7z.001` packages that contain an inner `.7z` archive.
 - Keeps full 7-Zip diagnostics in `dist/logs`, while the GUI log stays concise.
 - Streams 7-Zip diagnostics to disk and keeps only a small in-memory tail for error display.
+- Runs 7-Zip in a memory-limited child process so oversized archives fail cleanly instead of exhausting system RAM.
 
 ## Quick Use
 

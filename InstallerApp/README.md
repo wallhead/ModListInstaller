@@ -49,6 +49,7 @@ The `Start` button runs the install pipeline on a background thread:
 - check unpack free space again before extraction
 - show live unpack percentage in the progress bar and status line
 - stream full 7-Zip diagnostics to `dist\logs` while keeping only a small in-memory tail for the GUI
+- run 7-Zip inside a memory-limited child process so oversized archives fail cleanly instead of exhausting system RAM
 - automatically run a second extraction pass when a split `.7z.001` contains one inner `.7z`
 - extract with bundled 7-Zip into the selected install folder
 
