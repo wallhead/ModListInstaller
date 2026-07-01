@@ -2,6 +2,8 @@ InstallerApp/.xmake/
 InstallerApp/build/
 InstallerApp/dist/logs/
 InstallerApp/dist/last-7z-output.log
+InstallerApp/dist/Cyber_TEST/
+InstallerApp/CSS.txt
 InstallerApp/dist/*.torrent
 InstallerApp/dist/package/*.torrent
 InstallerApp/dist/downloads/
