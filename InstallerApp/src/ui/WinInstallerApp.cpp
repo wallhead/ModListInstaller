@@ -41,6 +41,7 @@ constexpr int kStopButton = 1013;
 constexpr int kUnpackButton = 1014;
 constexpr int kPreviousButton = 1015;
 constexpr int kNextButton = 1016;
+constexpr int kUnpackDriveCombo = 1017;
 
 constexpr UINT kLogMessage = WM_APP + 1;
 constexpr UINT kProgressMessage = WM_APP + 2;
@@ -58,8 +59,11 @@ HWND g_stepLabel = nullptr;
 HWND g_welcomeTitle = nullptr;
 HWND g_welcomeBody = nullptr;
 HWND g_downloadLabel = nullptr;
+HWND g_unpackDriveLabel = nullptr;
+HWND g_unpackTargetLabel = nullptr;
 HWND g_installLabel = nullptr;
 HWND g_downloadEdit = nullptr;
+HWND g_unpackDriveCombo = nullptr;
 HWND g_installEdit = nullptr;
 HWND g_logEdit = nullptr;
 HWND g_progress = nullptr;
@@ -239,6 +243,76 @@ HWND CreateLabel(HWND parent, const wchar_t* text, int x, int y, int width, int 
 HWND CreateEdit(HWND parent, int id, int x, int y, int width, int height) {
   return CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
                          x, y, width, height, parent, reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), g_instance, nullptr);
+}
+
+HWND CreateCombo(HWND parent, int id, int x, int y, int width, int height) {
+  return CreateWindowExW(WS_EX_CLIENTEDGE, L"COMBOBOX", L"",
+                         WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL,
+                         x, y, width, height, parent, reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), g_instance, nullptr);
+}
+
+std::wstring ComboText(HWND combo) {
+  const auto index = static_cast<int>(SendMessageW(combo, CB_GETCURSEL, 0, 0));
+  if (index == CB_ERR) {
+    return {};
+  }
+  const auto length = static_cast<int>(SendMessageW(combo, CB_GETLBTEXTLEN, static_cast<WPARAM>(index), 0));
+  if (length <= 0) {
+    return {};
+  }
+  std::wstring text(static_cast<size_t>(length) + 1, L'\0');
+  SendMessageW(combo, CB_GETLBTEXT, static_cast<WPARAM>(index), reinterpret_cast<LPARAM>(text.data()));
+  text.resize(static_cast<size_t>(length));
+  return text;
+}
+
+std::filesystem::path SelectedUnpackFolder() {
+  auto drive = ComboText(g_unpackDriveCombo);
+  if (drive.empty()) {
+    return {};
+  }
+  if (!drive.ends_with(L"\\")) {
+    drive += L"\\";
+  }
+  return std::filesystem::path(drive) / "Sky";
+}
+
+void UpdateUnpackTargetLabel() {
+  if (g_unpackTargetLabel == nullptr) {
+    return;
+  }
+  const auto folder = SelectedUnpackFolder();
+  if (folder.empty()) {
+    SetText(g_unpackTargetLabel, L"Target: choose a drive");
+  } else {
+    SetText(g_unpackTargetLabel, L"Target: " + folder.wstring());
+  }
+}
+
+void PopulateDriveCombo() {
+  if (g_unpackDriveCombo == nullptr) {
+    return;
+  }
+  wchar_t drives[512]{};
+  const DWORD length = GetLogicalDriveStringsW(static_cast<DWORD>(sizeof(drives) / sizeof(drives[0])), drives);
+  int selected = -1;
+  int index = 0;
+  for (const wchar_t* drive = drives; length > 0 && *drive != L'\0'; drive += wcslen(drive) + 1) {
+    const UINT type = GetDriveTypeW(drive);
+    if (type != DRIVE_FIXED && type != DRIVE_REMOVABLE) {
+      continue;
+    }
+    std::wstring item = drive;
+    SendMessageW(g_unpackDriveCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(item.c_str()));
+    if ((item.size() >= 2 && towupper(item[0]) == L'D') || selected < 0) {
+      selected = index;
+    }
+    ++index;
+  }
+  if (selected >= 0) {
+    SendMessageW(g_unpackDriveCombo, CB_SETCURSEL, static_cast<WPARAM>(selected), 0);
+  }
+  UpdateUnpackTargetLabel();
 }
 
 LRESULT CALLBACK ButtonSubclassProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam, UINT_PTR subclassId, DWORD_PTR refData) {
@@ -462,12 +536,15 @@ void Layout(HWND hwnd) {
   MoveWindow(g_welcomeTitle, contentX, 96, contentWidth, 42, TRUE);
   MoveWindow(g_welcomeBody, contentX, 154, contentWidth, 96, TRUE);
 
-  MoveWindow(g_downloadLabel, contentX, 112, labelWidth, 20, TRUE);
-  MoveWindow(GetDlgItem(hwnd, kDownloadEdit), editX, 108, editWidth, rowHeight, TRUE);
-  MoveWindow(GetDlgItem(hwnd, kDownloadBrowse), buttonX, 108, buttonWidth, rowHeight, TRUE);
-  MoveWindow(g_installLabel, contentX, 154, labelWidth, 20, TRUE);
-  MoveWindow(GetDlgItem(hwnd, kInstallEdit), editX, 150, editWidth, rowHeight, TRUE);
-  MoveWindow(GetDlgItem(hwnd, kInstallBrowse), buttonX, 150, buttonWidth, rowHeight, TRUE);
+  MoveWindow(g_downloadLabel, contentX, 94, labelWidth, 20, TRUE);
+  MoveWindow(GetDlgItem(hwnd, kDownloadEdit), editX, 90, editWidth, rowHeight, TRUE);
+  MoveWindow(GetDlgItem(hwnd, kDownloadBrowse), buttonX, 90, buttonWidth, rowHeight, TRUE);
+  MoveWindow(g_unpackDriveLabel, contentX, 136, labelWidth, 20, TRUE);
+  MoveWindow(g_unpackDriveCombo, editX, 132, 120, 180, TRUE);
+  MoveWindow(g_unpackTargetLabel, editX + 136, 136, editWidth - 136 + buttonWidth + 8, 20, TRUE);
+  MoveWindow(g_installLabel, contentX, 178, labelWidth, 20, TRUE);
+  MoveWindow(GetDlgItem(hwnd, kInstallEdit), editX, 174, editWidth, rowHeight, TRUE);
+  MoveWindow(GetDlgItem(hwnd, kInstallBrowse), buttonX, 174, buttonWidth, rowHeight, TRUE);
 
   MoveWindow(GetDlgItem(hwnd, kValidateButton), contentX, 74, 120, 30, TRUE);
   MoveWindow(GetDlgItem(hwnd, kStartButton), contentX + 132, 74, 120, 30, TRUE);
@@ -681,6 +758,9 @@ void ShowWizardPage(HWND hwnd, WizardPage page) {
   ShowControl(g_downloadLabel, folders);
   ShowControl(hwnd, kDownloadEdit, folders);
   ShowControl(hwnd, kDownloadBrowse, folders);
+  ShowControl(g_unpackDriveLabel, folders);
+  ShowControl(g_unpackDriveCombo, folders);
+  ShowControl(g_unpackTargetLabel, folders);
   ShowControl(g_installLabel, folders);
   ShowControl(hwnd, kInstallEdit, folders);
   ShowControl(hwnd, kInstallBrowse, folders);
@@ -698,6 +778,7 @@ void ShowWizardPage(HWND hwnd, WizardPage page) {
   EnableWindow(g_nextButton, page != WizardPage::Activity && !running);
 
   EnableWindow(GetDlgItem(hwnd, kDownloadBrowse), folders && !running);
+  EnableWindow(g_unpackDriveCombo, folders && !running);
   EnableWindow(GetDlgItem(hwnd, kInstallBrowse), folders && !running);
   EnableWindow(GetDlgItem(hwnd, kValidateButton), activity && !running);
   EnableWindow(GetDlgItem(hwnd, kStartButton), activity && !running);
@@ -845,6 +926,7 @@ bool ExtractArchiveChain(HWND hwnd,
 void RunInstallWorker(HWND hwnd,
                       modlist::PackageDiscovery package,
                       std::filesystem::path downloadFolder,
+                      std::filesystem::path unpackFolder,
                       std::filesystem::path installFolder,
                       std::shared_ptr<modlist::LibtorrentDownloader> downloader) {
   g_workerRunning = true;
@@ -951,12 +1033,14 @@ void RunInstallWorker(HWND hwnd,
     return;
   }
 
+  PostLog(hwnd, L"Selected install folder: " + PathToDisplay(installFolder));
+
   const uintmax_t archiveBytes = EstimateNearbyArchiveBytes(firstArchivePart->parent_path());
   if (archiveBytes > 0) {
-    const uintmax_t installFree = FreeBytes(installFolder);
-    PostLog(hwnd, L"Install free space: " + FormatBytes(installFree) + L"; archive size minimum: " + FormatBytes(archiveBytes));
-    if (installFree < archiveBytes) {
-      PostLog(hwnd, L"Not enough free space in the install folder for extraction.");
+    const uintmax_t unpackFree = FreeBytes(unpackFolder);
+    PostLog(hwnd, L"Unpack free space: " + FormatBytes(unpackFree) + L"; archive size minimum: " + FormatBytes(archiveBytes));
+    if (unpackFree < archiveBytes) {
+      PostLog(hwnd, L"Not enough free space in the unpack folder for extraction.");
       FinishWorker(hwnd, downloader);
       return;
     }
@@ -970,7 +1054,7 @@ void RunInstallWorker(HWND hwnd,
     return;
   }
 
-  const bool extracted = ExtractArchiveChain(hwnd, extractor, sevenZip.value(), *firstArchivePart, std::move(installFolder));
+  const bool extracted = ExtractArchiveChain(hwnd, extractor, sevenZip.value(), *firstArchivePart, std::move(unpackFolder));
   PostProgress(hwnd, extracted ? 100 : 0);
   FinishWorker(hwnd, downloader);
 }
@@ -993,6 +1077,19 @@ bool ValidateFolders(uintmax_t knownRequiredBytes = 0) {
   }
 
   const auto installText = GetText(g_installEdit);
+  const auto unpackFolder = SelectedUnpackFolder();
+  if (!unpackFolder.empty()) {
+    const auto result = validator.ValidateInstallFolder(unpackFolder, knownRequiredBytes);
+    AppendLog(L"Unpack folder: " + PathToDisplay(unpackFolder) + L" - " + Widen(result.message));
+    if (result.warning) {
+      AppendLog(L"Warning: " + Widen(result.message));
+    }
+    ok = ok && result.ok;
+  } else {
+    AppendLog(L"Unpack drive: not selected yet.");
+    ok = false;
+  }
+
   if (!installText.empty()) {
     const auto result = validator.ValidateInstallFolder(std::filesystem::path(installText), knownRequiredBytes);
     AppendLog(L"Install folder: " + Widen(result.message));
@@ -1001,17 +1098,20 @@ bool ValidateFolders(uintmax_t knownRequiredBytes = 0) {
     }
     ok = ok && result.ok;
   } else {
-    AppendLog(L"Install folder: not selected yet. Use a short path like D:\\Sky.");
+    AppendLog(L"Install folder: not selected yet.");
     ok = false;
   }
 
-  if (!downloadText.empty() && !installText.empty()) {
-    if (!validator.IsSameDrive(std::filesystem::path(downloadText), std::filesystem::path(installText))) {
-      AppendLog(L"Note: download and install folders are on different drives. Extraction temp will still stay under the install folder.");
+  if (!downloadText.empty() && !unpackFolder.empty()) {
+    if (!validator.IsSameDrive(std::filesystem::path(downloadText), unpackFolder)) {
+      AppendLog(L"Note: download and unpack folders are on different drives. Extraction temp will stay under the unpack folder.");
     }
   }
 
   if (!downloadText.empty() && !HasEnoughSpace(std::filesystem::path(downloadText), knownRequiredBytes, L"Download folder")) {
+    ok = false;
+  }
+  if (!unpackFolder.empty() && !HasEnoughSpace(unpackFolder, knownRequiredBytes, L"Unpack folder")) {
     ok = false;
   }
   if (!installText.empty() && !HasEnoughSpace(std::filesystem::path(installText), knownRequiredBytes, L"Install folder")) {
@@ -1108,6 +1208,7 @@ void StartInstall(HWND hwnd) {
   }
 
   const auto downloadFolder = std::filesystem::path(GetText(g_downloadEdit));
+  const auto unpackFolder = SelectedUnpackFolder();
   const auto installFolder = std::filesystem::path(GetText(g_installEdit));
   auto downloader = std::make_shared<modlist::LibtorrentDownloader>();
   {
@@ -1117,20 +1218,20 @@ void StartInstall(HWND hwnd) {
   g_workerRunning = true;
   SetControlsRunning(hwnd, true);
   g_closeAfterWorker = false;
-  std::thread(RunInstallWorker, hwnd, std::move(package.value()), downloadFolder, installFolder, downloader).detach();
+  std::thread(RunInstallWorker, hwnd, std::move(package.value()), downloadFolder, unpackFolder, installFolder, downloader).detach();
 }
 
-void RunUnpackWorker(HWND hwnd, std::filesystem::path archiveFirstPart, std::filesystem::path installFolder) {
+void RunUnpackWorker(HWND hwnd, std::filesystem::path archiveFirstPart, std::filesystem::path unpackFolder) {
   g_workerRunning = true;
   PostProgress(hwnd, 0);
   PostLog(hwnd, L"Unpacking without torrent validation: " + PathToDisplay(archiveFirstPart));
 
   const uintmax_t archiveBytes = EstimateNearbyArchiveBytes(archiveFirstPart.parent_path());
   if (archiveBytes > 0) {
-    const uintmax_t installFree = FreeBytes(installFolder);
-    PostLog(hwnd, L"Install free space: " + FormatBytes(installFree) + L"; archive size minimum: " + FormatBytes(archiveBytes));
-    if (installFree < archiveBytes) {
-      PostLog(hwnd, L"Not enough free space in the install folder for extraction.");
+    const uintmax_t unpackFree = FreeBytes(unpackFolder);
+    PostLog(hwnd, L"Unpack free space: " + FormatBytes(unpackFree) + L"; archive size minimum: " + FormatBytes(archiveBytes));
+    if (unpackFree < archiveBytes) {
+      PostLog(hwnd, L"Not enough free space in the unpack folder for extraction.");
       g_workerRunning = false;
       PostMessageW(hwnd, kWorkerFinishedMessage, 0, 0);
       return;
@@ -1146,7 +1247,7 @@ void RunUnpackWorker(HWND hwnd, std::filesystem::path archiveFirstPart, std::fil
     return;
   }
 
-  const bool extracted = ExtractArchiveChain(hwnd, extractor, sevenZip.value(), std::move(archiveFirstPart), std::move(installFolder));
+  const bool extracted = ExtractArchiveChain(hwnd, extractor, sevenZip.value(), std::move(archiveFirstPart), std::move(unpackFolder));
   PostProgress(hwnd, extracted ? 100 : 0);
   g_workerRunning = false;
   PostMessageW(hwnd, kWorkerFinishedMessage, 0, 0);
@@ -1159,13 +1260,19 @@ void UnpackOnly(HWND hwnd) {
   }
 
   const auto downloadFolder = std::filesystem::path(GetText(g_downloadEdit));
+  const auto unpackFolder = SelectedUnpackFolder();
   const auto installFolder = std::filesystem::path(GetText(g_installEdit));
-  if (downloadFolder.empty() || installFolder.empty()) {
-    AppendLog(L"Select download and install folders before unpacking.");
+  if (downloadFolder.empty() || unpackFolder.empty() || installFolder.empty()) {
+    AppendLog(L"Select download, unpack drive, and install folder before unpacking.");
     return;
   }
 
   modlist::PathValidator validator;
+  const auto unpack = validator.ValidateInstallFolder(unpackFolder);
+  AppendLog(L"Unpack folder: " + PathToDisplay(unpackFolder) + L" - " + Widen(unpack.message));
+  if (!unpack.ok) {
+    return;
+  }
   const auto install = validator.ValidateInstallFolder(installFolder);
   AppendLog(L"Install folder: " + Widen(install.message));
   if (!install.ok) {
@@ -1184,7 +1291,7 @@ void UnpackOnly(HWND hwnd) {
   g_workerRunning = true;
   SetControlsRunning(hwnd, true);
   g_closeAfterWorker = false;
-  std::thread(RunUnpackWorker, hwnd, *archive, installFolder).detach();
+  std::thread(RunUnpackWorker, hwnd, *archive, unpackFolder).detach();
 }
 
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
@@ -1210,8 +1317,11 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
       g_welcomeTitle = CreateLabel(hwnd, L"Modlist Installer", 16, 92, 720, 38);
       g_welcomeBody = CreateLabel(hwnd, L"Welcome text will be added later.", 16, 146, 720, 90);
       g_downloadLabel = CreateLabel(hwnd, L"Download", 16, 112, 100, 20);
-      g_installLabel = CreateLabel(hwnd, L"Install", 16, 154, 100, 20);
+      g_unpackDriveLabel = CreateLabel(hwnd, L"Unpack drive", 16, 136, 100, 20);
+      g_unpackTargetLabel = CreateLabel(hwnd, L"Target: choose a drive", 160, 136, 420, 20);
+      g_installLabel = CreateLabel(hwnd, L"Install", 16, 178, 100, 20);
       g_downloadEdit = CreateEdit(hwnd, kDownloadEdit, 120, 22, 420, 25);
+      g_unpackDriveCombo = CreateCombo(hwnd, kUnpackDriveCombo, 120, 132, 120, 180);
       g_installEdit = CreateEdit(hwnd, kInstallEdit, 120, 57, 420, 25);
       CreateButton(hwnd, kDownloadBrowse, L"Browse", 550, 22, 88, 25);
       CreateButton(hwnd, kInstallBrowse, L"Browse", 550, 57, 88, 25);
@@ -1237,8 +1347,11 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
       SetControlFont(g_welcomeTitle, g_titleFont);
       SetControlFont(g_welcomeBody, g_bodyFont);
       SetControlFont(g_downloadLabel, g_labelFont);
+      SetControlFont(g_unpackDriveLabel, g_labelFont);
+      SetControlFont(g_unpackTargetLabel, g_bodyFont);
       SetControlFont(g_installLabel, g_labelFont);
       SetControlFont(g_downloadEdit, g_bodyFont);
+      SetControlFont(g_unpackDriveCombo, g_bodyFont);
       SetControlFont(g_installEdit, g_bodyFont);
       SetControlFont(g_statusLabel, g_bodyFont);
       SetControlFont(g_logEdit, g_bodyFont);
@@ -1255,7 +1368,8 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
       SendMessageW(g_progress, PBM_SETBARCOLOR, 0, static_cast<LPARAM>(RGB(41, 111, 205)));
       SendMessageW(g_progress, PBM_SETBKCOLOR, 0, static_cast<LPARAM>(RGB(226, 231, 239)));
       SetText(g_downloadEdit, DownloadsFolder().wstring());
-      SetText(g_installEdit, L"D:\\Sky");
+      PopulateDriveCombo();
+      SetText(g_installEdit, L"");
       AppendLog(L"App log: " + PathToDisplay(AppLogPath()));
       AppendLog(L"Place exactly one .torrent file in: " + PathToDisplay(PackageFolder()));
       auto package = ReadPackageFromUi();
@@ -1270,7 +1384,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
       } else {
         AppendLog(L"Torrent auto-detect: " + Widen(package.error()));
       }
-      AppendLog(L"Use a short install path near the drive root, for example D:\\Sky.");
+      AppendLog(L"Choose an unpack drive; the unpack folder will be created as <drive>:\\Sky.");
       Layout(hwnd);
       ShowWizardPage(hwnd, WizardPage::Welcome);
       return 0;
@@ -1327,6 +1441,8 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
         if (auto path = PickFolder(hwnd)) {
           SetText(g_installEdit, path->wstring());
         }
+      } else if (id == kUnpackDriveCombo && HIWORD(wParam) == CBN_SELCHANGE) {
+        UpdateUnpackTargetLabel();
       } else if (id == kValidateButton) {
         ValidatePackage();
       } else if (id == kStartButton) {

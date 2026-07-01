@@ -18,6 +18,8 @@ Put exactly one `.torrent` file in `InstallerApp/dist/package`, then run the exe
 - Owner-drawn installer-style buttons with hover, pressed, focus, and disabled states.
 - Welcome page with placeholder greeting text.
 - Folder selection page.
+- Separate choices for download folder, unpack drive, and final install folder.
+- Unpack drive selection automatically resolves to `X:\Sky`.
 - Download and validation page.
 - Auto-detects one `.torrent` from the `package` folder.
 - Torrent download through libtorrent-rasterbar.
@@ -44,7 +46,7 @@ MyPack/
       7z.exe
 ```
 
-Run `modlist-installer.exe`, choose a download folder and a short install folder such as `D:\Sky`, then press `Start`.
+Run `modlist-installer.exe`, choose a download folder, choose the drive to unpack to, choose the final install folder, then press `Start`. The unpack target is always generated as `<drive>:\Sky`.
 
 Use `Unpack` when the archive is already downloaded and you want to skip torrent validation/download.
 

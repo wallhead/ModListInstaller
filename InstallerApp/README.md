@@ -32,8 +32,8 @@ Copy it into `dist`, then put exactly one `.torrent` file in `dist\package`. The
 
 The `Start` button runs the install pipeline on a background thread:
 
-- detect the torrent next to the exe
-- validate download and install folders
+- detect the torrent in the package folder
+- validate download, unpack, and install folders
 - check known archive size against free space when local archive parts are present
 - read total payload size directly from the `.torrent` file before downloading
 - check remaining torrent size against download free space once torrent metadata is available
@@ -45,7 +45,7 @@ The `Start` button runs the install pipeline on a background thread:
 - release torrent file handles before 7-Zip starts
 - unpack directly from an existing `.7z.001` with the `Unpack` button, skipping torrent validation/download
 - look for a `.7z.001` archive after download
-- check install free space again before extraction
+- check unpack free space again before extraction
 - show live unpack percentage in the progress bar and status line
 - automatically run a second extraction pass when a split `.7z.001` contains one inner `.7z`
 - extract with bundled 7-Zip into the selected install folder
@@ -53,10 +53,12 @@ The `Start` button runs the install pipeline on a background thread:
 The GUI is organized as a three-step wizard:
 
 - welcome page
-- folder selection page
+- folder selection page with download folder, unpack drive, and final install folder
 - download and validation page
 
 The window uses a classic installer-inspired color scheme with a blue side rail, white content area, grey navigation footer, and owner-drawn buttons with hover/pressed/focus states. The welcome text is intentionally placeholder copy for now.
+
+The unpack drive selector asks only for a drive letter. The app derives the unpack target as `<drive>:\Sky`, for example `X:\Sky`.
 
 The default build reports a clear error until libtorrent-rasterbar is linked with `xmake f --use_libtorrent=y`.
 
