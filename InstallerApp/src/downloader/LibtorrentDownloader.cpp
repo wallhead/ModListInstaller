@@ -12,12 +12,23 @@
 #include <libtorrent/torrent_info.hpp>
 #endif
 
+#include <algorithm>
+#include <thread>
+
 namespace modlist {
 
 #if defined(MODLIST_HAVE_LIBTORRENT)
 namespace lt = libtorrent;
 
 namespace {
+
+int BoundedWorkerCount(unsigned int reserveForUi = 1, int minimum = 2, int maximum = 4) {
+  const unsigned int detected = std::thread::hardware_concurrency();
+  if (detected <= reserveForUi) {
+    return minimum;
+  }
+  return std::clamp(static_cast<int>(detected - reserveForUi), minimum, maximum);
+}
 
 lt::session MakeSession() {
   lt::settings_pack settings;
@@ -26,10 +37,10 @@ lt::session MakeSession() {
   settings.set_int(lt::settings_pack::active_downloads, 1);
   settings.set_int(lt::settings_pack::active_limit, 1);
   settings.set_int(lt::settings_pack::connections_limit, 80);
-  settings.set_int(lt::settings_pack::aio_threads, 2);
-  settings.set_int(lt::settings_pack::hashing_threads, 1);
-  settings.set_int(lt::settings_pack::checking_mem_usage, 64);
-  settings.set_int(lt::settings_pack::max_queued_disk_bytes, 4 * 1024 * 1024);
+  settings.set_int(lt::settings_pack::aio_threads, BoundedWorkerCount(2, 2, 4));
+  settings.set_int(lt::settings_pack::hashing_threads, BoundedWorkerCount(1, 2, 4));
+  settings.set_int(lt::settings_pack::checking_mem_usage, 4096);
+  settings.set_int(lt::settings_pack::max_queued_disk_bytes, 32 * 1024 * 1024);
   settings.set_int(lt::settings_pack::disk_io_read_mode, lt::settings_pack::disable_os_cache);
   settings.set_int(lt::settings_pack::disk_io_write_mode, lt::settings_pack::write_through);
   lt::session_params params(settings);
