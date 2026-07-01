@@ -37,7 +37,7 @@ The `Install` button runs the install pipeline on a background thread:
 - check known archive size against free space when local archive parts are present
 - read total payload size directly from the `.torrent` file
 - validate local archive files through libtorrent without starting a network download
-- use non-mmap disk validation with bounded parallel hashing and capped memory for large archives
+- use multithreaded local torrent validation with bounded parallel hashing and capped memory for large archives
 - show local validation progress and ETA
 - stop active validation
 - force-check torrent data before extraction

@@ -23,7 +23,7 @@ Put exactly one `.torrent` file in `package\` and the complete multi-volume arch
 - Validation and install page.
 - Auto-detects one `.torrent` from the `package` folder.
 - Validates local archive files through libtorrent-rasterbar without starting a network download.
-- Uses non-mmap disk validation with bounded parallel hashing and capped memory for large archives.
+- Uses multithreaded local torrent validation with bounded parallel hashing and capped memory for large archives.
 - Shows local validation progress and ETA before unpacking.
 - Stop control for active validation.
 - Force-checks torrent data before unpacking.

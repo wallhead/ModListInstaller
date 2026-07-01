@@ -10,10 +10,17 @@
 #include <libtorrent/torrent_flags.hpp>
 #include <libtorrent/torrent_handle.hpp>
 #include <libtorrent/torrent_info.hpp>
+
+#include <openssl/evp.h>
 #endif
 
 #include <algorithm>
+#include <atomic>
+#include <condition_variable>
+#include <fstream>
+#include <sstream>
 #include <thread>
+#include <vector>
 
 namespace modlist {
 
@@ -30,6 +37,10 @@ int BoundedWorkerCount(unsigned int reserveForUi = 1, int minimum = 2, int maxim
   return std::clamp(static_cast<int>(detected - reserveForUi), minimum, maximum);
 }
 
+int ValidationWorkerCount() {
+  return BoundedWorkerCount(1, 2, 8);
+}
+
 lt::session MakeSession() {
   lt::settings_pack settings;
   settings.set_bool(lt::settings_pack::enable_dht, true);
@@ -39,13 +50,138 @@ lt::session MakeSession() {
   settings.set_int(lt::settings_pack::connections_limit, 80);
   settings.set_int(lt::settings_pack::aio_threads, BoundedWorkerCount(2, 2, 4));
   settings.set_int(lt::settings_pack::hashing_threads, BoundedWorkerCount(1, 2, 4));
-  settings.set_int(lt::settings_pack::checking_mem_usage, 4096);
-  settings.set_int(lt::settings_pack::max_queued_disk_bytes, 32 * 1024 * 1024);
+  settings.set_int(lt::settings_pack::checking_mem_usage, 8192);
+  settings.set_int(lt::settings_pack::max_queued_disk_bytes, 64 * 1024 * 1024);
   settings.set_int(lt::settings_pack::disk_io_read_mode, lt::settings_pack::disable_os_cache);
   settings.set_int(lt::settings_pack::disk_io_write_mode, lt::settings_pack::write_through);
   lt::session_params params(settings);
   params.disk_io_constructor = lt::posix_disk_io_constructor;
   return lt::session(std::move(params));
+}
+
+std::string SlicePath(const lt::torrent_info& info,
+                      const lt::file_slice& slice,
+                      const std::filesystem::path& root) {
+  return info.files().file_path(slice.file_index, root.string());
+}
+
+class Sha1Hasher {
+public:
+  Sha1Hasher() : context_(EVP_MD_CTX_new()) {
+    ok_ = context_ != nullptr && EVP_DigestInit_ex(context_, EVP_sha1(), nullptr) == 1;
+  }
+
+  ~Sha1Hasher() {
+    EVP_MD_CTX_free(context_);
+  }
+
+  bool ok() const {
+    return ok_;
+  }
+
+  bool Update(const void* data, size_t size) {
+    ok_ = ok_ && EVP_DigestUpdate(context_, data, size) == 1;
+    return ok_;
+  }
+
+  bool Final(lt::sha1_hash& hash) {
+    unsigned char digest[lt::sha1_hash::size()]{};
+    unsigned int length = 0;
+    ok_ = ok_ && EVP_DigestFinal_ex(context_, digest, &length) == 1 && length == lt::sha1_hash::size();
+    if (!ok_) {
+      return false;
+    }
+    hash.assign(reinterpret_cast<const char*>(digest));
+    return true;
+  }
+
+private:
+  EVP_MD_CTX* context_{nullptr};
+  bool ok_{false};
+};
+
+bool FeedZeros(Sha1Hasher& hasher, std::int64_t bytes) {
+  constexpr int kChunkSize = 4 * 1024 * 1024;
+  std::vector<char> zeros(kChunkSize, '\0');
+  while (bytes > 0) {
+    const int chunk = static_cast<int>(std::min<std::int64_t>(bytes, kChunkSize));
+    if (!hasher.Update(zeros.data(), static_cast<size_t>(chunk))) {
+      return false;
+    }
+    bytes -= chunk;
+  }
+  return true;
+}
+
+bool ValidatePiece(const lt::torrent_info& info,
+                   int pieceIndex,
+                   const std::filesystem::path& root,
+                   std::string& error) {
+  constexpr int kChunkSize = 4 * 1024 * 1024;
+  const lt::piece_index_t piece(pieceIndex);
+  const int pieceSize = info.piece_size(piece);
+  const auto slices = info.map_block(piece, 0, pieceSize);
+  std::vector<char> buffer(kChunkSize);
+  Sha1Hasher hasher;
+  if (!hasher.ok()) {
+    error = "Unable to initialize SHA1 validator.";
+    return false;
+  }
+
+  for (const auto& slice : slices) {
+    if (info.files().pad_file_at(slice.file_index)) {
+      if (!FeedZeros(hasher, slice.size)) {
+        error = "Unable to hash torrent padding data.";
+        return false;
+      }
+      continue;
+    }
+
+    const auto path = SlicePath(info, slice, root);
+    std::ifstream file{std::filesystem::path(path), std::ios::binary};
+    if (!file) {
+      error = "Missing package file: " + path;
+      return false;
+    }
+    file.seekg(slice.offset, std::ios::beg);
+    if (!file) {
+      error = "Unable to seek package file: " + path;
+      return false;
+    }
+
+    std::int64_t remaining = slice.size;
+    while (remaining > 0) {
+      const std::streamsize chunk = static_cast<std::streamsize>(
+          std::min<std::int64_t>(remaining, static_cast<std::int64_t>(buffer.size())));
+      file.read(buffer.data(), chunk);
+      const std::streamsize read = file.gcount();
+      if (read <= 0) {
+        std::ostringstream out;
+        out << "Package file ended early while validating piece " << pieceIndex << ": " << path;
+        error = out.str();
+        return false;
+      }
+      if (!hasher.Update(buffer.data(), static_cast<size_t>(read))) {
+        error = "Unable to hash package data.";
+        return false;
+      }
+      remaining -= read;
+    }
+  }
+
+  lt::sha1_hash actual;
+  if (!hasher.Final(actual)) {
+    error = "Unable to finish SHA1 validation.";
+    return false;
+  }
+  if (actual != info.hash_for_piece(piece)) {
+    std::ostringstream out;
+    out << "Piece hash mismatch at piece " << pieceIndex << ".";
+    error = out.str();
+    return false;
+  }
+
+  return true;
 }
 
 }  // namespace
@@ -56,8 +192,30 @@ struct LibtorrentDownloader::Impl {
   bool recheckRequested{false};
   bool recheckObserved{false};
   bool validationOnly{false};
+  std::thread validationThread;
+  std::atomic_bool validationRunning{false};
+  std::atomic_bool validationCancelRequested{false};
+  std::atomic_bool validationPauseRequested{false};
+  std::mutex validationPauseMutex;
+  std::condition_variable validationPauseCv;
 
   Impl() : session(MakeSession()) {}
+  ~Impl() {
+    StopValidation();
+    JoinValidation();
+  }
+
+  void StopValidation() {
+    validationCancelRequested = true;
+    validationPauseRequested = false;
+    validationPauseCv.notify_all();
+  }
+
+  void JoinValidation() {
+    if (validationThread.joinable()) {
+      validationThread.join();
+    }
+  }
 };
 #endif
 
@@ -130,6 +288,13 @@ void LibtorrentDownloader::Start(const DownloadConfig& config) {
 }
 
 void LibtorrentDownloader::StartLocalValidation(const DownloadConfig& config) {
+#if defined(MODLIST_HAVE_LIBTORRENT)
+  if (impl_) {
+    impl_->StopValidation();
+    impl_->JoinValidation();
+  }
+#endif
+
   std::lock_guard<std::mutex> lock(mutex_);
   status_ = {};
   status_.stage = DownloadStage::Loading;
@@ -139,35 +304,21 @@ void LibtorrentDownloader::StartLocalValidation(const DownloadConfig& config) {
 #if defined(MODLIST_HAVE_LIBTORRENT)
   if (impl_) {
     impl_->validationOnly = true;
+    impl_->recheckRequested = false;
+    impl_->recheckObserved = false;
+    impl_->handle = lt::torrent_handle();
+    impl_->validationCancelRequested = false;
+    impl_->validationPauseRequested = false;
   }
-  lt::add_torrent_params params;
-  params.save_path = config.downloadFolder.string();
-  params.trackers = config.trackers;
-
-  lt::error_code ec;
   if (config.torrent.type == TorrentSourceType::Magnet) {
-    params = lt::parse_magnet_uri(config.torrent.source, ec);
-    params.save_path = config.downloadFolder.string();
-    params.trackers.insert(params.trackers.end(), config.trackers.begin(), config.trackers.end());
-  } else {
-    params.ti = std::make_shared<lt::torrent_info>(config.torrent.source, ec);
-  }
-  params.flags |= lt::torrent_flags::paused;
-  if (ec) {
-    SetFailure("Unable to load torrent: " + ec.message());
+    SetFailure("Local validation requires a .torrent file.");
     return;
   }
-
-  impl_->handle = impl_->session.add_torrent(params, ec);
-  if (ec) {
-    SetFailure("Unable to start torrent validation: " + ec.message());
-    return;
-  }
-  impl_->handle.force_recheck();
-  impl_->recheckRequested = true;
-  impl_->recheckObserved = false;
   status_.stage = DownloadStage::Checking;
   status_.stateText = "Validating local files";
+  status_.trackerCount = ValidationWorkerCount();
+  impl_->validationRunning = true;
+  impl_->validationThread = std::thread(&LibtorrentDownloader::RunLocalValidation, this, config);
 #else
   (void)config;
   SetFailure("libtorrent-rasterbar backend is not enabled. Configure with -DMODLIST_USE_LIBTORRENT=ON after installing libtorrent.");
@@ -180,6 +331,9 @@ void LibtorrentDownloader::Cancel() {
   if (impl_ && impl_->handle.is_valid()) {
     impl_->session.remove_torrent(impl_->handle);
   }
+  if (impl_) {
+    impl_->StopValidation();
+  }
 #endif
   status_.stage = DownloadStage::Cancelled;
   status_.stateText = "Cancelled";
@@ -188,22 +342,31 @@ void LibtorrentDownloader::Cancel() {
 void LibtorrentDownloader::Pause() {
   std::lock_guard<std::mutex> lock(mutex_);
 #if defined(MODLIST_HAVE_LIBTORRENT)
-  if (impl_ && impl_->handle.is_valid()) {
+  if (impl_ && impl_->validationRunning) {
+    impl_->validationPauseRequested = true;
+    status_.stage = DownloadStage::Paused;
+    status_.stateText = "Paused";
+  } else if (impl_ && impl_->handle.is_valid()) {
     impl_->handle.pause();
+    status_.stage = DownloadStage::Paused;
+    status_.stateText = "Paused";
   }
 #endif
-  status_.stage = DownloadStage::Paused;
-  status_.stateText = "Paused";
 }
 
 void LibtorrentDownloader::Resume() {
   std::lock_guard<std::mutex> lock(mutex_);
 #if defined(MODLIST_HAVE_LIBTORRENT)
-  if (impl_ && impl_->handle.is_valid()) {
+  if (impl_ && impl_->validationRunning) {
+    impl_->validationPauseRequested = false;
+    impl_->validationPauseCv.notify_all();
+    status_.stage = DownloadStage::Checking;
+    status_.stateText = "Validating local files";
+  } else if (impl_ && impl_->handle.is_valid()) {
     impl_->handle.resume();
+    status_.stage = DownloadStage::Downloading;
+    status_.stateText = "Downloading";
   }
-  status_.stage = DownloadStage::Downloading;
-  status_.stateText = "Downloading";
 #else
   SetFailure("libtorrent-rasterbar backend is not enabled.");
 #endif
@@ -225,10 +388,143 @@ void LibtorrentDownloader::ForceRecheck() {
 }
 
 void LibtorrentDownloader::ReleaseFiles() {
-  std::lock_guard<std::mutex> lock(mutex_);
 #if defined(MODLIST_HAVE_LIBTORRENT)
+  if (impl_) {
+    impl_->StopValidation();
+    impl_->JoinValidation();
+  }
+  std::lock_guard<std::mutex> lock(mutex_);
   impl_.reset();
   impl_ = std::make_unique<Impl>();
+#else
+  std::lock_guard<std::mutex> lock(mutex_);
+#endif
+}
+
+void LibtorrentDownloader::RunLocalValidation(DownloadConfig config) {
+#if defined(MODLIST_HAVE_LIBTORRENT)
+  lt::error_code ec;
+  lt::torrent_info info(config.torrent.source, ec);
+  if (ec) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    SetFailure("Unable to load torrent: " + ec.message());
+    if (impl_) {
+      impl_->validationRunning = false;
+    }
+    return;
+  }
+
+  const int totalPieces = info.num_pieces();
+  const auto totalBytes = info.total_size();
+  if (totalPieces <= 0 || totalBytes <= 0) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    SetFailure("Torrent metadata reported an invalid payload.");
+    if (impl_) {
+      impl_->validationRunning = false;
+    }
+    return;
+  }
+
+  const int workerCount = std::min(ValidationWorkerCount(), totalPieces);
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    status_.stage = DownloadStage::Checking;
+    status_.stateText = "Validating local files";
+    status_.progress = 0.0f;
+    status_.downloadedBytes = 0;
+    status_.totalBytes = totalBytes;
+    status_.trackerCount = workerCount;
+  }
+
+  std::atomic<int> nextPiece{0};
+  std::atomic<std::int64_t> validatedBytes{0};
+  std::atomic_bool failed{false};
+  std::vector<std::thread> workers;
+  workers.reserve(static_cast<size_t>(workerCount));
+
+  auto failValidation = [&](const std::string& message) {
+    bool expected = false;
+    if (failed.compare_exchange_strong(expected, true)) {
+      std::lock_guard<std::mutex> lock(mutex_);
+      SetFailure("Local package validation failed. " + message);
+    }
+    if (impl_) {
+      impl_->validationCancelRequested = true;
+      impl_->validationPauseRequested = false;
+      impl_->validationPauseCv.notify_all();
+    }
+  };
+
+  auto worker = [&]() {
+    while (true) {
+      if (impl_ == nullptr || impl_->validationCancelRequested || failed) {
+        return;
+      }
+      {
+        std::unique_lock<std::mutex> pauseLock(impl_->validationPauseMutex);
+        impl_->validationPauseCv.wait(pauseLock, [&]() {
+          return !impl_->validationPauseRequested || impl_->validationCancelRequested || failed.load();
+        });
+      }
+      if (impl_->validationCancelRequested || failed) {
+        return;
+      }
+
+      const int pieceIndex = nextPiece.fetch_add(1);
+      if (pieceIndex >= totalPieces) {
+        return;
+      }
+
+      std::string error;
+      if (!ValidatePiece(info, pieceIndex, config.downloadFolder, error)) {
+        failValidation(error);
+        return;
+      }
+
+      const auto done = validatedBytes.fetch_add(info.piece_size(lt::piece_index_t(pieceIndex))) +
+                        info.piece_size(lt::piece_index_t(pieceIndex));
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (status_.stage == DownloadStage::Checking || status_.stage == DownloadStage::Paused) {
+        status_.stage = impl_->validationPauseRequested ? DownloadStage::Paused : DownloadStage::Checking;
+        status_.stateText = impl_->validationPauseRequested ? "Paused" : "Validating local files";
+        status_.downloadedBytes = std::min<std::int64_t>(done, totalBytes);
+        status_.totalBytes = totalBytes;
+        status_.progress = static_cast<float>(
+            static_cast<double>(status_.downloadedBytes) / static_cast<double>(totalBytes));
+      }
+    }
+  };
+
+  for (int i = 0; i < workerCount; ++i) {
+    workers.emplace_back(worker);
+  }
+  for (auto& thread : workers) {
+    if (thread.joinable()) {
+      thread.join();
+    }
+  }
+
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (impl_) {
+    impl_->validationRunning = false;
+  }
+  if (failed || status_.stage == DownloadStage::Failed) {
+    return;
+  }
+  if (impl_ && impl_->validationCancelRequested) {
+    status_.stage = DownloadStage::Cancelled;
+    status_.stateText = "Cancelled";
+    return;
+  }
+
+  status_.stage = DownloadStage::Completed;
+  status_.stateText = "Validated";
+  status_.progress = 1.0f;
+  status_.downloadedBytes = totalBytes;
+  status_.totalBytes = totalBytes;
+  status_.etaSeconds = 0;
+#else
+  (void)config;
 #endif
 }
 
@@ -237,7 +533,7 @@ DownloadStatus LibtorrentDownloader::GetStatus() const {
   DownloadStatus current = status_;
 
 #if defined(MODLIST_HAVE_LIBTORRENT)
-  if (impl_ && impl_->handle.is_valid()) {
+  if (impl_ && impl_->handle.is_valid() && !impl_->validationOnly) {
     const auto s = impl_->handle.status();
     current.progress = s.progress;
     current.downloadRateBytesPerSecond = s.download_rate;

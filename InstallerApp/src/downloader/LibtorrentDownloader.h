@@ -28,6 +28,7 @@ public:
 
 private:
   void SetFailure(const std::string& message);
+  void RunLocalValidation(DownloadConfig config);
 
   mutable std::mutex mutex_;
   DownloadStatus status_;
