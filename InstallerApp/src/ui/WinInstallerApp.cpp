@@ -73,6 +73,7 @@ HWND g_nextButton = nullptr;
 HWND g_hotButton = nullptr;
 WizardPage g_page = WizardPage::Welcome;
 HBRUSH g_contentBrush = nullptr;
+HBRUSH g_headerBrush = nullptr;
 HBRUSH g_panelBrush = nullptr;
 HBRUSH g_footerBrush = nullptr;
 HBRUSH g_editBrush = nullptr;
@@ -88,6 +89,7 @@ std::shared_ptr<modlist::LibtorrentDownloader> g_activeDownloader;
 constexpr COLORREF kRailColor = RGB(12, 18, 24);
 constexpr COLORREF kRailDarkColor = RGB(5, 8, 11);
 constexpr COLORREF kContentColor = RGB(17, 24, 31);
+constexpr COLORREF kHeaderColor = RGB(23, 42, 55);
 constexpr COLORREF kPanelColor = RGB(20, 29, 38);
 constexpr COLORREF kEditColor = RGB(11, 17, 23);
 constexpr COLORREF kFooterColor = RGB(13, 18, 24);
@@ -120,6 +122,43 @@ std::string Narrow(const std::wstring& text) {
   std::string narrow(static_cast<size_t>(size), '\0');
   WideCharToMultiByte(CP_UTF8, 0, text.data(), static_cast<int>(text.size()), narrow.data(), size, nullptr, nullptr);
   return narrow;
+}
+
+void SetDwmColorAttribute(HWND hwnd, DWORD attribute, COLORREF color) {
+  HMODULE dwm = LoadLibraryW(L"dwmapi.dll");
+  if (dwm == nullptr) {
+    return;
+  }
+
+  using DwmSetWindowAttributeFn = HRESULT(WINAPI*)(HWND, DWORD, LPCVOID, DWORD);
+  auto setWindowAttribute =
+      reinterpret_cast<DwmSetWindowAttributeFn>(GetProcAddress(dwm, "DwmSetWindowAttribute"));
+  if (setWindowAttribute != nullptr) {
+    setWindowAttribute(hwnd, attribute, &color, sizeof(color));
+  }
+  FreeLibrary(dwm);
+}
+
+void ApplyWindowFrameTheme(HWND hwnd) {
+  BOOL darkMode = TRUE;
+  HMODULE dwm = LoadLibraryW(L"dwmapi.dll");
+  if (dwm != nullptr) {
+    using DwmSetWindowAttributeFn = HRESULT(WINAPI*)(HWND, DWORD, LPCVOID, DWORD);
+    auto setWindowAttribute =
+        reinterpret_cast<DwmSetWindowAttributeFn>(GetProcAddress(dwm, "DwmSetWindowAttribute"));
+    if (setWindowAttribute != nullptr) {
+      constexpr DWORD kUseImmersiveDarkMode = 20;
+      setWindowAttribute(hwnd, kUseImmersiveDarkMode, &darkMode, sizeof(darkMode));
+    }
+    FreeLibrary(dwm);
+  }
+
+  constexpr DWORD kDwmwaBorderColor = 34;
+  constexpr DWORD kDwmwaCaptionColor = 35;
+  constexpr DWORD kDwmwaTextColor = 36;
+  SetDwmColorAttribute(hwnd, kDwmwaBorderColor, kLineColor);
+  SetDwmColorAttribute(hwnd, kDwmwaCaptionColor, kHeaderColor);
+  SetDwmColorAttribute(hwnd, kDwmwaTextColor, kPrimaryTextColor);
 }
 
 std::filesystem::path ModuleFolder() {
@@ -388,6 +427,7 @@ void PaintInstallerChrome(HWND hwnd, HDC dc) {
   const int width = rect.right - rect.left;
   const int height = rect.bottom - rect.top;
   constexpr int railWidth = 116;
+  constexpr int headerHeight = 66;
   constexpr int footerHeight = 66;
 
   RECT content{0, 0, width, height};
@@ -395,6 +435,9 @@ void PaintInstallerChrome(HWND hwnd, HDC dc) {
 
   RECT panel{railWidth, 0, width, height - footerHeight};
   FillRect(dc, &panel, g_panelBrush);
+
+  RECT header{railWidth, 0, width, headerHeight};
+  FillRect(dc, &header, g_headerBrush);
 
   RECT rail{0, 0, railWidth, height - footerHeight};
   HBRUSH railBrush = CreateSolidBrush(kRailColor);
@@ -411,6 +454,8 @@ void PaintInstallerChrome(HWND hwnd, HDC dc) {
 
   HPEN linePen = CreatePen(PS_SOLID, 1, kLineColor);
   HPEN oldPen = static_cast<HPEN>(SelectObject(dc, linePen));
+  MoveToEx(dc, railWidth, headerHeight, nullptr);
+  LineTo(dc, width, headerHeight);
   MoveToEx(dc, 0, height - footerHeight, nullptr);
   LineTo(dc, width, height - footerHeight);
   MoveToEx(dc, railWidth, 0, nullptr);
@@ -1311,7 +1356,9 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
       std::filesystem::create_directories(PackageFolder());
       std::filesystem::create_directories(DownloadsFolder());
       std::filesystem::create_directories(ExeFolder() / "tools" / "7zip");
+      ApplyWindowFrameTheme(hwnd);
       g_contentBrush = CreateSolidBrush(kContentColor);
+      g_headerBrush = CreateSolidBrush(kHeaderColor);
       g_panelBrush = CreateSolidBrush(kPanelColor);
       g_footerBrush = CreateSolidBrush(kFooterColor);
       g_editBrush = CreateSolidBrush(kEditColor);
@@ -1417,6 +1464,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
       }
       if (control == g_stepLabel) {
         SetTextColor(dc, kAccentTextColor);
+        return reinterpret_cast<LRESULT>(g_headerBrush);
       } else if (control == g_welcomeTitle) {
         SetTextColor(dc, kPrimaryTextColor);
       } else if (control == g_welcomeBody || control == g_statusLabel || control == g_unpackTargetLabel) {
@@ -1510,6 +1558,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
       return 0;
     case WM_DESTROY:
       DeleteObject(g_contentBrush);
+      DeleteObject(g_headerBrush);
       DeleteObject(g_panelBrush);
       DeleteObject(g_footerBrush);
       DeleteObject(g_editBrush);
