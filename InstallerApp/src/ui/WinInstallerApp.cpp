@@ -73,6 +73,7 @@ HWND g_nextButton = nullptr;
 HWND g_hotButton = nullptr;
 WizardPage g_page = WizardPage::Welcome;
 HBRUSH g_contentBrush = nullptr;
+HBRUSH g_panelBrush = nullptr;
 HBRUSH g_footerBrush = nullptr;
 HBRUSH g_editBrush = nullptr;
 HFONT g_stepFont = nullptr;
@@ -84,20 +85,22 @@ std::atomic_bool g_closeAfterWorker{false};
 std::mutex g_downloaderMutex;
 std::shared_ptr<modlist::LibtorrentDownloader> g_activeDownloader;
 
-constexpr COLORREF kRailColor = RGB(27, 58, 107);
-constexpr COLORREF kRailDarkColor = RGB(18, 39, 74);
-constexpr COLORREF kContentColor = RGB(255, 255, 255);
-constexpr COLORREF kFooterColor = RGB(240, 240, 240);
-constexpr COLORREF kLineColor = RGB(208, 213, 222);
-constexpr COLORREF kPrimaryTextColor = RGB(28, 37, 52);
-constexpr COLORREF kMutedTextColor = RGB(91, 101, 118);
-constexpr COLORREF kAccentTextColor = RGB(32, 82, 149);
-constexpr COLORREF kButtonFaceColor = RGB(244, 244, 244);
-constexpr COLORREF kButtonHoverColor = RGB(232, 240, 252);
-constexpr COLORREF kButtonPressedColor = RGB(214, 228, 248);
-constexpr COLORREF kButtonBorderColor = RGB(132, 139, 150);
-constexpr COLORREF kButtonHoverBorderColor = RGB(59, 119, 191);
-constexpr COLORREF kButtonDisabledTextColor = RGB(145, 150, 160);
+constexpr COLORREF kRailColor = RGB(12, 18, 24);
+constexpr COLORREF kRailDarkColor = RGB(5, 8, 11);
+constexpr COLORREF kContentColor = RGB(17, 24, 31);
+constexpr COLORREF kPanelColor = RGB(20, 29, 38);
+constexpr COLORREF kEditColor = RGB(11, 17, 23);
+constexpr COLORREF kFooterColor = RGB(13, 18, 24);
+constexpr COLORREF kLineColor = RGB(43, 55, 68);
+constexpr COLORREF kPrimaryTextColor = RGB(220, 226, 232);
+constexpr COLORREF kMutedTextColor = RGB(139, 151, 163);
+constexpr COLORREF kAccentTextColor = RGB(136, 188, 225);
+constexpr COLORREF kButtonFaceColor = RGB(24, 34, 45);
+constexpr COLORREF kButtonHoverColor = RGB(33, 50, 66);
+constexpr COLORREF kButtonPressedColor = RGB(13, 23, 33);
+constexpr COLORREF kButtonBorderColor = RGB(70, 86, 103);
+constexpr COLORREF kButtonHoverBorderColor = RGB(132, 191, 232);
+constexpr COLORREF kButtonDisabledTextColor = RGB(94, 106, 118);
 
 std::wstring Widen(const std::string& text) {
   if (text.empty()) {
@@ -390,6 +393,9 @@ void PaintInstallerChrome(HWND hwnd, HDC dc) {
   RECT content{0, 0, width, height};
   FillRect(dc, &content, g_contentBrush);
 
+  RECT panel{railWidth, 0, width, height - footerHeight};
+  FillRect(dc, &panel, g_panelBrush);
+
   RECT rail{0, 0, railWidth, height - footerHeight};
   HBRUSH railBrush = CreateSolidBrush(kRailColor);
   FillRect(dc, &rail, railBrush);
@@ -413,7 +419,7 @@ void PaintInstallerChrome(HWND hwnd, HDC dc) {
   DeleteObject(linePen);
 
   SetBkMode(dc, TRANSPARENT);
-  SetTextColor(dc, RGB(238, 244, 255));
+  SetTextColor(dc, RGB(180, 195, 207));
   HFONT oldFont = static_cast<HFONT>(SelectObject(dc, g_labelFont));
   RECT railText{18, 26, railWidth - 12, 88};
   DrawTextW(dc, L"MODLIST", -1, &railText, DT_LEFT | DT_TOP | DT_SINGLELINE);
@@ -434,8 +440,8 @@ void DrawNsisButton(const DRAWITEMSTRUCT& item) {
   COLORREF border = kButtonBorderColor;
   COLORREF textColor = kPrimaryTextColor;
   if (disabled) {
-    fill = RGB(235, 235, 235);
-    border = RGB(178, 178, 178);
+    fill = RGB(18, 25, 33);
+    border = RGB(45, 55, 66);
     textColor = kButtonDisabledTextColor;
   } else if (pressed) {
     fill = kButtonPressedColor;
@@ -457,8 +463,8 @@ void DrawNsisButton(const DRAWITEMSTRUCT& item) {
   SelectObject(item.hDC, oldPen);
   DeleteObject(borderPen);
 
-  HPEN lightPen = CreatePen(PS_SOLID, 1, pressed ? RGB(164, 181, 207) : RGB(255, 255, 255));
-  HPEN shadowPen = CreatePen(PS_SOLID, 1, pressed ? RGB(255, 255, 255) : RGB(185, 190, 198));
+  HPEN lightPen = CreatePen(PS_SOLID, 1, pressed ? RGB(33, 49, 64) : RGB(58, 73, 90));
+  HPEN shadowPen = CreatePen(PS_SOLID, 1, pressed ? RGB(90, 108, 128) : RGB(8, 12, 17));
   oldPen = static_cast<HPEN>(SelectObject(item.hDC, lightPen));
   MoveToEx(item.hDC, rect.left + 1, rect.bottom - 2, nullptr);
   LineTo(item.hDC, rect.left + 1, rect.top + 1);
@@ -1306,8 +1312,9 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
       std::filesystem::create_directories(DownloadsFolder());
       std::filesystem::create_directories(ExeFolder() / "tools" / "7zip");
       g_contentBrush = CreateSolidBrush(kContentColor);
+      g_panelBrush = CreateSolidBrush(kPanelColor);
       g_footerBrush = CreateSolidBrush(kFooterColor);
-      g_editBrush = CreateSolidBrush(RGB(255, 255, 255));
+      g_editBrush = CreateSolidBrush(kEditColor);
       g_stepFont = CreateUiFont(10, FW_SEMIBOLD);
       g_titleFont = CreateUiFont(22, FW_SEMIBOLD);
       g_bodyFont = CreateUiFont(10);
@@ -1365,8 +1372,8 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
       SetControlFont(g_previousButton, g_bodyFont);
       SetControlFont(g_nextButton, g_bodyFont);
       SendMessageW(g_progress, PBM_SETRANGE, 0, MAKELPARAM(0, 100));
-      SendMessageW(g_progress, PBM_SETBARCOLOR, 0, static_cast<LPARAM>(RGB(41, 111, 205)));
-      SendMessageW(g_progress, PBM_SETBKCOLOR, 0, static_cast<LPARAM>(RGB(226, 231, 239)));
+      SendMessageW(g_progress, PBM_SETBARCOLOR, 0, static_cast<LPARAM>(RGB(94, 154, 196)));
+      SendMessageW(g_progress, PBM_SETBKCOLOR, 0, static_cast<LPARAM>(RGB(9, 14, 20)));
       SetText(g_downloadEdit, DownloadsFolder().wstring());
       PopulateDriveCombo();
       SetText(g_installEdit, L"");
@@ -1402,21 +1409,33 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
       HDC dc = reinterpret_cast<HDC>(wParam);
       HWND control = reinterpret_cast<HWND>(lParam);
       SetBkMode(dc, TRANSPARENT);
+      if (control == g_logEdit) {
+        SetBkMode(dc, OPAQUE);
+        SetTextColor(dc, kMutedTextColor);
+        SetBkColor(dc, kEditColor);
+        return reinterpret_cast<LRESULT>(g_editBrush);
+      }
       if (control == g_stepLabel) {
         SetTextColor(dc, kAccentTextColor);
       } else if (control == g_welcomeTitle) {
         SetTextColor(dc, kPrimaryTextColor);
-      } else if (control == g_welcomeBody || control == g_statusLabel) {
+      } else if (control == g_welcomeBody || control == g_statusLabel || control == g_unpackTargetLabel) {
         SetTextColor(dc, kMutedTextColor);
       } else {
         SetTextColor(dc, kPrimaryTextColor);
       }
-      return reinterpret_cast<LRESULT>(g_contentBrush);
+      return reinterpret_cast<LRESULT>(g_panelBrush);
     }
     case WM_CTLCOLOREDIT: {
       HDC dc = reinterpret_cast<HDC>(wParam);
       SetTextColor(dc, kPrimaryTextColor);
-      SetBkColor(dc, RGB(255, 255, 255));
+      SetBkColor(dc, kEditColor);
+      return reinterpret_cast<LRESULT>(g_editBrush);
+    }
+    case WM_CTLCOLORLISTBOX: {
+      HDC dc = reinterpret_cast<HDC>(wParam);
+      SetTextColor(dc, kPrimaryTextColor);
+      SetBkColor(dc, kEditColor);
       return reinterpret_cast<LRESULT>(g_editBrush);
     }
     case WM_DRAWITEM: {
@@ -1491,6 +1510,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
       return 0;
     case WM_DESTROY:
       DeleteObject(g_contentBrush);
+      DeleteObject(g_panelBrush);
       DeleteObject(g_footerBrush);
       DeleteObject(g_editBrush);
       DeleteObject(g_stepFont);
