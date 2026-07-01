@@ -159,6 +159,21 @@ void TestPackageDiscovery() {
   Expect(package.value().firstArchivePart.has_value(), "Package discovery should find .7z.001");
 }
 
+void TestPackageDiscoveryWithoutTorrent() {
+  const auto root = std::filesystem::temp_directory_path() / "modlist_installer_manifest_package_tests";
+  std::filesystem::remove_all(root);
+  std::filesystem::create_directories(root);
+  {
+    std::ofstream out(root / "modpack.7z.001", std::ios::binary);
+    out << "archive";
+  }
+
+  auto package = DiscoverPackageNear(root);
+  Expect(package.ok(), package.error().c_str());
+  Expect(package.value().torrentFile.empty(), "Package discovery should not require torrent");
+  Expect(package.value().firstArchivePart.has_value(), "Package discovery should still find archive");
+}
+
 }  // namespace
 
 int main() {
@@ -171,6 +186,7 @@ int main() {
     TestVerifier();
     TestExtractorCommand();
     TestPackageDiscovery();
+    TestPackageDiscoveryWithoutTorrent();
   } catch (const std::exception& ex) {
     std::cerr << "Test failed: " << ex.what() << "\n";
     return 1;

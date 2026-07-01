@@ -1,16 +1,14 @@
 # Modlist Installer
 
-Initial implementation from `Windows Installer with Torrent Support.pdf`.
+Native Windows installer for local modlist release folders produced by `PackerApp`.
 
 ## What Is Included
 
 - CMake C++ project structure.
 - Manifest JSON parser and validator.
 - Skyrim-safe path validation.
-- Tracker list parser with protocol filtering and deduplication.
 - SHA256 verifier for manifest files.
 - 7-Zip wrapper that extracts directly to the install folder and uses same-disk temp.
-- Libtorrent downloader interface with an optional libtorrent-rasterbar backend.
 - Dependency-free tests.
 - Example manifest.
 
@@ -28,21 +26,16 @@ The GUI executable is built as:
 InstallerApp\build\windows\x64\release\modlist-installer-gui.exe
 ```
 
-Copy it into `dist`, then put exactly one `.torrent` file in `dist\package` and all archive parts beside the exe. The GUI does not ask for a torrent path; it automatically scans the package folder and requires exactly one `.torrent` file there.
+Copy it into `dist`, put `manifest.json` in `dist\package`, and keep all archive parts beside the exe. The GUI does not use torrent files.
 
 The `Install` button runs the install pipeline on a background thread:
 
-- detect the torrent in the package folder
+- load `package\manifest.json`
 - validate unpack and install folders
-- check known archive size against free space when local archive parts are present
-- read total payload size directly from the `.torrent` file
-- validate local archive files through libtorrent without starting a network download
-- use multithreaded local torrent validation with bounded parallel hashing and capped memory for large archives
-- show local validation progress and ETA
-- stop active validation
-- force-check torrent data before extraction
-- release torrent file handles before 7-Zip starts
-- look for a `.7z.001` archive beside the exe
+- check manifest archive size against free space
+- verify archive file sizes and SHA256 hashes from the manifest
+- show validation progress, speed, ETA, and elapsed time
+- look for the archive named by the manifest beside the exe
 - check unpack free space again before extraction
 - show live unpack percentage, speed, and ETA in the progress bar and status line
 - show live install percentage, speed, ETA, and elapsed time in the status line
@@ -63,8 +56,6 @@ The window uses a dark Nordic-inspired color scheme with charcoal panels, cool g
 
 The unpack drive selector asks only for a drive letter. The app derives the unpack target as `<drive>:\Sky`, for example `X:\Sky`.
 
-The default build reports a clear error until libtorrent-rasterbar is linked with `xmake f --use_libtorrent=y`.
-
 ## Ready Binary
 
 The ready exe is placed at:
@@ -81,12 +72,11 @@ InstallerApp\dist\
   YourPack.7z.001
   YourPack.7z.002
   package\
-    YourPack.torrent
     manifest.json
   logs\
 ```
 
-Do not commit personal `.torrent` files or generated logs.
+Do not commit generated logs.
 
 ## Release Build Script
 
@@ -95,7 +85,7 @@ cd InstallerApp
 .\scripts\build-release.ps1
 ```
 
-The script configures xmake for release, enables libtorrent, runs tests, and copies the GUI exe into `dist\modlist-installer.exe`.
+The script configures xmake for release, runs tests, and copies the GUI exe into `dist\modlist-installer.exe`.
 
 ## Build With CMake
 
@@ -105,25 +95,9 @@ cmake --build InstallerApp/build
 ctest --test-dir InstallerApp/build --output-on-failure
 ```
 
-## Enable Libtorrent
+## Package Layout
 
-Install libtorrent-rasterbar so CMake can find `LibtorrentRasterbar::torrent-rasterbar`, then configure with:
-
-```powershell
-cmake -S InstallerApp -B InstallerApp/build -DMODLIST_USE_LIBTORRENT=ON
-```
-
-For xmake, configure with:
-
-```powershell
-cd InstallerApp
-xmake f --use_libtorrent=y
-xmake
-```
-
-## Simple Torrent Package Mode
-
-You can skip the manifest for a basic GUI package layout:
+The GUI package layout is:
 
 ```text
 MyPack/
@@ -131,7 +105,7 @@ MyPack/
   MyPack.7z.001
   MyPack.7z.002
   package/
-    MyPack.torrent
+    manifest.json
 ```
 
 Run from that folder:
@@ -140,14 +114,4 @@ Run from that folder:
 modlist-installer.exe
 ```
 
-The GUI scans `package` for exactly one `.torrent` file and validates the archive parts beside the exe against it. It does not fetch missing pieces from the network.
-
-If `package\manifest.json` exists, the GUI also loads the packer manifest, uses its archive filename, uses its file sizes for space checks, and verifies SHA256 before extraction. If the manifest exists but is invalid or the hashes fail, install stops and shows `Rehash torrent`.
-
-The console harness can still pass a torrent explicitly for testing:
-
-```powershell
-modlist-installer.exe MyPack.torrent D:\Downloads D:\Sky
-```
-
-The tradeoff: without a manifest, the installer does not know expected SHA256 hashes, exact archive names, cleanup rules, or version/update metadata. Torrent piece checks still protect local package content, but stronger SHA256 verification needs a manifest or a separate hash file.
+The GUI requires `package\manifest.json`, uses its archive filename, uses its file sizes for space checks, and verifies SHA256 before extraction. If the manifest is missing, invalid, or the hashes fail, install stops and shows a validation failure message.

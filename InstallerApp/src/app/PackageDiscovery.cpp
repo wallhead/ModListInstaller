@@ -45,15 +45,14 @@ Result<PackageDiscovery> DiscoverPackageNear(const std::filesystem::path& folder
     }
   }
 
-  if (torrents.empty()) {
-    return Result<PackageDiscovery>::Error("No .torrent file found in: " + folder.string());
-  }
   if (torrents.size() > 1) {
     return Result<PackageDiscovery>::Error("More than one .torrent file found. Pass the torrent path explicitly.");
   }
 
   PackageDiscovery package;
-  package.torrentFile = torrents.front();
+  if (!torrents.empty()) {
+    package.torrentFile = torrents.front();
+  }
   package.firstArchivePart = firstArchivePart;
   return Result<PackageDiscovery>::Ok(std::move(package));
 }

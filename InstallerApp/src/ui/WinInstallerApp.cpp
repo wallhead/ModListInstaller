@@ -1,18 +1,18 @@
 #define NOMINMAX
 
 #include "app/PackageDiscovery.h"
-#include "downloader/LibtorrentDownloader.h"
 #include "extractor/SevenZipExtractor.h"
 #include "manifest/Manifest.h"
 #include "paths/PathValidator.h"
 #include "resource.h"
-#include "verifier/Verifier.h"
+#include "verifier/Sha256.h"
 
 #include <windows.h>
 #include <commctrl.h>
 #include <shlobj.h>
 
 #include <atomic>
+#include <array>
 #include <chrono>
 #include <ctime>
 #include <cwctype>
@@ -87,8 +87,7 @@ HFONT g_bodyFont = nullptr;
 HFONT g_labelFont = nullptr;
 std::atomic_bool g_workerRunning{false};
 std::atomic_bool g_closeAfterWorker{false};
-std::mutex g_downloaderMutex;
-std::shared_ptr<modlist::LibtorrentDownloader> g_activeDownloader;
+std::atomic_bool g_stopRequested{false};
 
 constexpr COLORREF kRailColor = RGB(23, 28, 31);
 constexpr COLORREF kRailDarkColor = RGB(16, 20, 22);
@@ -668,8 +667,10 @@ void Layout(HWND hwnd) {
   MoveWindow(g_nextButton, width - 116, navY, 100, 30, TRUE);
 }
 
-std::wstring StageToText(modlist::DownloadStage stage);
 std::wstring FormatBytes(uintmax_t bytes);
+std::wstring FormatBytesPerSecond(uintmax_t bytesPerSecond);
+std::wstring FormatEta(int seconds);
+std::string HexDigest(const std::array<uint8_t, 32>& digest);
 std::optional<std::filesystem::path> FindFirstArchivePart(const std::filesystem::path& folder);
 std::optional<modlist::Manifest> LoadPackageManifest(std::wstring& message);
 std::optional<std::filesystem::path> ArchivePartFromManifest(const modlist::Manifest& manifest);
@@ -726,20 +727,89 @@ std::optional<std::filesystem::path> ArchivePartFromManifest(const modlist::Mani
 bool VerifyPackageManifest(HWND hwnd, const modlist::Manifest& manifest) {
   PostStatus(hwnd, L"Verifying manifest SHA-256");
   PostLog(hwnd, L"Verifying manifest SHA-256 for " + std::to_wstring(manifest.files.size()) + L" archive file(s)...");
-  modlist::Verifier verifier;
-  const auto summary = verifier.Verify(ArchiveFolder(), manifest.files);
-  if (summary.ok) {
-    PostLog(hwnd, L"Manifest verification completed.");
-    return true;
-  }
 
-  for (const auto& file : summary.files) {
-    if (file.message != "OK") {
-      PostLog(hwnd, L"Manifest verification failed for " + PathToDisplay(file.path) + L": " + Widen(file.message));
+  const uintmax_t totalBytes = ManifestRequiredBytes(manifest);
+  uintmax_t doneBytes = 0;
+  const auto startedAt = std::chrono::steady_clock::now();
+  std::array<uint8_t, 4 * 1024 * 1024> buffer{};
+
+  for (const auto& expected : manifest.files) {
+    if (g_stopRequested) {
+      PostLog(hwnd, L"Manifest verification stopped.");
+      return false;
+    }
+    if (!modlist::IsSafeManifestRelativePath(expected.path)) {
+      PostLog(hwnd, L"Manifest verification failed for " + PathToDisplay(expected.path) + L": unsafe path");
+      PostValidationFailed(hwnd);
+      return false;
+    }
+
+    const auto fullPath = ArchiveFolder() / expected.path;
+    std::error_code ec;
+    if (!std::filesystem::exists(fullPath, ec) || !std::filesystem::is_regular_file(fullPath, ec)) {
+      PostLog(hwnd, L"Manifest verification failed for " + PathToDisplay(expected.path) + L": missing file");
+      PostValidationFailed(hwnd);
+      return false;
+    }
+    const auto actualSize = std::filesystem::file_size(fullPath, ec);
+    if (ec || actualSize != expected.size) {
+      PostLog(hwnd, L"Manifest verification failed for " + PathToDisplay(expected.path) + L": file size mismatch");
+      PostValidationFailed(hwnd);
+      return false;
+    }
+
+    PostLog(hwnd, L"Checking " + PathToDisplay(expected.path));
+    std::ifstream input(fullPath, std::ios::binary);
+    if (!input) {
+      PostLog(hwnd, L"Manifest verification failed for " + PathToDisplay(expected.path) + L": unable to open file");
+      PostValidationFailed(hwnd);
+      return false;
+    }
+
+    modlist::Sha256 sha;
+    while (input && !g_stopRequested) {
+      input.read(reinterpret_cast<char*>(buffer.data()), static_cast<std::streamsize>(buffer.size()));
+      const auto read = input.gcount();
+      if (read <= 0) {
+        break;
+      }
+      sha.Update(buffer.data(), static_cast<size_t>(read));
+      doneBytes += static_cast<uintmax_t>(read);
+      const int percent = totalBytes > 0 ? static_cast<int>((doneBytes * 100) / totalBytes) : 0;
+      const auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+          std::chrono::steady_clock::now() - startedAt).count();
+      uintmax_t speed = 0;
+      int eta = -1;
+      if (elapsed > 0 && doneBytes > 0) {
+        speed = doneBytes / static_cast<uintmax_t>(elapsed);
+        if (speed > 0 && totalBytes > doneBytes) {
+          eta = static_cast<int>((totalBytes - doneBytes) / speed);
+        }
+      }
+      PostProgress(hwnd, (percent * 35) / 100);
+      PostStatus(hwnd,
+                 L"Validating " + std::to_wstring(percent) + L"% | " +
+                     FormatBytes(doneBytes) + L" / " + FormatBytes(totalBytes) +
+                     L" | " + FormatBytesPerSecond(speed) +
+                     L" | ETA " + FormatEta(eta) +
+                     L" | Elapsed " + FormatEta(static_cast<int>(elapsed)));
+    }
+    if (g_stopRequested) {
+      PostLog(hwnd, L"Manifest verification stopped.");
+      return false;
+    }
+
+    const auto actualHash = HexDigest(sha.Final());
+    if (actualHash != expected.sha256) {
+      PostLog(hwnd, L"Manifest verification failed for " + PathToDisplay(expected.path) + L": SHA256 mismatch");
+      PostValidationFailed(hwnd);
+      return false;
     }
   }
-  PostValidationFailed(hwnd);
-  return false;
+
+  PostProgress(hwnd, 35);
+  PostLog(hwnd, L"Manifest verification completed.");
+  return true;
 }
 
 std::optional<std::filesystem::path> FindFirstArchivePart(const std::filesystem::path& folder) {
@@ -828,6 +898,7 @@ uintmax_t EstimateNearbyArchiveBytes(const std::filesystem::path& folder) {
 }
 
 uintmax_t EstimateRequiredBytes(const modlist::PackageDiscovery& package) {
+  (void)package;
   std::wstring manifestMessage;
   auto manifest = LoadPackageManifest(manifestMessage);
   if (manifest.has_value()) {
@@ -837,13 +908,6 @@ uintmax_t EstimateRequiredBytes(const modlist::PackageDiscovery& package) {
     return manifestBytes;
   }
 
-  auto torrentSize = modlist::LibtorrentDownloader::ReadTorrentPayloadSize(package.torrentFile);
-  if (torrentSize.ok()) {
-    AppendLog(L"Torrent payload size: " + FormatBytes(torrentSize.value()));
-    return torrentSize.value();
-  }
-
-  AppendLog(L"Torrent size warning: " + Widen(torrentSize.error()));
   const uintmax_t archiveBytes = EstimateNearbyArchiveBytes(ArchiveFolder());
   if (archiveBytes > 0) {
     AppendLog(L"Using nearby archive size estimate: " + FormatBytes(archiveBytes));
@@ -885,6 +949,15 @@ std::wstring FormatBytes(uintmax_t bytes) {
   return out.str();
 }
 
+std::string HexDigest(const std::array<uint8_t, 32>& digest) {
+  std::ostringstream out;
+  out << std::hex << std::setfill('0');
+  for (const auto byte : digest) {
+    out << std::setw(2) << static_cast<int>(byte);
+  }
+  return out.str();
+}
+
 std::wstring FormatEta(int seconds) {
   if (seconds < 0) {
     return L"unknown";
@@ -905,32 +978,12 @@ std::wstring FormatEta(int seconds) {
 
 bool HasEnoughSpace(const std::filesystem::path& folder, uintmax_t requiredBytes, const std::wstring& label) {
   if (requiredBytes == 0) {
-    AppendLog(label + L" required space: unknown until torrent metadata is available.");
+    AppendLog(label + L" required space: unknown until package files are available.");
     return true;
   }
   const uintmax_t free = FreeBytes(folder);
   AppendLog(label + L" free space: " + FormatBytes(free) + L"; minimum required: " + FormatBytes(requiredBytes));
   return free >= requiredBytes;
-}
-
-std::wstring FormatDownloadStatus(const modlist::DownloadStatus& status, int elapsedSeconds = -1) {
-  std::wostringstream out;
-  out << StageToText(status.stage)
-      << L" | " << static_cast<int>(status.progress * 100.0f) << L"%";
-  if (status.totalBytes > 0) {
-    out << L" | " << FormatBytes(static_cast<uintmax_t>(status.downloadedBytes))
-        << L" / " << FormatBytes(static_cast<uintmax_t>(status.totalBytes));
-    if (status.downloadRateBytesPerSecond > 0) {
-      out << L" | " << FormatBytesPerSecond(status.downloadRateBytesPerSecond);
-    }
-    if (status.etaSeconds >= 0) {
-      out << L" | ETA " << FormatEta(status.etaSeconds);
-    }
-  }
-  if (elapsedSeconds >= 0) {
-    out << L" | Elapsed " << FormatEta(elapsedSeconds);
-  }
-  return out.str();
 }
 
 void ShowWizardPage(HWND hwnd, WizardPage page) {
@@ -999,39 +1052,9 @@ void GoToNextPage(HWND hwnd) {
   }
 }
 
-void FinishWorker(HWND hwnd, const std::shared_ptr<modlist::LibtorrentDownloader>& downloader) {
-  {
-    std::lock_guard<std::mutex> lock(g_downloaderMutex);
-    if (g_activeDownloader == downloader) {
-      g_activeDownloader.reset();
-    }
-  }
+void FinishWorker(HWND hwnd) {
   g_workerRunning = false;
   PostMessageW(hwnd, kWorkerFinishedMessage, 0, 0);
-}
-
-std::wstring StageToText(modlist::DownloadStage stage) {
-  switch (stage) {
-    case modlist::DownloadStage::Idle:
-      return L"Idle";
-    case modlist::DownloadStage::Loading:
-      return L"Loading torrent";
-    case modlist::DownloadStage::Downloading:
-      return L"Downloading";
-    case modlist::DownloadStage::Checking:
-      return L"Checking";
-    case modlist::DownloadStage::Seeding:
-      return L"Seeding";
-    case modlist::DownloadStage::Completed:
-      return L"Completed";
-    case modlist::DownloadStage::Paused:
-      return L"Paused";
-    case modlist::DownloadStage::Cancelled:
-      return L"Cancelled";
-    case modlist::DownloadStage::Failed:
-      return L"Failed";
-  }
-  return L"Unknown";
 }
 
 std::wstring FormatExtractionStatus(const std::wstring& label,
@@ -1460,75 +1483,11 @@ bool InstallExtractedFiles(HWND hwnd, const std::filesystem::path& unpackFolder,
 void RunInstallWorker(HWND hwnd,
                       modlist::PackageDiscovery package,
                       std::filesystem::path unpackFolder,
-                      std::filesystem::path installFolder,
-                      std::shared_ptr<modlist::LibtorrentDownloader> downloader) {
+                      std::filesystem::path installFolder) {
   g_workerRunning = true;
+  g_stopRequested = false;
   PostProgress(hwnd, 0);
-  PostLog(hwnd, L"Starting local package validation...");
-  PostLog(hwnd, L"The torrent will validate files already beside the installer. Missing files stop the install.");
-
-  modlist::DownloadConfig config;
-  config.torrent.type = modlist::TorrentSourceType::TorrentFile;
-  config.torrent.source = package.torrentFile.string();
-  config.downloadFolder = ArchiveFolder();
-  config.features.enableDht = false;
-  config.features.enablePex = false;
-  config.features.enableLsd = false;
-
-  downloader->StartLocalValidation(config);
-  modlist::DownloadStage lastStage = modlist::DownloadStage::Idle;
-  const auto validationStartedAt = std::chrono::steady_clock::now();
-  while (true) {
-    auto status = downloader->GetStatus();
-    if (status.stage != lastStage) {
-      lastStage = status.stage;
-      PostLog(hwnd, L"Validation stage: " + StageToText(status.stage));
-    }
-    int elapsedSeconds = 0;
-    if (status.totalBytes > 0) {
-      status.downloadedBytes = static_cast<int64_t>(status.totalBytes * status.progress);
-      const auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
-          std::chrono::steady_clock::now() - validationStartedAt).count();
-      elapsedSeconds = static_cast<int>(elapsed);
-      if (elapsed > 0 && status.downloadedBytes > 0 && status.totalBytes > status.downloadedBytes) {
-        const auto speed = static_cast<uintmax_t>(status.downloadedBytes / elapsed);
-        if (speed > 0) {
-          status.downloadRateBytesPerSecond = speed > static_cast<uintmax_t>(std::numeric_limits<int>::max())
-                                                  ? std::numeric_limits<int>::max()
-                                                  : static_cast<int>(speed);
-          status.etaSeconds = static_cast<int>((status.totalBytes - status.downloadedBytes) / static_cast<int64_t>(speed));
-        }
-      }
-    }
-    PostProgress(hwnd, static_cast<int>(status.progress * 35.0f));
-    PostStatus(hwnd, FormatDownloadStatus(status, elapsedSeconds));
-
-    if (status.stage == modlist::DownloadStage::Completed) {
-      PostLog(hwnd, L"Local package validation completed.");
-      break;
-    }
-    if (status.stage == modlist::DownloadStage::Failed) {
-      PostLog(hwnd, L"Validation error: " + Widen(status.error));
-      PostValidationFailed(hwnd);
-      FinishWorker(hwnd, downloader);
-      return;
-    }
-    if (status.stage == modlist::DownloadStage::Cancelled) {
-      PostLog(hwnd, L"Validation cancelled.");
-      FinishWorker(hwnd, downloader);
-      return;
-    }
-    std::this_thread::sleep_for(std::chrono::milliseconds(500));
-  }
-
-  PostLog(hwnd, L"Releasing validated files before unpacking...");
-  {
-    std::lock_guard<std::mutex> lock(g_downloaderMutex);
-    if (g_activeDownloader == downloader) {
-      g_activeDownloader.reset();
-    }
-  }
-  downloader->ReleaseFiles();
+  PostLog(hwnd, L"Starting manifest validation...");
 
   std::optional<modlist::Manifest> manifest;
   {
@@ -1536,27 +1495,26 @@ void RunInstallWorker(HWND hwnd,
     manifest = LoadPackageManifest(manifestMessage);
     PostLog(hwnd, manifestMessage);
   }
-  if (!manifest.has_value() && PackageManifestFileExists()) {
+  if (!manifest.has_value()) {
+    PostLog(hwnd, L"package\\manifest.json is required.");
     PostValidationFailed(hwnd);
-    FinishWorker(hwnd, downloader);
+    FinishWorker(hwnd);
     return;
   }
-  if (manifest.has_value() && !VerifyPackageManifest(hwnd, *manifest)) {
-    FinishWorker(hwnd, downloader);
+  if (!VerifyPackageManifest(hwnd, *manifest)) {
+    FinishWorker(hwnd);
     return;
   }
 
   PostLog(hwnd, L"Looking for archive file to unpack...");
   auto firstArchivePart = package.firstArchivePart;
-  if (manifest.has_value()) {
-    firstArchivePart = ArchivePartFromManifest(*manifest);
-  }
+  firstArchivePart = ArchivePartFromManifest(*manifest);
   if (!firstArchivePart.has_value()) {
     firstArchivePart = FindFirstArchivePart(ArchiveFolder());
   }
   if (!firstArchivePart.has_value()) {
     PostLog(hwnd, L"No archive file found beside the installer. Cannot extract automatically.");
-    FinishWorker(hwnd, downloader);
+    FinishWorker(hwnd);
     return;
   }
 
@@ -1568,7 +1526,7 @@ void RunInstallWorker(HWND hwnd,
     PostLog(hwnd, L"Unpack free space: " + FormatBytes(unpackFree) + L"; archive size minimum: " + FormatBytes(archiveBytes));
     if (unpackFree < archiveBytes) {
       PostLog(hwnd, L"Not enough free space in the unpack folder for extraction.");
-      FinishWorker(hwnd, downloader);
+      FinishWorker(hwnd);
       return;
     }
   }
@@ -1577,20 +1535,20 @@ void RunInstallWorker(HWND hwnd,
   auto sevenZip = extractor.LocateExecutable(ExeFolder());
   if (!sevenZip.ok()) {
     PostLog(hwnd, L"7-Zip error: " + Widen(sevenZip.error()));
-    FinishWorker(hwnd, downloader);
+    FinishWorker(hwnd);
     return;
   }
 
   const bool extracted = ExtractArchiveChain(hwnd, extractor, sevenZip.value(), *firstArchivePart, unpackFolder, 35, 60);
   if (!extracted) {
     PostProgress(hwnd, 0);
-    FinishWorker(hwnd, downloader);
+    FinishWorker(hwnd);
     return;
   }
 
   const bool installed = InstallExtractedFiles(hwnd, unpackFolder, installFolder);
   PostProgress(hwnd, installed ? 100 : 0);
-  FinishWorker(hwnd, downloader);
+  FinishWorker(hwnd);
 }
 
 bool ValidateFolders(uintmax_t knownRequiredBytes = 0) {
@@ -1642,7 +1600,6 @@ void ValidatePackage() {
     return;
   }
 
-  AppendLog(L"Torrent: " + PathToDisplay(package.value().torrentFile));
   if (package.value().firstArchivePart.has_value()) {
     AppendLog(L"Archive first part: " + PathToDisplay(*package.value().firstArchivePart));
   } else {
@@ -1676,38 +1633,18 @@ void SetControlsRunning(HWND hwnd, bool running) {
   ShowWizardPage(hwnd, g_page);
 }
 
-std::shared_ptr<modlist::LibtorrentDownloader> ActiveDownloader() {
-  std::lock_guard<std::mutex> lock(g_downloaderMutex);
-  return g_activeDownloader;
-}
-
 void TogglePause(HWND hwnd) {
-  auto downloader = ActiveDownloader();
-  if (!downloader) {
-    AppendLog(L"No active validation to pause.");
-    return;
-  }
-
-  const auto status = downloader->GetStatus();
-  if (status.stage == modlist::DownloadStage::Paused) {
-    downloader->Resume();
-    SetWindowTextW(GetDlgItem(hwnd, kPauseButton), L"Pause");
-    AppendLog(L"Validation resumed.");
-  } else {
-    downloader->Pause();
-    SetWindowTextW(GetDlgItem(hwnd, kPauseButton), L"Resume");
-    AppendLog(L"Validation paused.");
-  }
+  (void)hwnd;
+  AppendLog(L"Pause is not available during manifest validation.");
 }
 
 void StopInstall() {
-  auto downloader = ActiveDownloader();
-  if (!downloader) {
-    AppendLog(L"No active validation to stop.");
+  if (!g_workerRunning) {
+    AppendLog(L"No active operation to stop.");
     return;
   }
-  downloader->Cancel();
-  AppendLog(L"Stopping validation. Existing package files are left untouched.");
+  g_stopRequested = true;
+  AppendLog(L"Stopping. Existing package files are left untouched.");
 }
 
 void StartInstall(HWND hwnd) {
@@ -1729,21 +1666,16 @@ void StartInstall(HWND hwnd) {
 
   const auto unpackFolder = SelectedUnpackFolder();
   const auto installFolder = std::filesystem::path(GetText(g_installEdit));
-  auto downloader = std::make_shared<modlist::LibtorrentDownloader>();
-  {
-    std::lock_guard<std::mutex> lock(g_downloaderMutex);
-    g_activeDownloader = downloader;
-  }
   g_workerRunning = true;
   SetControlsRunning(hwnd, true);
   g_closeAfterWorker = false;
-  std::thread(RunInstallWorker, hwnd, std::move(package.value()), unpackFolder, installFolder, downloader).detach();
+  std::thread(RunInstallWorker, hwnd, std::move(package.value()), unpackFolder, installFolder).detach();
 }
 
 void RunUnpackWorker(HWND hwnd, std::filesystem::path archiveFirstPart, std::filesystem::path unpackFolder) {
   g_workerRunning = true;
   PostProgress(hwnd, 0);
-  PostLog(hwnd, L"Unpacking without torrent validation: " + PathToDisplay(archiveFirstPart));
+  PostLog(hwnd, L"Unpacking archive: " + PathToDisplay(archiveFirstPart));
 
   const uintmax_t archiveBytes = EstimateNearbyArchiveBytes(archiveFirstPart.parent_path());
   if (archiveBytes > 0) {
@@ -1898,19 +1830,19 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
       PopulateDriveCombo();
       SetText(g_installEdit, L"");
       AppendLog(L"App log: " + PathToDisplay(AppLogPath()));
-      AppendLog(L"Place exactly one .torrent file in: " + PathToDisplay(PackageFolder()));
+      AppendLog(L"Place manifest.json in: " + PathToDisplay(PackageFolder()));
       AppendLog(L"Place all archive parts beside this exe: " + PathToDisplay(ArchiveFolder()));
-      auto package = ReadPackageFromUi();
-      if (package.ok()) {
-        AppendLog(L"Found torrent: " + PathToDisplay(package.value().torrentFile));
-        auto torrentSize = modlist::LibtorrentDownloader::ReadTorrentPayloadSize(package.value().torrentFile);
-        if (torrentSize.ok()) {
-          AppendLog(L"Torrent payload size: " + FormatBytes(torrentSize.value()));
-        } else {
-          AppendLog(L"Torrent size warning: " + Widen(torrentSize.error()));
-        }
+      std::wstring manifestMessage;
+      auto manifest = LoadPackageManifest(manifestMessage);
+      AppendLog(manifestMessage);
+      if (manifest.has_value()) {
+        AppendLog(L"Manifest archive size: " + FormatBytes(ManifestRequiredBytes(*manifest)));
+        AppendLog(L"Manifest archive entry: " + PathToDisplay(manifest->extract.firstArchivePart));
       } else {
-        AppendLog(L"Torrent auto-detect: " + Widen(package.error()));
+        auto package = ReadPackageFromUi();
+        if (!package.ok()) {
+          AppendLog(L"Package auto-detect: " + Widen(package.error()));
+        }
       }
       AppendLog(L"Choose an unpack drive; the unpack folder will be created as <drive>:\\Sky.");
       Layout(hwnd);
@@ -2011,7 +1943,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
       return 0;
     }
     case kValidationFailedMessage:
-      MessageBoxW(hwnd, L"Rehash torrent", L"Validation failed", MB_OK | MB_ICONERROR);
+      MessageBoxW(hwnd, L"Package validation failed. Rebuild the package.", L"Validation failed", MB_OK | MB_ICONERROR);
       return 0;
     case kWorkerFinishedMessage:
       SetControlsRunning(hwnd, false);

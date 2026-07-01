@@ -1,17 +1,9 @@
-param(
-  [switch]$NoLibtorrent
-)
-
 $ErrorActionPreference = "Stop"
 
 $ProjectRoot = Split-Path -Parent $PSScriptRoot
 Push-Location $ProjectRoot
 try {
-  if ($NoLibtorrent) {
-    xmake f -m release
-  } else {
-    xmake f --use_libtorrent=y -m release
-  }
+  xmake f --use_libtorrent=n -m release
 
   xmake
   xmake run installer_core_tests
