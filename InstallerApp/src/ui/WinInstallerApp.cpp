@@ -66,6 +66,7 @@ HWND g_progress = nullptr;
 HWND g_statusLabel = nullptr;
 HWND g_previousButton = nullptr;
 HWND g_nextButton = nullptr;
+HWND g_hotButton = nullptr;
 WizardPage g_page = WizardPage::Welcome;
 HBRUSH g_contentBrush = nullptr;
 HBRUSH g_footerBrush = nullptr;
@@ -87,6 +88,12 @@ constexpr COLORREF kLineColor = RGB(208, 213, 222);
 constexpr COLORREF kPrimaryTextColor = RGB(28, 37, 52);
 constexpr COLORREF kMutedTextColor = RGB(91, 101, 118);
 constexpr COLORREF kAccentTextColor = RGB(32, 82, 149);
+constexpr COLORREF kButtonFaceColor = RGB(244, 244, 244);
+constexpr COLORREF kButtonHoverColor = RGB(232, 240, 252);
+constexpr COLORREF kButtonPressedColor = RGB(214, 228, 248);
+constexpr COLORREF kButtonBorderColor = RGB(132, 139, 150);
+constexpr COLORREF kButtonHoverBorderColor = RGB(59, 119, 191);
+constexpr COLORREF kButtonDisabledTextColor = RGB(145, 150, 160);
 
 std::wstring Widen(const std::string& text) {
   if (text.empty()) {
@@ -234,9 +241,54 @@ HWND CreateEdit(HWND parent, int id, int x, int y, int width, int height) {
                          x, y, width, height, parent, reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), g_instance, nullptr);
 }
 
+LRESULT CALLBACK ButtonSubclassProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam, UINT_PTR subclassId, DWORD_PTR refData) {
+  (void)subclassId;
+  (void)refData;
+  switch (message) {
+    case WM_MOUSEMOVE: {
+      if (g_hotButton != hwnd) {
+        if (g_hotButton != nullptr) {
+          InvalidateRect(g_hotButton, nullptr, TRUE);
+        }
+        g_hotButton = hwnd;
+        InvalidateRect(hwnd, nullptr, TRUE);
+      }
+      TRACKMOUSEEVENT track{};
+      track.cbSize = sizeof(track);
+      track.dwFlags = TME_LEAVE;
+      track.hwndTrack = hwnd;
+      TrackMouseEvent(&track);
+      break;
+    }
+    case WM_MOUSELEAVE:
+      if (g_hotButton == hwnd) {
+        g_hotButton = nullptr;
+        InvalidateRect(hwnd, nullptr, TRUE);
+      }
+      break;
+    case WM_ENABLE:
+    case WM_SETFOCUS:
+    case WM_KILLFOCUS:
+    case WM_LBUTTONDOWN:
+    case WM_LBUTTONUP:
+      InvalidateRect(hwnd, nullptr, TRUE);
+      break;
+    case WM_NCDESTROY:
+      if (g_hotButton == hwnd) {
+        g_hotButton = nullptr;
+      }
+      RemoveWindowSubclass(hwnd, ButtonSubclassProc, 1);
+      break;
+  }
+  return DefSubclassProc(hwnd, message, wParam, lParam);
+}
+
 HWND CreateButton(HWND parent, int id, const wchar_t* text, int x, int y, int width, int height) {
-  return CreateWindowExW(0, L"BUTTON", text, WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-                         x, y, width, height, parent, reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), g_instance, nullptr);
+  HWND button = CreateWindowExW(0, L"BUTTON", text, WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+                                x, y, width, height, parent, reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)),
+                                g_instance, nullptr);
+  SetWindowSubclass(button, ButtonSubclassProc, 1, 0);
+  return button;
 }
 
 HFONT CreateUiFont(int pointSize, int weight = FW_NORMAL) {
@@ -295,6 +347,74 @@ void PaintInstallerChrome(HWND hwnd, HDC dc) {
   RECT railMark{18, 74, railWidth - 12, 132};
   DrawTextW(dc, L"III", -1, &railMark, DT_LEFT | DT_TOP | DT_SINGLELINE);
   SelectObject(dc, oldFont);
+}
+
+void DrawNsisButton(const DRAWITEMSTRUCT& item) {
+  const bool disabled = (item.itemState & ODS_DISABLED) != 0;
+  const bool pressed = (item.itemState & ODS_SELECTED) != 0;
+  const bool focused = (item.itemState & ODS_FOCUS) != 0;
+  const bool hot = item.hwndItem == g_hotButton && !disabled;
+
+  RECT rect = item.rcItem;
+  COLORREF fill = kButtonFaceColor;
+  COLORREF border = kButtonBorderColor;
+  COLORREF textColor = kPrimaryTextColor;
+  if (disabled) {
+    fill = RGB(235, 235, 235);
+    border = RGB(178, 178, 178);
+    textColor = kButtonDisabledTextColor;
+  } else if (pressed) {
+    fill = kButtonPressedColor;
+    border = RGB(48, 94, 158);
+  } else if (hot) {
+    fill = kButtonHoverColor;
+    border = kButtonHoverBorderColor;
+  }
+
+  HBRUSH fillBrush = CreateSolidBrush(fill);
+  FillRect(item.hDC, &rect, fillBrush);
+  DeleteObject(fillBrush);
+
+  HPEN borderPen = CreatePen(PS_SOLID, 1, border);
+  HPEN oldPen = static_cast<HPEN>(SelectObject(item.hDC, borderPen));
+  HBRUSH oldBrush = static_cast<HBRUSH>(SelectObject(item.hDC, GetStockObject(NULL_BRUSH)));
+  Rectangle(item.hDC, rect.left, rect.top, rect.right, rect.bottom);
+  SelectObject(item.hDC, oldBrush);
+  SelectObject(item.hDC, oldPen);
+  DeleteObject(borderPen);
+
+  HPEN lightPen = CreatePen(PS_SOLID, 1, pressed ? RGB(164, 181, 207) : RGB(255, 255, 255));
+  HPEN shadowPen = CreatePen(PS_SOLID, 1, pressed ? RGB(255, 255, 255) : RGB(185, 190, 198));
+  oldPen = static_cast<HPEN>(SelectObject(item.hDC, lightPen));
+  MoveToEx(item.hDC, rect.left + 1, rect.bottom - 2, nullptr);
+  LineTo(item.hDC, rect.left + 1, rect.top + 1);
+  LineTo(item.hDC, rect.right - 2, rect.top + 1);
+  SelectObject(item.hDC, shadowPen);
+  MoveToEx(item.hDC, rect.left + 2, rect.bottom - 2, nullptr);
+  LineTo(item.hDC, rect.right - 2, rect.bottom - 2);
+  LineTo(item.hDC, rect.right - 2, rect.top + 1);
+  SelectObject(item.hDC, oldPen);
+  DeleteObject(lightPen);
+  DeleteObject(shadowPen);
+
+  wchar_t text[128]{};
+  GetWindowTextW(item.hwndItem, text, static_cast<int>(sizeof(text) / sizeof(text[0])));
+  RECT textRect = rect;
+  if (pressed) {
+    OffsetRect(&textRect, 1, 1);
+  }
+
+  SetBkMode(item.hDC, TRANSPARENT);
+  SetTextColor(item.hDC, textColor);
+  HFONT oldFont = static_cast<HFONT>(SelectObject(item.hDC, g_bodyFont));
+  DrawTextW(item.hDC, text, -1, &textRect, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+  SelectObject(item.hDC, oldFont);
+
+  if (focused && !disabled) {
+    RECT focusRect = rect;
+    InflateRect(&focusRect, -4, -4);
+    DrawFocusRect(item.hDC, &focusRect);
+  }
 }
 
 void ShowControl(HWND hwnd, bool visible) {
@@ -1184,6 +1304,14 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
       SetTextColor(dc, kPrimaryTextColor);
       SetBkColor(dc, RGB(255, 255, 255));
       return reinterpret_cast<LRESULT>(g_editBrush);
+    }
+    case WM_DRAWITEM: {
+      const auto* item = reinterpret_cast<DRAWITEMSTRUCT*>(lParam);
+      if (item != nullptr && item->CtlType == ODT_BUTTON) {
+        DrawNsisButton(*item);
+        return TRUE;
+      }
+      return DefWindowProcW(hwnd, message, wParam, lParam);
     }
     case WM_SIZE:
       Layout(hwnd);

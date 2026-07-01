@@ -56,7 +56,7 @@ The GUI is organized as a three-step wizard:
 - folder selection page
 - download and validation page
 
-The window uses a classic installer-inspired color scheme with a blue side rail, white content area, and grey navigation footer. The welcome text is intentionally placeholder copy for now.
+The window uses a classic installer-inspired color scheme with a blue side rail, white content area, grey navigation footer, and owner-drawn buttons with hover/pressed/focus states. The welcome text is intentionally placeholder copy for now.
 
 The default build reports a clear error until libtorrent-rasterbar is linked with `xmake f --use_libtorrent=y`.
 
