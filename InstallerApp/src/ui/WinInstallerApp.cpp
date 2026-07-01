@@ -17,6 +17,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -95,11 +96,11 @@ constexpr COLORREF kEditColor = RGB(18, 23, 25);
 constexpr COLORREF kFooterColor = RGB(29, 36, 40);
 constexpr COLORREF kLineColor = RGB(42, 50, 54);
 constexpr COLORREF kStrongLineColor = RGB(58, 68, 74);
-constexpr COLORREF kPrimaryTextColor = RGB(216, 216, 210);
-constexpr COLORREF kMutedTextColor = RGB(143, 150, 152);
-constexpr COLORREF kDimTextColor = RGB(102, 111, 115);
-constexpr COLORREF kAccentTextColor = RGB(143, 186, 208);
-constexpr COLORREF kAccentStrongColor = RGB(184, 215, 232);
+constexpr COLORREF kPrimaryTextColor = RGB(246, 247, 242);
+constexpr COLORREF kMutedTextColor = RGB(194, 201, 203);
+constexpr COLORREF kDimTextColor = RGB(146, 156, 160);
+constexpr COLORREF kAccentTextColor = RGB(173, 216, 235);
+constexpr COLORREF kAccentStrongColor = RGB(220, 241, 250);
 constexpr COLORREF kDangerColor = RGB(168, 111, 111);
 constexpr COLORREF kButtonTopColor = RGB(34, 41, 45);
 constexpr COLORREF kButtonBottomColor = RGB(23, 28, 31);
@@ -771,16 +772,14 @@ std::wstring FormatBytesPerSecond(int bytesPerSecond) {
   if (bytesPerSecond <= 0) {
     return L"0 B/s";
   }
-  const wchar_t* units[] = {L"B/s", L"KB/s", L"MB/s", L"GB/s"};
-  double value = static_cast<double>(bytesPerSecond);
-  size_t unit = 0;
-  while (value >= 1024.0 && unit < 3) {
-    value /= 1024.0;
-    ++unit;
+  return FormatBytes(static_cast<uintmax_t>(bytesPerSecond)) + L"/s";
+}
+
+std::wstring FormatBytesPerSecond(uintmax_t bytesPerSecond) {
+  if (bytesPerSecond == 0) {
+    return L"0 B/s";
   }
-  std::wostringstream out;
-  out << std::fixed << std::setprecision(unit == 0 ? 0 : 1) << value << L" " << units[unit];
-  return out.str();
+  return FormatBytes(bytesPerSecond) + L"/s";
 }
 
 std::wstring FormatBytes(uintmax_t bytes) {
@@ -831,6 +830,12 @@ std::wstring FormatDownloadStatus(const modlist::DownloadStatus& status) {
   if (status.totalBytes > 0) {
     out << L" | " << FormatBytes(static_cast<uintmax_t>(status.downloadedBytes))
         << L" / " << FormatBytes(static_cast<uintmax_t>(status.totalBytes));
+    if (status.downloadRateBytesPerSecond > 0) {
+      out << L" | " << FormatBytesPerSecond(status.downloadRateBytesPerSecond);
+    }
+    if (status.etaSeconds >= 0) {
+      out << L" | ETA " << FormatEta(status.etaSeconds);
+    }
   }
   return out.str();
 }
@@ -936,9 +941,15 @@ std::wstring StageToText(modlist::DownloadStage stage) {
   return L"Unknown";
 }
 
-std::wstring FormatExtractionStatus(const std::wstring& label, int percent) {
+std::wstring FormatExtractionStatus(const std::wstring& label, int percent, uintmax_t bytesPerSecond = 0, int etaSeconds = -1) {
   std::wostringstream out;
   out << label << L" " << percent << L"%";
+  if (bytesPerSecond > 0) {
+    out << L" | " << FormatBytesPerSecond(bytesPerSecond);
+  }
+  if (etaSeconds >= 0) {
+    out << L" | ETA " << FormatEta(etaSeconds);
+  }
   return out.str();
 }
 
@@ -947,19 +958,32 @@ bool RunExtractionStep(HWND hwnd,
                        const modlist::ExtractionConfig& extraction,
                        const std::wstring& statusLabel,
                        int progressBase,
-                       int progressSpan) {
+                       int progressSpan,
+                       uintmax_t estimatedBytes) {
   PostLog(hwnd, L"Extracting: " + PathToDisplay(extraction.archiveFirstPart));
   PostProgress(hwnd, progressBase);
   PostStatus(hwnd, FormatExtractionStatus(statusLabel, 0));
   int lastPercent = -1;
-  const auto result = extractor.Extract(extraction, [hwnd, statusLabel, progressBase, progressSpan, &lastPercent](int percent) {
+  const auto startedAt = std::chrono::steady_clock::now();
+  const auto result = extractor.Extract(extraction, [hwnd, statusLabel, progressBase, progressSpan, estimatedBytes, startedAt, &lastPercent](int percent) {
     if (percent == lastPercent) {
       return;
     }
     lastPercent = percent;
     const int mapped = progressBase + (percent * progressSpan) / 100;
+    uintmax_t speed = 0;
+    int eta = -1;
+    const auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::steady_clock::now() - startedAt).count();
+    if (estimatedBytes > 0 && elapsed > 0 && percent > 0 && percent < 100) {
+      const uintmax_t processed = (estimatedBytes * static_cast<uintmax_t>(percent)) / 100;
+      speed = processed / static_cast<uintmax_t>(elapsed);
+      if (speed > 0 && estimatedBytes > processed) {
+        eta = static_cast<int>((estimatedBytes - processed) / speed);
+      }
+    }
     PostProgress(hwnd, mapped);
-    PostStatus(hwnd, FormatExtractionStatus(statusLabel, percent));
+    PostStatus(hwnd, FormatExtractionStatus(statusLabel, percent, speed, eta));
   });
   PostLog(hwnd, Widen(result.message));
   WriteLastSevenZipLog(result.output);
@@ -998,7 +1022,17 @@ bool ExtractArchiveChain(HWND hwnd,
 
   const bool splitArchive = IsFirstSplitArchivePart(extraction.archiveFirstPart);
   const int firstSpan = splitArchive ? progressSpan / 2 : progressSpan;
-  if (!RunExtractionStep(hwnd, extractor, extraction, L"Unpacking", progressBase, firstSpan)) {
+  std::error_code sizeEc;
+  uintmax_t firstBytes = 0;
+  if (splitArchive) {
+    firstBytes = EstimateNearbyArchiveBytes(extraction.archiveFirstPart.parent_path());
+  } else {
+    firstBytes = std::filesystem::file_size(extraction.archiveFirstPart, sizeEc);
+    if (sizeEc) {
+      firstBytes = 0;
+    }
+  }
+  if (!RunExtractionStep(hwnd, extractor, extraction, L"Unpacking", progressBase, firstSpan, firstBytes)) {
     return false;
   }
 
@@ -1015,7 +1049,152 @@ bool ExtractArchiveChain(HWND hwnd,
   extraction.archiveFirstPart = innerArchives.front();
   extraction.installFolder = innerArchives.front().parent_path();
   const int secondSpan = progressSpan - firstSpan;
-  return RunExtractionStep(hwnd, extractor, extraction, L"Unpacking inner archive", progressBase + firstSpan, secondSpan);
+  std::error_code ec;
+  const uintmax_t secondBytes = std::filesystem::file_size(extraction.archiveFirstPart, ec);
+  return RunExtractionStep(hwnd, extractor, extraction, L"Unpacking inner archive", progressBase + firstSpan, secondSpan, ec ? 0 : secondBytes);
+}
+
+std::wstring NormalizedPathText(const std::filesystem::path& path) {
+  std::error_code ec;
+  auto normalized = std::filesystem::absolute(path, ec).lexically_normal().wstring();
+  if (ec) {
+    normalized = path.lexically_normal().wstring();
+  }
+  for (auto& ch : normalized) {
+    ch = static_cast<wchar_t>(std::towlower(ch));
+  }
+  while (!normalized.empty() && (normalized.back() == L'\\' || normalized.back() == L'/')) {
+    normalized.pop_back();
+  }
+  return normalized;
+}
+
+bool IsSameFolder(const std::filesystem::path& a, const std::filesystem::path& b) {
+  return NormalizedPathText(a) == NormalizedPathText(b);
+}
+
+bool IsChildFolder(const std::filesystem::path& child, const std::filesystem::path& parent) {
+  const auto childText = NormalizedPathText(child);
+  const auto parentText = NormalizedPathText(parent);
+  return childText.size() > parentText.size() &&
+         childText.starts_with(parentText) &&
+         (childText[parentText.size()] == L'\\' || childText[parentText.size()] == L'/');
+}
+
+bool MoveEntrySameDrive(const std::filesystem::path& source, const std::filesystem::path& target, std::wstring& error) {
+  std::error_code ec;
+  std::filesystem::create_directories(target.parent_path(), ec);
+  if (ec) {
+    error = L"Unable to create install folder: " + Widen(ec.message());
+    return false;
+  }
+
+  if (std::filesystem::is_directory(source, ec) && !ec && std::filesystem::exists(target, ec) && std::filesystem::is_directory(target, ec)) {
+    for (const auto& entry : std::filesystem::directory_iterator(source, ec)) {
+      if (ec) {
+        error = L"Unable to read unpacked folder: " + Widen(ec.message());
+        return false;
+      }
+      if (!MoveEntrySameDrive(entry.path(), target / entry.path().filename(), error)) {
+        return false;
+      }
+    }
+    std::filesystem::remove(source, ec);
+    if (ec) {
+      error = L"Unable to remove emptied unpack folder: " + Widen(ec.message());
+      return false;
+    }
+    return true;
+  }
+
+  DWORD flags = MOVEFILE_WRITE_THROUGH;
+  if (!std::filesystem::is_directory(source, ec)) {
+    flags |= MOVEFILE_REPLACE_EXISTING;
+  }
+  if (!MoveFileExW(source.wstring().c_str(), target.wstring().c_str(), flags)) {
+    error = L"Unable to move " + PathToDisplay(source) + L" to " + PathToDisplay(target) +
+            L" (Windows error " + std::to_wstring(GetLastError()) + L").";
+    return false;
+  }
+  return true;
+}
+
+bool CopyThenRemoveEntry(const std::filesystem::path& source, const std::filesystem::path& target, std::wstring& error) {
+  std::error_code ec;
+  std::filesystem::create_directories(target.parent_path(), ec);
+  if (ec) {
+    error = L"Unable to create install folder: " + Widen(ec.message());
+    return false;
+  }
+  std::filesystem::copy(source, target,
+                        std::filesystem::copy_options::recursive |
+                            std::filesystem::copy_options::overwrite_existing,
+                        ec);
+  if (ec) {
+    error = L"Unable to copy unpacked files: " + Widen(ec.message());
+    return false;
+  }
+  std::filesystem::remove_all(source, ec);
+  if (ec) {
+    error = L"Unable to remove copied unpacked files: " + Widen(ec.message());
+    return false;
+  }
+  return true;
+}
+
+bool InstallExtractedFiles(HWND hwnd, const std::filesystem::path& unpackFolder, const std::filesystem::path& installFolder) {
+  PostProgress(hwnd, 95);
+  PostStatus(hwnd, L"Installing 0%");
+  if (IsSameFolder(unpackFolder, installFolder)) {
+    PostLog(hwnd, L"Install folder is the unpack folder; no move is needed.");
+    PostProgress(hwnd, 100);
+    PostStatus(hwnd, L"Installing 100%");
+    return true;
+  }
+  if (IsChildFolder(installFolder, unpackFolder)) {
+    PostLog(hwnd, L"Install folder cannot be inside the unpack folder.");
+    return false;
+  }
+
+  std::error_code ec;
+  std::filesystem::create_directories(installFolder, ec);
+  if (ec) {
+    PostLog(hwnd, L"Unable to create install folder: " + Widen(ec.message()));
+    return false;
+  }
+
+  modlist::PathValidator validator;
+  const bool sameDrive = validator.IsSameDrive(unpackFolder, installFolder);
+  PostLog(hwnd, sameDrive ? L"Installing with same-drive cut/move; files will not be copied."
+                          : L"Installing across drives; Windows must copy files, then remove unpacked originals.");
+
+  std::wstring error;
+  for (const auto& entry : std::filesystem::directory_iterator(unpackFolder, ec)) {
+    if (ec) {
+      PostLog(hwnd, L"Unable to read unpack folder: " + Widen(ec.message()));
+      return false;
+    }
+    if (entry.path().filename() == ".install_temp") {
+      std::filesystem::remove_all(entry.path(), ec);
+      if (ec) {
+        PostLog(hwnd, L"Unable to remove extraction temp folder: " + Widen(ec.message()));
+        return false;
+      }
+      continue;
+    }
+    const auto target = installFolder / entry.path().filename();
+    const bool ok = sameDrive ? MoveEntrySameDrive(entry.path(), target, error)
+                              : CopyThenRemoveEntry(entry.path(), target, error);
+    if (!ok) {
+      PostLog(hwnd, error);
+      return false;
+    }
+  }
+
+  PostProgress(hwnd, 100);
+  PostStatus(hwnd, L"Installing 100%");
+  PostLog(hwnd, L"Install step completed.");
+  return true;
 }
 
 void RunInstallWorker(HWND hwnd,
@@ -1038,11 +1217,26 @@ void RunInstallWorker(HWND hwnd,
 
   downloader->StartLocalValidation(config);
   modlist::DownloadStage lastStage = modlist::DownloadStage::Idle;
+  const auto validationStartedAt = std::chrono::steady_clock::now();
   while (true) {
-    const auto status = downloader->GetStatus();
+    auto status = downloader->GetStatus();
     if (status.stage != lastStage) {
       lastStage = status.stage;
       PostLog(hwnd, L"Validation stage: " + StageToText(status.stage));
+    }
+    if (status.totalBytes > 0) {
+      status.downloadedBytes = static_cast<int64_t>(status.totalBytes * status.progress);
+      const auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+          std::chrono::steady_clock::now() - validationStartedAt).count();
+      if (elapsed > 0 && status.downloadedBytes > 0 && status.totalBytes > status.downloadedBytes) {
+        const auto speed = static_cast<uintmax_t>(status.downloadedBytes / elapsed);
+        if (speed > 0) {
+          status.downloadRateBytesPerSecond = speed > static_cast<uintmax_t>(std::numeric_limits<int>::max())
+                                                  ? std::numeric_limits<int>::max()
+                                                  : static_cast<int>(speed);
+          status.etaSeconds = static_cast<int>((status.totalBytes - status.downloadedBytes) / static_cast<int64_t>(speed));
+        }
+      }
     }
     PostProgress(hwnd, static_cast<int>(status.progress * 35.0f));
     PostStatus(hwnd, FormatDownloadStatus(status));
@@ -1105,8 +1299,15 @@ void RunInstallWorker(HWND hwnd,
     return;
   }
 
-  const bool extracted = ExtractArchiveChain(hwnd, extractor, sevenZip.value(), *firstArchivePart, std::move(unpackFolder), 35, 65);
-  PostProgress(hwnd, extracted ? 100 : 0);
+  const bool extracted = ExtractArchiveChain(hwnd, extractor, sevenZip.value(), *firstArchivePart, unpackFolder, 35, 60);
+  if (!extracted) {
+    PostProgress(hwnd, 0);
+    FinishWorker(hwnd, downloader);
+    return;
+  }
+
+  const bool installed = InstallExtractedFiles(hwnd, unpackFolder, installFolder);
+  PostProgress(hwnd, installed ? 100 : 0);
   FinishWorker(hwnd, downloader);
 }
 

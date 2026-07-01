@@ -37,13 +37,14 @@ The `Install` button runs the install pipeline on a background thread:
 - check known archive size against free space when local archive parts are present
 - read total payload size directly from the `.torrent` file
 - validate local archive files through libtorrent without starting a network download
-- show local validation progress
+- show local validation progress and ETA
 - stop active validation
 - force-check torrent data before extraction
 - release torrent file handles before 7-Zip starts
 - look for a `.7z.001` archive beside the exe
 - check unpack free space again before extraction
-- show live unpack percentage in the progress bar and status line
+- show live unpack percentage, speed, and ETA in the progress bar and status line
+- install from the unpack folder into the final install folder, using same-drive move/cut semantics instead of copying when both folders are on the same drive
 - stream full 7-Zip diagnostics to `dist\logs` while keeping only a small in-memory tail for the GUI
 - run 7-Zip inside a memory-limited child process so oversized archives fail cleanly instead of exhausting system RAM
 - automatically run a second extraction pass when a split `.7z.001` contains one inner `.7z`

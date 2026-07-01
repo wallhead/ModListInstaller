@@ -23,11 +23,12 @@ Put exactly one `.torrent` file in `package\` and the complete multi-volume arch
 - Validation and install page.
 - Auto-detects one `.torrent` from the `package` folder.
 - Validates local archive files through libtorrent-rasterbar without starting a network download.
-- Shows local validation progress before unpacking.
+- Shows local validation progress and ETA before unpacking.
 - Stop control for active validation.
 - Force-checks torrent data before unpacking.
 - Releases torrent file handles before extraction.
-- Live unpack progress percentage.
+- Live unpack progress percentage, speed, and ETA.
+- Installs from the unpack folder into the final install folder; same-drive installs use move/cut semantics instead of copying.
 - Supports split `.7z.001` packages that contain an inner `.7z` archive.
 - Keeps full 7-Zip diagnostics in `dist/logs`, while the GUI log stays concise.
 - Streams 7-Zip diagnostics to disk and keeps only a small in-memory tail for error display.
