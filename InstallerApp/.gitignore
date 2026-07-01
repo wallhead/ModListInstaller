@@ -1,0 +1,16 @@
+build/
+.xmake/
+out/
+*.user
+*.suo
+*.log
+*.tmp
+*.obj
+*.pdb
+*.ilk
+*.exe
+!dist/modlist-installer.exe
+!dist/7z.exe
+*.dll
+*.lib
+*.exp

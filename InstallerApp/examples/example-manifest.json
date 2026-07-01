@@ -1,0 +1,45 @@
+{
+  "version": "1.0.0",
+  "torrent": {
+    "type": "magnet",
+    "source": "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567"
+  },
+  "trackers": {
+    "use_online_tracker_list": true,
+    "tracker_list_url": "https://raw.githubusercontent.com/ngosang/trackerslist/master/trackers_all.txt",
+    "continue_if_tracker_list_fails": true
+  },
+  "torrent_features": {
+    "enable_dht": true,
+    "enable_pex": true,
+    "enable_lsd": true
+  },
+  "download": {
+    "ask_user": true
+  },
+  "install": {
+    "ask_user": true,
+    "prefer_short_root_path": true,
+    "example_path": "D:\\Sky",
+    "max_recommended_path_length": 20,
+    "same_disk_temp_only": true
+  },
+  "files": [
+    {
+      "path": "modpack.7z.001",
+      "size": 2147483648,
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+    },
+    {
+      "path": "modpack.7z.002",
+      "size": 2147483648,
+      "sha256": "1111111111111111111111111111111111111111111111111111111111111111"
+    }
+  ],
+  "extract": {
+    "first_archive_part": "modpack.7z.001",
+    "target_subfolder": "",
+    "cleanup_after_success": false,
+    "use_same_disk_temp": true
+  }
+}
