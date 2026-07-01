@@ -28,3 +28,9 @@ endif()
 
 add_executable(modlist-installer app/main.cpp)
 target_link_libraries(modlist-installer PRIVATE installer_core)
+
+if(WIN32)
+  add_executable(modlist-installer-gui WIN32 ui/WinInstallerApp.cpp ../resources/app.rc)
+  target_include_directories(modlist-installer-gui PRIVATE ../resources)
+  target_link_libraries(modlist-installer-gui PRIVATE installer_core comctl32)
+endif()

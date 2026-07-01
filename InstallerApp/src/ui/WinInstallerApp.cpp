@@ -4,6 +4,7 @@
 #include "downloader/LibtorrentDownloader.h"
 #include "extractor/SevenZipExtractor.h"
 #include "paths/PathValidator.h"
+#include "resource.h"
 
 #include <windows.h>
 #include <commctrl.h>
@@ -155,6 +156,14 @@ std::filesystem::path ExeFolder() {
   return ModuleFolder();
 }
 
+std::filesystem::path PackageFolder() {
+  return ExeFolder() / "package";
+}
+
+std::filesystem::path DownloadsFolder() {
+  return ExeFolder() / "downloads";
+}
+
 void WriteLastSevenZipLog(const std::string& output) {
   if (output.empty()) {
     return;
@@ -225,7 +234,7 @@ void Layout(HWND hwnd) {
 }
 
 modlist::Result<modlist::PackageDiscovery> ReadPackageFromUi() {
-  return modlist::DiscoverPackageNear(ExeFolder());
+  return modlist::DiscoverPackageNear(PackageFolder());
 }
 
 std::wstring StageToText(modlist::DownloadStage stage);
@@ -321,7 +330,7 @@ uintmax_t EstimateRequiredBytes(const modlist::PackageDiscovery& package) {
   }
 
   AppendLog(L"Torrent size warning: " + Widen(torrentSize.error()));
-  const uintmax_t archiveBytes = EstimateNearbyArchiveBytes(ExeFolder());
+  const uintmax_t archiveBytes = EstimateNearbyArchiveBytes(PackageFolder());
   if (archiveBytes > 0) {
     AppendLog(L"Using nearby archive size estimate: " + FormatBytes(archiveBytes));
   }
@@ -859,10 +868,10 @@ void UnpackOnly(HWND hwnd) {
 
   auto archive = FindFirstArchivePart(downloadFolder);
   if (!archive.has_value()) {
-    archive = FindFirstArchivePart(ExeFolder());
+    archive = FindFirstArchivePart(PackageFolder());
   }
   if (!archive.has_value()) {
-    AppendLog(L"No .7z.001 archive part found in the download folder or next to the exe.");
+    AppendLog(L"No .7z.001 archive part found in the download folder or package folder.");
     return;
   }
 
@@ -879,6 +888,9 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
       controls.dwICC = ICC_PROGRESS_CLASS;
       InitCommonControlsEx(&controls);
       std::filesystem::create_directories(ExeFolder() / "logs");
+      std::filesystem::create_directories(PackageFolder());
+      std::filesystem::create_directories(DownloadsFolder());
+      std::filesystem::create_directories(ExeFolder() / "tools" / "7zip");
 
       CreateLabel(hwnd, L"Download", 16, 26, 100, 20);
       CreateLabel(hwnd, L"Install", 16, 61, 100, 20);
@@ -903,10 +915,10 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
                                   16, 177, 622, 258, hwnd,
                                   reinterpret_cast<HMENU>(static_cast<INT_PTR>(kLogEdit)), g_instance, nullptr);
       SendMessageW(g_progress, PBM_SETRANGE, 0, MAKELPARAM(0, 100));
-      SetText(g_downloadEdit, (ExeFolder() / "downloads").wstring());
+      SetText(g_downloadEdit, DownloadsFolder().wstring());
       SetText(g_installEdit, L"D:\\Sky");
       AppendLog(L"App log: " + PathToDisplay(AppLogPath()));
-      AppendLog(L"Place exactly one .torrent file next to this exe.");
+      AppendLog(L"Place exactly one .torrent file in: " + PathToDisplay(PackageFolder()));
       auto package = ReadPackageFromUi();
       if (package.ok()) {
         AppendLog(L"Found torrent: " + PathToDisplay(package.value().torrentFile));
@@ -999,6 +1011,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
   windowClass.hInstance = instance;
   windowClass.lpszClassName = className;
   windowClass.hCursor = LoadCursor(nullptr, IDC_ARROW);
+  windowClass.hIcon = LoadIconW(instance, MAKEINTRESOURCEW(IDI_MODLIST_INSTALLER));
   windowClass.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
   RegisterClassW(&windowClass);
 

@@ -3,6 +3,8 @@ InstallerApp/build/
 InstallerApp/dist/logs/
 InstallerApp/dist/last-7z-output.log
 InstallerApp/dist/*.torrent
+InstallerApp/dist/package/*.torrent
+InstallerApp/dist/downloads/
 InstallerApp/dist/modlist-installer-updated.exe
 
 *.obj
@@ -18,4 +20,4 @@ InstallerApp/dist/modlist-installer-updated.exe
 
 *.exe
 !InstallerApp/dist/modlist-installer.exe
-!InstallerApp/dist/7z.exe
+!InstallerApp/dist/tools/7zip/7z.exe

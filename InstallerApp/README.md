@@ -28,7 +28,7 @@ The GUI executable is built as:
 InstallerApp\build\windows\x64\release\modlist-installer-gui.exe
 ```
 
-Copy it next to a `.torrent`. The GUI does not ask for a torrent path; it automatically scans the exe folder and requires exactly one `.torrent` file there.
+Copy it into `dist`, then put exactly one `.torrent` file in `dist\package`. The GUI does not ask for a torrent path; it automatically scans the package folder and requires exactly one `.torrent` file there.
 
 The `Start` button runs the install pipeline on a background thread:
 
@@ -60,7 +60,21 @@ The ready exe is placed at:
 InstallerApp\dist\modlist-installer.exe
 ```
 
-The dist folder should also contain `7z.exe`. Do not commit personal `.torrent` files or generated logs.
+The runtime layout is:
+
+```text
+InstallerApp\dist\
+  modlist-installer.exe
+  package\
+    YourPack.torrent
+  tools\
+    7zip\
+      7z.exe
+  downloads\
+  logs\
+```
+
+Do not commit personal `.torrent` files or generated logs.
 
 ## Release Build Script
 
@@ -118,7 +132,11 @@ You can skip the manifest for a basic GUI package layout:
 ```text
 MyPack/
   modlist-installer.exe
-  MyPack.torrent
+  package/
+    MyPack.torrent
+  tools/
+    7zip/
+      7z.exe
 ```
 
 Run from that folder:
@@ -127,7 +145,7 @@ Run from that folder:
 modlist-installer.exe
 ```
 
-The GUI scans its own folder for exactly one `.torrent` file. If a `.7z.001` file is already next to the torrent, it detects that too.
+The GUI scans `package` for exactly one `.torrent` file. If a `.7z.001` file is already next to the torrent, it detects that too.
 
 The console harness can still pass a torrent explicitly for testing:
 

@@ -35,6 +35,10 @@ std::string Quote(const std::filesystem::path& path) {
 std::filesystem::path MakeOutputCapturePath(const std::filesystem::path& sevenZipExe) {
   const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
   auto logFolder = sevenZipExe.parent_path() / "logs";
+  if (sevenZipExe.parent_path().filename() == "7zip" &&
+      sevenZipExe.parent_path().parent_path().filename() == "tools") {
+    logFolder = sevenZipExe.parent_path().parent_path().parent_path() / "logs";
+  }
   std::error_code ec;
   std::filesystem::create_directories(logFolder, ec);
   if (ec) {
@@ -170,13 +174,17 @@ int RunProcessAndCapture(const std::string& command,
 }  // namespace
 
 Result<std::filesystem::path> SevenZipExtractor::LocateExecutable(const std::filesystem::path& appRoot) const {
-  const std::array<std::filesystem::path, 6> candidates = {
+  const std::array<std::filesystem::path, 9> candidates = {
+      appRoot / "tools" / "7zip" / "7z.exe",
+      appRoot / "tools" / "7zip" / "7za.exe",
+      appRoot / "tools" / "7zip" / "7zz.exe",
+      appRoot / "tools" / "7z.exe",
+      appRoot / "tools" / "7za.exe",
+      appRoot / "tools" / "7zz.exe",
       appRoot / "third_party" / "7zip" / "7z.exe",
       appRoot / "third_party" / "7zip" / "7za.exe",
       appRoot / "third_party" / "7zip" / "7zz.exe",
-      appRoot / "7z.exe",
-      appRoot / "7za.exe",
-      appRoot / "7zz.exe"};
+  };
 
   for (const auto& candidate : candidates) {
     std::error_code ec;
@@ -184,7 +192,7 @@ Result<std::filesystem::path> SevenZipExtractor::LocateExecutable(const std::fil
       return Result<std::filesystem::path>::Ok(candidate);
     }
   }
-  return Result<std::filesystem::path>::Error("7-Zip executable not found. Bundle 7z.exe, 7za.exe, or 7zz.exe.");
+  return Result<std::filesystem::path>::Error("7-Zip executable not found. Bundle it under tools\\7zip.");
 }
 
 ExtractionResult SevenZipExtractor::Extract(const ExtractionConfig& config, ProgressCallback progressCallback) const {

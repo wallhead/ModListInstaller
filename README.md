@@ -8,12 +8,12 @@ The ready-to-run build is included at:
 InstallerApp/dist/modlist-installer.exe
 ```
 
-Put exactly one `.torrent` file next to `modlist-installer.exe`, then run the exe. The app auto-detects that torrent, lets the user choose download and install folders, validates the torrent payload, and unpacks the downloaded archive with bundled 7-Zip.
+Put exactly one `.torrent` file in `InstallerApp/dist/package`, then run the exe. The app auto-detects that torrent, lets the user choose download and install folders, validates the torrent payload, and unpacks the downloaded archive with bundled 7-Zip.
 
 ## Current Features
 
 - Native Windows GUI.
-- Auto-detects one `.torrent` next to the exe.
+- Auto-detects one `.torrent` from the `package` folder.
 - Torrent download through libtorrent-rasterbar.
 - DHT, PEX, and local service discovery enabled.
 - Download progress, speed, seeds, peers, and ETA.
@@ -31,8 +31,11 @@ Put exactly one `.torrent` file next to `modlist-installer.exe`, then run the ex
 ```text
 MyPack/
   modlist-installer.exe
-  7z.exe
-  MyPack.torrent
+  package/
+    MyPack.torrent
+  tools/
+    7zip/
+      7z.exe
 ```
 
 Run `modlist-installer.exe`, choose a download folder and a short install folder such as `D:\Sky`, then press `Start`.
@@ -78,6 +81,7 @@ Copy-Item .\build\windows\x64\release\modlist-installer-gui.exe .\dist\modlist-i
 ```text
 InstallerApp/
   dist/       ready exe and bundled 7-Zip
+  resources/  Windows icon resources
   docs/       architecture notes
   examples/   example manifest
   scripts/    build helper
