@@ -1,0 +1,958 @@
+#define NOMINMAX
+
+#include <windows.h>
+#include <commctrl.h>
+#include <shlobj.h>
+#include <bcrypt.h>
+
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cstdint>
+#include <cwctype>
+#include <filesystem>
+#include <fstream>
+#include <iomanip>
+#include <memory>
+#include <optional>
+#include <sstream>
+#include <string>
+#include <thread>
+#include <vector>
+
+namespace {
+
+constexpr int kSourceEdit = 1001;
+constexpr int kSourceBrowse = 1002;
+constexpr int kReleaseEdit = 1003;
+constexpr int kReleaseBrowse = 1004;
+constexpr int kSevenZipEdit = 1005;
+constexpr int kSevenZipBrowse = 1006;
+constexpr int kArchiveNameEdit = 1007;
+constexpr int kFormatCombo = 1008;
+constexpr int kLevelCombo = 1009;
+constexpr int kMethodCombo = 1010;
+constexpr int kDictionaryCombo = 1011;
+constexpr int kWordCombo = 1012;
+constexpr int kSolidCombo = 1013;
+constexpr int kVolumeCombo = 1014;
+constexpr int kThreadsCombo = 1015;
+constexpr int kChunkCombo = 1016;
+constexpr int kCopyInstallerCheck = 1017;
+constexpr int kBuildButton = 1018;
+constexpr int kManifestButton = 1019;
+constexpr int kStopButton = 1020;
+constexpr int kLogEdit = 1021;
+constexpr int kProgress = 1022;
+constexpr int kStatusLabel = 1023;
+
+constexpr UINT kLogMessage = WM_APP + 1;
+constexpr UINT kStatusMessage = WM_APP + 2;
+constexpr UINT kProgressMessage = WM_APP + 3;
+constexpr UINT kWorkerFinishedMessage = WM_APP + 4;
+
+HINSTANCE g_instance = nullptr;
+HWND g_sourceEdit = nullptr;
+HWND g_releaseEdit = nullptr;
+HWND g_sevenZipEdit = nullptr;
+HWND g_archiveNameEdit = nullptr;
+HWND g_formatCombo = nullptr;
+HWND g_levelCombo = nullptr;
+HWND g_methodCombo = nullptr;
+HWND g_dictionaryCombo = nullptr;
+HWND g_wordCombo = nullptr;
+HWND g_solidCombo = nullptr;
+HWND g_volumeCombo = nullptr;
+HWND g_threadsCombo = nullptr;
+HWND g_chunkCombo = nullptr;
+HWND g_copyInstallerCheck = nullptr;
+HWND g_logEdit = nullptr;
+HWND g_progress = nullptr;
+HWND g_statusLabel = nullptr;
+std::atomic_bool g_workerRunning{false};
+std::atomic_bool g_cancelRequested{false};
+
+struct PackerConfig {
+  std::filesystem::path sourceFolder;
+  std::filesystem::path releaseFolder;
+  std::filesystem::path sevenZipExe;
+  std::wstring archiveName;
+  std::wstring format;
+  std::wstring level;
+  std::wstring method;
+  std::wstring dictionary;
+  std::wstring wordSize;
+  std::wstring solid;
+  std::wstring volumeSize;
+  std::wstring threads;
+  uint64_t chunkSize{64ull * 1024ull * 1024ull};
+  bool copyInstaller{true};
+  bool archiveFirst{true};
+};
+
+std::filesystem::path ModuleFolder() {
+  std::wstring buffer(MAX_PATH, L'\0');
+  DWORD size = 0;
+  while (true) {
+    size = GetModuleFileNameW(nullptr, buffer.data(), static_cast<DWORD>(buffer.size()));
+    if (size == 0) {
+      return std::filesystem::current_path();
+    }
+    if (size < buffer.size() - 1) {
+      buffer.resize(size);
+      break;
+    }
+    buffer.resize(buffer.size() * 2);
+  }
+  return std::filesystem::path(buffer).parent_path();
+}
+
+std::wstring GetText(HWND hwnd) {
+  const int length = GetWindowTextLengthW(hwnd);
+  std::wstring text(static_cast<size_t>(length) + 1, L'\0');
+  GetWindowTextW(hwnd, text.data(), length + 1);
+  text.resize(static_cast<size_t>(length));
+  return text;
+}
+
+void SetText(HWND hwnd, const std::wstring& text) {
+  SetWindowTextW(hwnd, text.c_str());
+}
+
+std::wstring ComboText(HWND hwnd) {
+  const int index = static_cast<int>(SendMessageW(hwnd, CB_GETCURSEL, 0, 0));
+  if (index < 0) {
+    return {};
+  }
+  const int length = static_cast<int>(SendMessageW(hwnd, CB_GETLBTEXTLEN, index, 0));
+  std::wstring text(static_cast<size_t>(length) + 1, L'\0');
+  SendMessageW(hwnd, CB_GETLBTEXT, index, reinterpret_cast<LPARAM>(text.data()));
+  text.resize(static_cast<size_t>(length));
+  return text;
+}
+
+void AddComboItem(HWND combo, const wchar_t* text) {
+  SendMessageW(combo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(text));
+}
+
+void SelectCombo(HWND combo, int index) {
+  SendMessageW(combo, CB_SETCURSEL, index, 0);
+}
+
+std::wstring Quote(const std::filesystem::path& path) {
+  std::wstring text = path.wstring();
+  std::wstring escaped;
+  escaped.reserve(text.size() + 2);
+  escaped.push_back(L'"');
+  for (wchar_t ch : text) {
+    if (ch == L'"') {
+      escaped += L"\\\"";
+    } else {
+      escaped.push_back(ch);
+    }
+  }
+  escaped.push_back(L'"');
+  return escaped;
+}
+
+std::wstring FormatBytes(uint64_t bytes) {
+  const wchar_t* units[] = {L"B", L"KB", L"MB", L"GB", L"TB"};
+  double value = static_cast<double>(bytes);
+  size_t unit = 0;
+  while (value >= 1024.0 && unit < 4) {
+    value /= 1024.0;
+    ++unit;
+  }
+  std::wostringstream out;
+  out << std::fixed << std::setprecision(unit == 0 ? 0 : 1) << value << L" " << units[unit];
+  return out.str();
+}
+
+std::string Narrow(const std::wstring& text) {
+  if (text.empty()) {
+    return {};
+  }
+  const int size = WideCharToMultiByte(CP_UTF8, 0, text.data(), static_cast<int>(text.size()), nullptr, 0, nullptr, nullptr);
+  std::string result(static_cast<size_t>(size), '\0');
+  WideCharToMultiByte(CP_UTF8, 0, text.data(), static_cast<int>(text.size()), result.data(), size, nullptr, nullptr);
+  return result;
+}
+
+std::wstring Widen(const std::string& text) {
+  if (text.empty()) {
+    return {};
+  }
+  const int size = MultiByteToWideChar(CP_UTF8, 0, text.data(), static_cast<int>(text.size()), nullptr, 0);
+  std::wstring result(static_cast<size_t>(size), L'\0');
+  MultiByteToWideChar(CP_UTF8, 0, text.data(), static_cast<int>(text.size()), result.data(), size);
+  return result;
+}
+
+std::string JsonEscape(const std::string& text) {
+  std::ostringstream out;
+  for (unsigned char ch : text) {
+    switch (ch) {
+      case '\\':
+        out << "\\\\";
+        break;
+      case '"':
+        out << "\\\"";
+        break;
+      case '\n':
+        out << "\\n";
+        break;
+      case '\r':
+        out << "\\r";
+        break;
+      case '\t':
+        out << "\\t";
+        break;
+      default:
+        if (ch < 0x20) {
+          out << "\\u" << std::hex << std::setw(4) << std::setfill('0') << static_cast<int>(ch);
+        } else {
+          out << static_cast<char>(ch);
+        }
+        break;
+    }
+  }
+  return out.str();
+}
+
+void AppendLog(const std::wstring& text) {
+  const int length = GetWindowTextLengthW(g_logEdit);
+  SendMessageW(g_logEdit, EM_SETSEL, length, length);
+  std::wstring line = text + L"\r\n";
+  SendMessageW(g_logEdit, EM_REPLACESEL, FALSE, reinterpret_cast<LPARAM>(line.c_str()));
+}
+
+void PostLog(HWND hwnd, std::wstring text) {
+  PostMessageW(hwnd, kLogMessage, 0, reinterpret_cast<LPARAM>(new std::wstring(std::move(text))));
+}
+
+void PostStatus(HWND hwnd, std::wstring text) {
+  PostMessageW(hwnd, kStatusMessage, 0, reinterpret_cast<LPARAM>(new std::wstring(std::move(text))));
+}
+
+void PostProgress(HWND hwnd, int progress) {
+  PostMessageW(hwnd, kProgressMessage, static_cast<WPARAM>(progress), 0);
+}
+
+std::optional<std::filesystem::path> PickFolder(HWND owner) {
+  BROWSEINFOW browse{};
+  browse.hwndOwner = owner;
+  browse.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE;
+  PIDLIST_ABSOLUTE item = SHBrowseForFolderW(&browse);
+  if (item == nullptr) {
+    return std::nullopt;
+  }
+  wchar_t path[MAX_PATH]{};
+  const BOOL ok = SHGetPathFromIDListW(item, path);
+  CoTaskMemFree(item);
+  if (!ok) {
+    return std::nullopt;
+  }
+  return std::filesystem::path(path);
+}
+
+std::optional<std::filesystem::path> PickSevenZip(HWND owner) {
+  wchar_t file[MAX_PATH]{};
+  OPENFILENAMEW dialog{};
+  dialog.lStructSize = sizeof(dialog);
+  dialog.hwndOwner = owner;
+  dialog.lpstrFilter = L"7-Zip executable\0*.exe\0All files\0*.*\0";
+  dialog.lpstrFile = file;
+  dialog.nMaxFile = MAX_PATH;
+  dialog.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
+  if (!GetOpenFileNameW(&dialog)) {
+    return std::nullopt;
+  }
+  return std::filesystem::path(file);
+}
+
+uint64_t ParseSizeText(const std::wstring& text, uint64_t fallback) {
+  if (text.empty()) {
+    return fallback;
+  }
+  wchar_t suffix = text.back();
+  std::wstring number = text;
+  uint64_t multiplier = 1;
+  if (!iswdigit(suffix)) {
+    number.pop_back();
+    suffix = static_cast<wchar_t>(towlower(suffix));
+    if (suffix == L'k') {
+      multiplier = 1024ull;
+    } else if (suffix == L'm') {
+      multiplier = 1024ull * 1024ull;
+    } else if (suffix == L'g') {
+      multiplier = 1024ull * 1024ull * 1024ull;
+    }
+  }
+  try {
+    return std::stoull(number) * multiplier;
+  } catch (...) {
+    return fallback;
+  }
+}
+
+std::wstring SelectArchiveExtension(const PackerConfig& config) {
+  if (config.format == L"zip") {
+    return L".zip";
+  }
+  return L".7z";
+}
+
+std::filesystem::path ArchivePath(const PackerConfig& config) {
+  return config.releaseFolder / (config.archiveName + SelectArchiveExtension(config));
+}
+
+std::wstring BuildSevenZipCommand(const PackerConfig& config) {
+  std::wstring command = Quote(config.sevenZipExe) + L" a " + Quote(ArchivePath(config)) + L" " +
+                         Quote(config.sourceFolder / L"*") + L" -t" + config.format +
+                         L" -mx=" + config.level +
+                         L" -mmt=" + config.threads +
+                         L" -y -bsp1";
+  if (config.format == L"7z") {
+    if (!config.method.empty()) {
+      command += L" -m0=" + config.method;
+    }
+    if (!config.dictionary.empty()) {
+      command += L" -md=" + config.dictionary;
+    }
+    if (!config.wordSize.empty()) {
+      command += L" -mfb=" + config.wordSize;
+    }
+    command += (config.solid == L"Solid") ? L" -ms=on" : L" -ms=off";
+  }
+  if (!config.volumeSize.empty() && config.volumeSize != L"none") {
+    command += L" -v" + config.volumeSize;
+  }
+  return command;
+}
+
+std::wstring Hex(const std::vector<unsigned char>& bytes) {
+  std::wostringstream out;
+  out << std::hex << std::setfill(L'0');
+  for (unsigned char byte : bytes) {
+    out << std::setw(2) << static_cast<int>(byte);
+  }
+  return out.str();
+}
+
+bool Sha256Bytes(const void* data, size_t size, std::vector<unsigned char>& digest) {
+  digest.assign(32, 0);
+  return BCryptHash(BCRYPT_SHA256_ALG_HANDLE,
+                    nullptr,
+                    0,
+                    const_cast<PUCHAR>(static_cast<const unsigned char*>(data)),
+                    static_cast<ULONG>(size),
+                    digest.data(),
+                    static_cast<ULONG>(digest.size())) == 0;
+}
+
+struct FileManifest {
+  std::filesystem::path path;
+  uint64_t size{0};
+  std::wstring sha256;
+  std::vector<std::wstring> chunks;
+};
+
+bool HashArchiveFile(HWND hwnd,
+                     const std::filesystem::path& root,
+                     const std::filesystem::path& file,
+                     uint64_t chunkSize,
+                     FileManifest& manifest,
+                     uint64_t& doneBytes,
+                     uint64_t totalBytes) {
+  std::ifstream input(file, std::ios::binary);
+  if (!input) {
+    PostLog(hwnd, L"Unable to open file for hashing: " + file.wstring());
+    return false;
+  }
+
+  std::error_code ec;
+  manifest.path = std::filesystem::relative(file, root, ec);
+  if (ec) {
+    manifest.path = file.filename();
+  }
+  manifest.size = std::filesystem::file_size(file, ec);
+  if (ec) {
+    manifest.size = 0;
+  }
+
+  BCRYPT_HASH_HANDLE fullHash = nullptr;
+  if (BCryptCreateHash(BCRYPT_SHA256_ALG_HANDLE, &fullHash, nullptr, 0, nullptr, 0, 0) != 0) {
+    PostLog(hwnd, L"Unable to initialize SHA-256.");
+    return false;
+  }
+
+  std::vector<char> buffer(static_cast<size_t>(std::min<uint64_t>(chunkSize, 8ull * 1024ull * 1024ull)));
+  std::vector<char> chunk;
+  chunk.reserve(static_cast<size_t>(std::min<uint64_t>(chunkSize, 64ull * 1024ull * 1024ull)));
+  while (input && !g_cancelRequested) {
+    input.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
+    const std::streamsize read = input.gcount();
+    if (read <= 0) {
+      break;
+    }
+    BCryptHashData(fullHash, reinterpret_cast<PUCHAR>(buffer.data()), static_cast<ULONG>(read), 0);
+    chunk.insert(chunk.end(), buffer.data(), buffer.data() + read);
+    doneBytes += static_cast<uint64_t>(read);
+    if (chunk.size() >= chunkSize) {
+      std::vector<unsigned char> digest;
+      if (!Sha256Bytes(chunk.data(), chunk.size(), digest)) {
+        BCryptDestroyHash(fullHash);
+        return false;
+      }
+      manifest.chunks.push_back(Hex(digest));
+      chunk.clear();
+    }
+    const int percent = totalBytes > 0 ? static_cast<int>((doneBytes * 100) / totalBytes) : 0;
+    PostProgress(hwnd, percent);
+    PostStatus(hwnd, L"Hashing " + std::to_wstring(percent) + L"% | " + FormatBytes(doneBytes) + L" / " + FormatBytes(totalBytes));
+  }
+
+  if (!chunk.empty()) {
+    std::vector<unsigned char> digest;
+    if (!Sha256Bytes(chunk.data(), chunk.size(), digest)) {
+      BCryptDestroyHash(fullHash);
+      return false;
+    }
+    manifest.chunks.push_back(Hex(digest));
+  }
+
+  std::vector<unsigned char> fullDigest(32);
+  const bool ok = BCryptFinishHash(fullHash, fullDigest.data(), static_cast<ULONG>(fullDigest.size()), 0) == 0;
+  BCryptDestroyHash(fullHash);
+  if (!ok || !input.eof()) {
+    PostLog(hwnd, L"Hashing failed: " + file.wstring());
+    return false;
+  }
+  manifest.sha256 = Hex(fullDigest);
+  return !g_cancelRequested;
+}
+
+std::vector<std::filesystem::path> FindArchiveParts(const PackerConfig& config) {
+  std::vector<std::filesystem::path> files;
+  std::error_code ec;
+  const auto base = config.archiveName + SelectArchiveExtension(config);
+  for (const auto& entry : std::filesystem::directory_iterator(config.releaseFolder, ec)) {
+    if (ec) {
+      break;
+    }
+    if (!entry.is_regular_file(ec) || ec) {
+      ec.clear();
+      continue;
+    }
+    const auto name = entry.path().filename().wstring();
+    if (name == base || name.starts_with(base + L".")) {
+      files.push_back(entry.path());
+    }
+  }
+  std::sort(files.begin(), files.end());
+  return files;
+}
+
+bool WriteManifest(HWND hwnd, const PackerConfig& config) {
+  const auto files = FindArchiveParts(config);
+  if (files.empty()) {
+    PostLog(hwnd, L"No archive parts found in release folder.");
+    return false;
+  }
+
+  uint64_t totalBytes = 0;
+  for (const auto& file : files) {
+    std::error_code ec;
+    totalBytes += std::filesystem::file_size(file, ec);
+    if (ec) {
+      ec.clear();
+    }
+  }
+
+  PostLog(hwnd, L"Generating manifest for " + std::to_wstring(files.size()) + L" archive file(s).");
+  std::vector<FileManifest> manifests;
+  uint64_t doneBytes = 0;
+  for (const auto& file : files) {
+    FileManifest manifest;
+    if (!HashArchiveFile(hwnd, config.releaseFolder, file, config.chunkSize, manifest, doneBytes, totalBytes)) {
+      return false;
+    }
+    manifests.push_back(std::move(manifest));
+  }
+
+  std::error_code ec;
+  const auto packageFolder = config.releaseFolder / "package";
+  std::filesystem::create_directories(packageFolder, ec);
+  if (ec) {
+    PostLog(hwnd, L"Unable to create package folder: " + Widen(ec.message()));
+    return false;
+  }
+
+  const auto manifestPath = packageFolder / "manifest.json";
+  std::ofstream output(manifestPath, std::ios::binary | std::ios::trunc);
+  if (!output) {
+    PostLog(hwnd, L"Unable to write manifest: " + manifestPath.wstring());
+    return false;
+  }
+
+  output << "{\n";
+  output << "  \"schema\": \"modlist-manifest-chunks-v1\",\n";
+  output << "  \"archive_name\": \"" << JsonEscape(Narrow(config.archiveName)) << "\",\n";
+  output << "  \"hash\": {\n";
+  output << "    \"algorithm\": \"sha256\",\n";
+  output << "    \"chunk_size\": " << config.chunkSize << "\n";
+  output << "  },\n";
+  output << "  \"files\": [\n";
+  for (size_t i = 0; i < manifests.size(); ++i) {
+    const auto& file = manifests[i];
+    output << "    {\n";
+    output << "      \"path\": \"" << JsonEscape(file.path.generic_string()) << "\",\n";
+    output << "      \"size\": " << file.size << ",\n";
+    output << "      \"sha256\": \"" << Narrow(file.sha256) << "\",\n";
+    output << "      \"chunks\": [\n";
+    for (size_t j = 0; j < file.chunks.size(); ++j) {
+      output << "        \"" << Narrow(file.chunks[j]) << "\"";
+      output << (j + 1 == file.chunks.size() ? "\n" : ",\n");
+    }
+    output << "      ]\n";
+    output << "    }" << (i + 1 == manifests.size() ? "\n" : ",\n");
+  }
+  output << "  ]\n";
+  output << "}\n";
+  if (!output) {
+    PostLog(hwnd, L"Unable to finish manifest write.");
+    return false;
+  }
+
+  PostProgress(hwnd, 100);
+  PostStatus(hwnd, L"Manifest complete");
+  PostLog(hwnd, L"Manifest written: " + manifestPath.wstring());
+  return true;
+}
+
+int RunProcess(HWND hwnd, const std::wstring& command) {
+  SECURITY_ATTRIBUTES security{};
+  security.nLength = sizeof(security);
+  security.bInheritHandle = TRUE;
+
+  HANDLE readPipe = nullptr;
+  HANDLE writePipe = nullptr;
+  if (!CreatePipe(&readPipe, &writePipe, &security, 0)) {
+    return static_cast<int>(GetLastError());
+  }
+  SetHandleInformation(readPipe, HANDLE_FLAG_INHERIT, 0);
+
+  STARTUPINFOW startup{};
+  startup.cb = sizeof(startup);
+  startup.dwFlags = STARTF_USESTDHANDLES;
+  startup.hStdOutput = writePipe;
+  startup.hStdError = writePipe;
+  startup.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+
+  PROCESS_INFORMATION process{};
+  std::wstring mutableCommand = command;
+  const BOOL created = CreateProcessW(nullptr,
+                                      mutableCommand.data(),
+                                      nullptr,
+                                      nullptr,
+                                      TRUE,
+                                      CREATE_NO_WINDOW,
+                                      nullptr,
+                                      nullptr,
+                                      &startup,
+                                      &process);
+  CloseHandle(writePipe);
+  if (!created) {
+    CloseHandle(readPipe);
+    return static_cast<int>(GetLastError());
+  }
+
+  char buffer[4096];
+  DWORD bytesRead = 0;
+  std::string tail;
+  while (!g_cancelRequested && ReadFile(readPipe, buffer, sizeof(buffer), &bytesRead, nullptr) && bytesRead > 0) {
+    tail.append(buffer, bytesRead);
+    if (tail.size() > 4096) {
+      tail.erase(0, tail.size() - 4096);
+    }
+    const auto percentPos = tail.rfind('%');
+    if (percentPos != std::string::npos) {
+      size_t begin = percentPos;
+      while (begin > 0 && std::isdigit(static_cast<unsigned char>(tail[begin - 1]))) {
+        --begin;
+      }
+      if (begin < percentPos) {
+        const int percent = std::stoi(tail.substr(begin, percentPos - begin));
+        if (percent >= 0 && percent <= 100) {
+          PostProgress(hwnd, percent);
+          PostStatus(hwnd, L"Compressing " + std::to_wstring(percent) + L"%");
+        }
+      }
+    }
+  }
+
+  if (g_cancelRequested) {
+    TerminateProcess(process.hProcess, 255);
+  }
+
+  WaitForSingleObject(process.hProcess, INFINITE);
+  DWORD exitCode = 0;
+  GetExitCodeProcess(process.hProcess, &exitCode);
+  CloseHandle(process.hThread);
+  CloseHandle(process.hProcess);
+  CloseHandle(readPipe);
+  return static_cast<int>(exitCode);
+}
+
+void CopyInstallerIfRequested(HWND hwnd, const PackerConfig& config) {
+  if (!config.copyInstaller) {
+    return;
+  }
+  const auto source = ModuleFolder().parent_path().parent_path() / "InstallerApp" / "dist" / "modlist-installer.exe";
+  const auto target = config.releaseFolder / "modlist-installer.exe";
+  std::error_code ec;
+  if (std::filesystem::exists(source, ec)) {
+    std::filesystem::copy_file(source, target, std::filesystem::copy_options::overwrite_existing, ec);
+    if (ec) {
+      PostLog(hwnd, L"Installer copy warning: " + Widen(ec.message()));
+    } else {
+      PostLog(hwnd, L"Installer copied: " + target.wstring());
+    }
+  } else {
+    PostLog(hwnd, L"Installer copy warning: installer exe was not found next to the repo.");
+  }
+}
+
+PackerConfig ReadConfig(bool archiveFirst) {
+  PackerConfig config;
+  config.sourceFolder = GetText(g_sourceEdit);
+  config.releaseFolder = GetText(g_releaseEdit);
+  config.sevenZipExe = GetText(g_sevenZipEdit);
+  config.archiveName = GetText(g_archiveNameEdit);
+  config.format = ComboText(g_formatCombo);
+  config.level = ComboText(g_levelCombo);
+  config.method = ComboText(g_methodCombo);
+  config.dictionary = ComboText(g_dictionaryCombo);
+  config.wordSize = ComboText(g_wordCombo);
+  config.solid = ComboText(g_solidCombo);
+  config.volumeSize = ComboText(g_volumeCombo);
+  config.threads = ComboText(g_threadsCombo);
+  config.chunkSize = ParseSizeText(ComboText(g_chunkCombo), 64ull * 1024ull * 1024ull);
+  config.copyInstaller = SendMessageW(g_copyInstallerCheck, BM_GETCHECK, 0, 0) == BST_CHECKED;
+  config.archiveFirst = archiveFirst;
+  return config;
+}
+
+bool ValidateConfig(HWND hwnd, const PackerConfig& config) {
+  std::error_code ec;
+  if (config.releaseFolder.empty()) {
+    PostLog(hwnd, L"Release folder is required.");
+    return false;
+  }
+  std::filesystem::create_directories(config.releaseFolder, ec);
+  if (ec) {
+    PostLog(hwnd, L"Unable to create release folder: " + Widen(ec.message()));
+    return false;
+  }
+  if (config.archiveName.empty()) {
+    PostLog(hwnd, L"Archive name is required.");
+    return false;
+  }
+  if (config.archiveFirst) {
+    if (!std::filesystem::exists(config.sourceFolder, ec) || !std::filesystem::is_directory(config.sourceFolder, ec)) {
+      PostLog(hwnd, L"Source folder is required.");
+      return false;
+    }
+    if (!std::filesystem::exists(config.sevenZipExe, ec)) {
+      PostLog(hwnd, L"7z.exe path is required for archive creation.");
+      return false;
+    }
+  }
+  return true;
+}
+
+void Worker(HWND hwnd, PackerConfig config) {
+  g_workerRunning = true;
+  g_cancelRequested = false;
+  PostProgress(hwnd, 0);
+
+  if (!ValidateConfig(hwnd, config)) {
+    g_workerRunning = false;
+    PostMessageW(hwnd, kWorkerFinishedMessage, 0, 0);
+    return;
+  }
+
+  bool ok = true;
+  if (config.archiveFirst) {
+    PostLog(hwnd, L"Creating archive...");
+    PostLog(hwnd, L"7-Zip command: " + BuildSevenZipCommand(config));
+    PostStatus(hwnd, L"Compressing");
+    const int exitCode = RunProcess(hwnd, BuildSevenZipCommand(config));
+    if (exitCode != 0) {
+      PostLog(hwnd, L"7-Zip failed with exit code " + std::to_wstring(exitCode));
+      ok = false;
+    } else {
+      PostLog(hwnd, L"Archive creation completed.");
+    }
+  }
+
+  if (ok && !g_cancelRequested) {
+    CopyInstallerIfRequested(hwnd, config);
+    ok = WriteManifest(hwnd, config);
+  }
+
+  if (g_cancelRequested) {
+    PostLog(hwnd, L"Stopped.");
+    PostStatus(hwnd, L"Stopped");
+  } else if (ok) {
+    PostLog(hwnd, L"Package ready.");
+    PostStatus(hwnd, L"Package ready");
+  }
+  g_workerRunning = false;
+  PostMessageW(hwnd, kWorkerFinishedMessage, 0, 0);
+}
+
+HWND CreateLabel(HWND parent, const wchar_t* text, int x, int y, int w, int h) {
+  return CreateWindowExW(0, L"STATIC", text, WS_CHILD | WS_VISIBLE, x, y, w, h, parent, nullptr, g_instance, nullptr);
+}
+
+HWND CreateEdit(HWND parent, int id, int x, int y, int w, int h) {
+  return CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
+                         x, y, w, h, parent, reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), g_instance, nullptr);
+}
+
+HWND CreateButton(HWND parent, int id, const wchar_t* text, int x, int y, int w, int h) {
+  return CreateWindowExW(0, L"BUTTON", text, WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                         x, y, w, h, parent, reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), g_instance, nullptr);
+}
+
+HWND CreateCombo(HWND parent, int id, int x, int y, int w, int h) {
+  return CreateWindowExW(0, WC_COMBOBOXW, L"", WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL,
+                         x, y, w, h, parent, reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), g_instance, nullptr);
+}
+
+void EnableRunningControls(HWND hwnd, bool running) {
+  EnableWindow(GetDlgItem(hwnd, kBuildButton), !running);
+  EnableWindow(GetDlgItem(hwnd, kManifestButton), !running);
+  EnableWindow(GetDlgItem(hwnd, kStopButton), running);
+}
+
+void StartWork(HWND hwnd, bool archiveFirst) {
+  if (g_workerRunning) {
+    return;
+  }
+  EnableRunningControls(hwnd, true);
+  std::thread(Worker, hwnd, ReadConfig(archiveFirst)).detach();
+}
+
+void SetDefaults(HWND hwnd) {
+  (void)hwnd;
+  AddComboItem(g_formatCombo, L"7z");
+  AddComboItem(g_formatCombo, L"zip");
+  SelectCombo(g_formatCombo, 0);
+
+  for (const wchar_t* item : {L"0", L"1", L"3", L"5", L"7", L"9"}) {
+    AddComboItem(g_levelCombo, item);
+  }
+  SelectCombo(g_levelCombo, 5);
+
+  for (const wchar_t* item : {L"LZMA2", L"LZMA", L"PPMd", L"BZip2"}) {
+    AddComboItem(g_methodCombo, item);
+  }
+  SelectCombo(g_methodCombo, 0);
+
+  for (const wchar_t* item : {L"64m", L"128m", L"256m", L"512m", L"1g"}) {
+    AddComboItem(g_dictionaryCombo, item);
+  }
+  SelectCombo(g_dictionaryCombo, 1);
+
+  for (const wchar_t* item : {L"32", L"64", L"128", L"273"}) {
+    AddComboItem(g_wordCombo, item);
+  }
+  SelectCombo(g_wordCombo, 3);
+
+  AddComboItem(g_solidCombo, L"Solid");
+  AddComboItem(g_solidCombo, L"Non-solid");
+  SelectCombo(g_solidCombo, 0);
+
+  for (const wchar_t* item : {L"none", L"2g", L"4g", L"8g", L"16g"}) {
+    AddComboItem(g_volumeCombo, item);
+  }
+  SelectCombo(g_volumeCombo, 2);
+
+  for (const wchar_t* item : {L"on", L"2", L"4", L"8", L"16"}) {
+    AddComboItem(g_threadsCombo, item);
+  }
+  SelectCombo(g_threadsCombo, 0);
+
+  for (const wchar_t* item : {L"16m", L"64m", L"128m", L"256m"}) {
+    AddComboItem(g_chunkCombo, item);
+  }
+  SelectCombo(g_chunkCombo, 1);
+
+  SetText(g_archiveNameEdit, L"MyPack");
+  const auto resource7z = ModuleFolder().parent_path().parent_path() / "InstallerApp" / "resources" / "7z.exe";
+  if (std::filesystem::exists(resource7z)) {
+    SetText(g_sevenZipEdit, resource7z.wstring());
+  }
+  SendMessageW(g_copyInstallerCheck, BM_SETCHECK, BST_CHECKED, 0);
+  EnableWindow(GetDlgItem(hwnd, kStopButton), FALSE);
+}
+
+LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
+  switch (message) {
+    case WM_CREATE: {
+      INITCOMMONCONTROLSEX controls{};
+      controls.dwSize = sizeof(controls);
+      controls.dwICC = ICC_PROGRESS_CLASS;
+      InitCommonControlsEx(&controls);
+
+      CreateLabel(hwnd, L"Source folder", 14, 16, 120, 20);
+      g_sourceEdit = CreateEdit(hwnd, kSourceEdit, 140, 12, 520, 24);
+      CreateButton(hwnd, kSourceBrowse, L"...", 668, 12, 34, 24);
+
+      CreateLabel(hwnd, L"Release folder", 14, 48, 120, 20);
+      g_releaseEdit = CreateEdit(hwnd, kReleaseEdit, 140, 44, 520, 24);
+      CreateButton(hwnd, kReleaseBrowse, L"...", 668, 44, 34, 24);
+
+      CreateLabel(hwnd, L"7z.exe", 14, 80, 120, 20);
+      g_sevenZipEdit = CreateEdit(hwnd, kSevenZipEdit, 140, 76, 520, 24);
+      CreateButton(hwnd, kSevenZipBrowse, L"...", 668, 76, 34, 24);
+
+      CreateLabel(hwnd, L"Archive name", 14, 118, 120, 20);
+      g_archiveNameEdit = CreateEdit(hwnd, kArchiveNameEdit, 140, 114, 170, 24);
+      CreateLabel(hwnd, L"Format", 326, 118, 70, 20);
+      g_formatCombo = CreateCombo(hwnd, kFormatCombo, 388, 114, 100, 160);
+      CreateLabel(hwnd, L"Level", 504, 118, 70, 20);
+      g_levelCombo = CreateCombo(hwnd, kLevelCombo, 562, 114, 90, 160);
+
+      CreateLabel(hwnd, L"Method", 14, 152, 120, 20);
+      g_methodCombo = CreateCombo(hwnd, kMethodCombo, 140, 148, 120, 160);
+      CreateLabel(hwnd, L"Dictionary", 280, 152, 90, 20);
+      g_dictionaryCombo = CreateCombo(hwnd, kDictionaryCombo, 370, 148, 100, 160);
+      CreateLabel(hwnd, L"Word", 490, 152, 60, 20);
+      g_wordCombo = CreateCombo(hwnd, kWordCombo, 550, 148, 100, 160);
+
+      CreateLabel(hwnd, L"Solid block", 14, 186, 120, 20);
+      g_solidCombo = CreateCombo(hwnd, kSolidCombo, 140, 182, 120, 160);
+      CreateLabel(hwnd, L"Split volume", 280, 186, 90, 20);
+      g_volumeCombo = CreateCombo(hwnd, kVolumeCombo, 370, 182, 100, 160);
+      CreateLabel(hwnd, L"Threads", 490, 186, 60, 20);
+      g_threadsCombo = CreateCombo(hwnd, kThreadsCombo, 550, 182, 100, 160);
+
+      CreateLabel(hwnd, L"Manifest chunk", 14, 220, 120, 20);
+      g_chunkCombo = CreateCombo(hwnd, kChunkCombo, 140, 216, 120, 160);
+      g_copyInstallerCheck = CreateWindowExW(0, L"BUTTON", L"Copy modlist-installer.exe into release folder",
+                                             WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
+                                             280, 216, 360, 24, hwnd,
+                                             reinterpret_cast<HMENU>(static_cast<INT_PTR>(kCopyInstallerCheck)), g_instance, nullptr);
+
+      CreateButton(hwnd, kBuildButton, L"Build Package", 14, 260, 130, 30);
+      CreateButton(hwnd, kManifestButton, L"Manifest Only", 154, 260, 130, 30);
+      CreateButton(hwnd, kStopButton, L"Stop", 294, 260, 90, 30);
+
+      g_progress = CreateWindowExW(0, PROGRESS_CLASSW, L"", WS_CHILD | WS_VISIBLE,
+                                   400, 264, 300, 20, hwnd,
+                                   reinterpret_cast<HMENU>(static_cast<INT_PTR>(kProgress)), g_instance, nullptr);
+      g_statusLabel = CreateWindowExW(0, L"STATIC", L"Ready", WS_CHILD | WS_VISIBLE,
+                                      14, 304, 690, 22, hwnd,
+                                      reinterpret_cast<HMENU>(static_cast<INT_PTR>(kStatusLabel)), g_instance, nullptr);
+      g_logEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+                                  WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL,
+                                  14, 330, 690, 190, hwnd,
+                                  reinterpret_cast<HMENU>(static_cast<INT_PTR>(kLogEdit)), g_instance, nullptr);
+      SendMessageW(g_progress, PBM_SETRANGE, 0, MAKELPARAM(0, 100));
+      SetDefaults(hwnd);
+      AppendLog(L"Modlist Packer ready.");
+      return 0;
+    }
+    case WM_COMMAND: {
+      const int id = LOWORD(wParam);
+      if (id == kSourceBrowse) {
+        if (auto path = PickFolder(hwnd)) {
+          SetText(g_sourceEdit, path->wstring());
+        }
+      } else if (id == kReleaseBrowse) {
+        if (auto path = PickFolder(hwnd)) {
+          SetText(g_releaseEdit, path->wstring());
+        }
+      } else if (id == kSevenZipBrowse) {
+        if (auto path = PickSevenZip(hwnd)) {
+          SetText(g_sevenZipEdit, path->wstring());
+        }
+      } else if (id == kBuildButton) {
+        StartWork(hwnd, true);
+      } else if (id == kManifestButton) {
+        StartWork(hwnd, false);
+      } else if (id == kStopButton) {
+        g_cancelRequested = true;
+      }
+      return 0;
+    }
+    case kLogMessage: {
+      std::unique_ptr<std::wstring> text(reinterpret_cast<std::wstring*>(lParam));
+      AppendLog(*text);
+      return 0;
+    }
+    case kStatusMessage: {
+      std::unique_ptr<std::wstring> text(reinterpret_cast<std::wstring*>(lParam));
+      SetWindowTextW(g_statusLabel, text->c_str());
+      return 0;
+    }
+    case kProgressMessage:
+      SendMessageW(g_progress, PBM_SETPOS, static_cast<int>(wParam), 0);
+      return 0;
+    case kWorkerFinishedMessage:
+      EnableRunningControls(hwnd, false);
+      return 0;
+    case WM_CLOSE:
+      if (g_workerRunning) {
+        g_cancelRequested = true;
+        return 0;
+      }
+      DestroyWindow(hwnd);
+      return 0;
+    case WM_DESTROY:
+      PostQuitMessage(0);
+      return 0;
+    default:
+      return DefWindowProcW(hwnd, message, wParam, lParam);
+  }
+}
+
+}  // namespace
+
+int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
+  g_instance = instance;
+  OleInitialize(nullptr);
+
+  const wchar_t className[] = L"ModlistPackerWindow";
+  WNDCLASSW windowClass{};
+  windowClass.lpfnWndProc = WindowProc;
+  windowClass.hInstance = instance;
+  windowClass.lpszClassName = className;
+  windowClass.hCursor = LoadCursor(nullptr, IDC_ARROW);
+  windowClass.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_BTNFACE + 1);
+  RegisterClassW(&windowClass);
+
+  HWND hwnd = CreateWindowExW(0, className, L"Modlist Packer",
+                              WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
+                              CW_USEDEFAULT, CW_USEDEFAULT, 735, 570,
+                              nullptr, nullptr, instance, nullptr);
+  if (hwnd == nullptr) {
+    OleUninitialize();
+    return 1;
+  }
+
+  ShowWindow(hwnd, showCommand);
+  UpdateWindow(hwnd);
+
+  MSG message{};
+  while (GetMessageW(&message, nullptr, 0, 0) > 0) {
+    TranslateMessage(&message);
+    DispatchMessageW(&message);
+  }
+
+  OleUninitialize();
+  return static_cast<int>(message.wParam);
+}

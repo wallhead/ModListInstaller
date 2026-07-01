@@ -8,6 +8,8 @@ InstallerApp/dist/*.torrent
 InstallerApp/dist/package/*.torrent
 InstallerApp/dist/downloads/
 InstallerApp/dist/modlist-installer-updated.exe
+PackerApp/.xmake/
+PackerApp/build/
 
 *.obj
 *.pdb
@@ -22,4 +24,5 @@ InstallerApp/dist/modlist-installer-updated.exe
 
 *.exe
 !InstallerApp/dist/modlist-installer.exe
-!InstallerApp/dist/tools/7zip/7z.exe
+!InstallerApp/resources/7z.exe
+!PackerApp/dist/modlist-packer.exe

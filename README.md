@@ -8,6 +8,12 @@ The ready-to-run build is included at:
 InstallerApp/dist/modlist-installer.exe
 ```
 
+The release preparation tool is included at:
+
+```text
+PackerApp/dist/modlist-packer.exe
+```
+
 Put exactly one `.torrent` file in `package\` and the complete multi-volume archive beside `modlist-installer.exe`, then run the exe. The app validates the local archive files against the torrent, then unpacks them with embedded 7-Zip.
 
 ## Current Features
@@ -96,6 +102,11 @@ InstallerApp/
   src/        C++ source
   tests/      core tests
   xmake.lua   primary build
+PackerApp/
+  dist/       ready modlist packer exe
+  scripts/    build helper
+  src/        native packer GUI and manifest writer
+  xmake.lua   packer build
 ```
 
 The app can still build without libtorrent, but the real torrent backend requires `xmake f --use_libtorrent=y`.
