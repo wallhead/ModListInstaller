@@ -14,6 +14,7 @@ Put exactly one `.torrent` file in `InstallerApp/dist/package`, then run the exe
 
 - Native Windows GUI.
 - Three-step wizard with Previous/Next navigation.
+- Classic installer-inspired color scheme with blue side rail and grey navigation footer.
 - Welcome page with placeholder greeting text.
 - Folder selection page.
 - Download and validation page.

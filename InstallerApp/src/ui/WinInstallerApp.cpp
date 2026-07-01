@@ -67,10 +67,26 @@ HWND g_statusLabel = nullptr;
 HWND g_previousButton = nullptr;
 HWND g_nextButton = nullptr;
 WizardPage g_page = WizardPage::Welcome;
+HBRUSH g_contentBrush = nullptr;
+HBRUSH g_footerBrush = nullptr;
+HBRUSH g_editBrush = nullptr;
+HFONT g_stepFont = nullptr;
+HFONT g_titleFont = nullptr;
+HFONT g_bodyFont = nullptr;
+HFONT g_labelFont = nullptr;
 std::atomic_bool g_workerRunning{false};
 std::atomic_bool g_closeAfterWorker{false};
 std::mutex g_downloaderMutex;
 std::shared_ptr<modlist::LibtorrentDownloader> g_activeDownloader;
+
+constexpr COLORREF kRailColor = RGB(27, 58, 107);
+constexpr COLORREF kRailDarkColor = RGB(18, 39, 74);
+constexpr COLORREF kContentColor = RGB(255, 255, 255);
+constexpr COLORREF kFooterColor = RGB(240, 240, 240);
+constexpr COLORREF kLineColor = RGB(208, 213, 222);
+constexpr COLORREF kPrimaryTextColor = RGB(28, 37, 52);
+constexpr COLORREF kMutedTextColor = RGB(91, 101, 118);
+constexpr COLORREF kAccentTextColor = RGB(32, 82, 149);
 
 std::wstring Widen(const std::string& text) {
   if (text.empty()) {
@@ -223,6 +239,64 @@ HWND CreateButton(HWND parent, int id, const wchar_t* text, int x, int y, int wi
                          x, y, width, height, parent, reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), g_instance, nullptr);
 }
 
+HFONT CreateUiFont(int pointSize, int weight = FW_NORMAL) {
+  HDC screen = GetDC(nullptr);
+  const int height = -MulDiv(pointSize, GetDeviceCaps(screen, LOGPIXELSY), 72);
+  ReleaseDC(nullptr, screen);
+  return CreateFontW(height, 0, 0, 0, weight, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
+                     CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+}
+
+void SetControlFont(HWND hwnd, HFONT font) {
+  if (hwnd != nullptr && font != nullptr) {
+    SendMessageW(hwnd, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
+  }
+}
+
+void PaintInstallerChrome(HWND hwnd, HDC dc) {
+  RECT rect{};
+  GetClientRect(hwnd, &rect);
+  const int width = rect.right - rect.left;
+  const int height = rect.bottom - rect.top;
+  constexpr int railWidth = 116;
+  constexpr int footerHeight = 66;
+
+  RECT content{0, 0, width, height};
+  FillRect(dc, &content, g_contentBrush);
+
+  RECT rail{0, 0, railWidth, height - footerHeight};
+  HBRUSH railBrush = CreateSolidBrush(kRailColor);
+  FillRect(dc, &rail, railBrush);
+  DeleteObject(railBrush);
+
+  RECT railDark{0, 0, 12, height - footerHeight};
+  HBRUSH railDarkBrush = CreateSolidBrush(kRailDarkColor);
+  FillRect(dc, &railDark, railDarkBrush);
+  DeleteObject(railDarkBrush);
+
+  RECT footer{0, height - footerHeight, width, height};
+  FillRect(dc, &footer, g_footerBrush);
+
+  HPEN linePen = CreatePen(PS_SOLID, 1, kLineColor);
+  HPEN oldPen = static_cast<HPEN>(SelectObject(dc, linePen));
+  MoveToEx(dc, 0, height - footerHeight, nullptr);
+  LineTo(dc, width, height - footerHeight);
+  MoveToEx(dc, railWidth, 0, nullptr);
+  LineTo(dc, railWidth, height - footerHeight);
+  SelectObject(dc, oldPen);
+  DeleteObject(linePen);
+
+  SetBkMode(dc, TRANSPARENT);
+  SetTextColor(dc, RGB(238, 244, 255));
+  HFONT oldFont = static_cast<HFONT>(SelectObject(dc, g_labelFont));
+  RECT railText{18, 26, railWidth - 12, 88};
+  DrawTextW(dc, L"MODLIST", -1, &railText, DT_LEFT | DT_TOP | DT_SINGLELINE);
+  SelectObject(dc, g_titleFont);
+  RECT railMark{18, 74, railWidth - 12, 132};
+  DrawTextW(dc, L"III", -1, &railMark, DT_LEFT | DT_TOP | DT_SINGLELINE);
+  SelectObject(dc, oldFont);
+}
+
 void ShowControl(HWND hwnd, bool visible) {
   if (hwnd != nullptr) {
     ShowWindow(hwnd, visible ? SW_SHOW : SW_HIDE);
@@ -251,34 +325,38 @@ void Layout(HWND hwnd) {
   const int width = rect.right - rect.left;
   const int height = rect.bottom - rect.top;
   const int margin = 16;
+  const int railWidth = 116;
+  const int contentX = railWidth + 28;
+  const int contentRightPadding = 28;
   const int navY = height - 48;
   const int labelWidth = 115;
   const int buttonWidth = 88;
   const int rowHeight = 25;
-  const int editX = margin + labelWidth;
-  const int editWidth = width - editX - buttonWidth - margin * 2;
+  const int editX = contentX + labelWidth;
+  const int editWidth = width - editX - buttonWidth - contentRightPadding - 8;
   const int buttonX = editX + editWidth + 8;
+  const int contentWidth = width - contentX - contentRightPadding;
 
-  MoveWindow(g_stepLabel, margin, 18, width - margin * 2, 24, TRUE);
+  MoveWindow(g_stepLabel, contentX, 24, contentWidth, 24, TRUE);
 
-  MoveWindow(g_welcomeTitle, margin, 92, width - margin * 2, 38, TRUE);
-  MoveWindow(g_welcomeBody, margin, 146, width - margin * 2, 90, TRUE);
+  MoveWindow(g_welcomeTitle, contentX, 96, contentWidth, 42, TRUE);
+  MoveWindow(g_welcomeBody, contentX, 154, contentWidth, 96, TRUE);
 
-  MoveWindow(g_downloadLabel, margin, 112, labelWidth, 20, TRUE);
+  MoveWindow(g_downloadLabel, contentX, 112, labelWidth, 20, TRUE);
   MoveWindow(GetDlgItem(hwnd, kDownloadEdit), editX, 108, editWidth, rowHeight, TRUE);
   MoveWindow(GetDlgItem(hwnd, kDownloadBrowse), buttonX, 108, buttonWidth, rowHeight, TRUE);
-  MoveWindow(g_installLabel, margin, 154, labelWidth, 20, TRUE);
+  MoveWindow(g_installLabel, contentX, 154, labelWidth, 20, TRUE);
   MoveWindow(GetDlgItem(hwnd, kInstallEdit), editX, 150, editWidth, rowHeight, TRUE);
   MoveWindow(GetDlgItem(hwnd, kInstallBrowse), buttonX, 150, buttonWidth, rowHeight, TRUE);
 
-  MoveWindow(GetDlgItem(hwnd, kValidateButton), margin, 70, 120, 30, TRUE);
-  MoveWindow(GetDlgItem(hwnd, kStartButton), margin + 132, 70, 120, 30, TRUE);
-  MoveWindow(GetDlgItem(hwnd, kUnpackButton), margin + 264, 70, 120, 30, TRUE);
-  MoveWindow(GetDlgItem(hwnd, kPauseButton), margin + 396, 70, 120, 30, TRUE);
-  MoveWindow(GetDlgItem(hwnd, kStopButton), margin + 528, 70, 92, 30, TRUE);
-  MoveWindow(g_progress, margin, 118, width - margin * 2, 20, TRUE);
-  MoveWindow(g_statusLabel, margin, 146, width - margin * 2, 22, TRUE);
-  MoveWindow(g_logEdit, margin, 178, width - margin * 2, navY - 194, TRUE);
+  MoveWindow(GetDlgItem(hwnd, kValidateButton), contentX, 74, 120, 30, TRUE);
+  MoveWindow(GetDlgItem(hwnd, kStartButton), contentX + 132, 74, 120, 30, TRUE);
+  MoveWindow(GetDlgItem(hwnd, kUnpackButton), contentX + 264, 74, 120, 30, TRUE);
+  MoveWindow(GetDlgItem(hwnd, kPauseButton), contentX + 396, 74, 120, 30, TRUE);
+  MoveWindow(GetDlgItem(hwnd, kStopButton), contentX + 528, 74, 92, 30, TRUE);
+  MoveWindow(g_progress, contentX, 122, contentWidth, 20, TRUE);
+  MoveWindow(g_statusLabel, contentX, 150, contentWidth, 22, TRUE);
+  MoveWindow(g_logEdit, contentX, 182, contentWidth, navY - 198, TRUE);
 
   MoveWindow(g_previousButton, width - 228, navY, 100, 30, TRUE);
   MoveWindow(g_nextButton, width - 116, navY, 100, 30, TRUE);
@@ -1000,6 +1078,13 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
       std::filesystem::create_directories(PackageFolder());
       std::filesystem::create_directories(DownloadsFolder());
       std::filesystem::create_directories(ExeFolder() / "tools" / "7zip");
+      g_contentBrush = CreateSolidBrush(kContentColor);
+      g_footerBrush = CreateSolidBrush(kFooterColor);
+      g_editBrush = CreateSolidBrush(RGB(255, 255, 255));
+      g_stepFont = CreateUiFont(10, FW_SEMIBOLD);
+      g_titleFont = CreateUiFont(22, FW_SEMIBOLD);
+      g_bodyFont = CreateUiFont(10);
+      g_labelFont = CreateUiFont(9, FW_SEMIBOLD);
 
       g_stepLabel = CreateLabel(hwnd, L"", 16, 18, 720, 24);
       g_welcomeTitle = CreateLabel(hwnd, L"Modlist Installer", 16, 92, 720, 38);
@@ -1028,7 +1113,27 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
                                   WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL,
                                   16, 177, 622, 258, hwnd,
                                   reinterpret_cast<HMENU>(static_cast<INT_PTR>(kLogEdit)), g_instance, nullptr);
+      SetControlFont(g_stepLabel, g_stepFont);
+      SetControlFont(g_welcomeTitle, g_titleFont);
+      SetControlFont(g_welcomeBody, g_bodyFont);
+      SetControlFont(g_downloadLabel, g_labelFont);
+      SetControlFont(g_installLabel, g_labelFont);
+      SetControlFont(g_downloadEdit, g_bodyFont);
+      SetControlFont(g_installEdit, g_bodyFont);
+      SetControlFont(g_statusLabel, g_bodyFont);
+      SetControlFont(g_logEdit, g_bodyFont);
+      SetControlFont(GetDlgItem(hwnd, kDownloadBrowse), g_bodyFont);
+      SetControlFont(GetDlgItem(hwnd, kInstallBrowse), g_bodyFont);
+      SetControlFont(GetDlgItem(hwnd, kValidateButton), g_bodyFont);
+      SetControlFont(GetDlgItem(hwnd, kStartButton), g_bodyFont);
+      SetControlFont(GetDlgItem(hwnd, kUnpackButton), g_bodyFont);
+      SetControlFont(GetDlgItem(hwnd, kPauseButton), g_bodyFont);
+      SetControlFont(GetDlgItem(hwnd, kStopButton), g_bodyFont);
+      SetControlFont(g_previousButton, g_bodyFont);
+      SetControlFont(g_nextButton, g_bodyFont);
       SendMessageW(g_progress, PBM_SETRANGE, 0, MAKELPARAM(0, 100));
+      SendMessageW(g_progress, PBM_SETBARCOLOR, 0, static_cast<LPARAM>(RGB(41, 111, 205)));
+      SendMessageW(g_progress, PBM_SETBKCOLOR, 0, static_cast<LPARAM>(RGB(226, 231, 239)));
       SetText(g_downloadEdit, DownloadsFolder().wstring());
       SetText(g_installEdit, L"D:\\Sky");
       AppendLog(L"App log: " + PathToDisplay(AppLogPath()));
@@ -1050,8 +1155,39 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
       ShowWizardPage(hwnd, WizardPage::Welcome);
       return 0;
     }
+    case WM_ERASEBKGND:
+      return 1;
+    case WM_PAINT: {
+      PAINTSTRUCT paint{};
+      HDC dc = BeginPaint(hwnd, &paint);
+      PaintInstallerChrome(hwnd, dc);
+      EndPaint(hwnd, &paint);
+      return 0;
+    }
+    case WM_CTLCOLORSTATIC: {
+      HDC dc = reinterpret_cast<HDC>(wParam);
+      HWND control = reinterpret_cast<HWND>(lParam);
+      SetBkMode(dc, TRANSPARENT);
+      if (control == g_stepLabel) {
+        SetTextColor(dc, kAccentTextColor);
+      } else if (control == g_welcomeTitle) {
+        SetTextColor(dc, kPrimaryTextColor);
+      } else if (control == g_welcomeBody || control == g_statusLabel) {
+        SetTextColor(dc, kMutedTextColor);
+      } else {
+        SetTextColor(dc, kPrimaryTextColor);
+      }
+      return reinterpret_cast<LRESULT>(g_contentBrush);
+    }
+    case WM_CTLCOLOREDIT: {
+      HDC dc = reinterpret_cast<HDC>(wParam);
+      SetTextColor(dc, kPrimaryTextColor);
+      SetBkColor(dc, RGB(255, 255, 255));
+      return reinterpret_cast<LRESULT>(g_editBrush);
+    }
     case WM_SIZE:
       Layout(hwnd);
+      InvalidateRect(hwnd, nullptr, TRUE);
       return 0;
     case WM_COMMAND: {
       const int id = LOWORD(wParam);
@@ -1110,6 +1246,13 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
       DestroyWindow(hwnd);
       return 0;
     case WM_DESTROY:
+      DeleteObject(g_contentBrush);
+      DeleteObject(g_footerBrush);
+      DeleteObject(g_editBrush);
+      DeleteObject(g_stepFont);
+      DeleteObject(g_titleFont);
+      DeleteObject(g_bodyFont);
+      DeleteObject(g_labelFont);
       PostQuitMessage(0);
       return 0;
     default:
