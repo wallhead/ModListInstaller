@@ -70,6 +70,57 @@ Result<ManifestFile> ParseFile(const JsonValue& json, size_t index) {
   return Result<ManifestFile>::Ok(std::move(file));
 }
 
+bool EndsWithInsensitive(std::string value, const std::string& suffix) {
+  std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
+    return static_cast<char>(std::tolower(c));
+  });
+  return value.size() >= suffix.size() && value.compare(value.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
+
+std::filesystem::path SelectFirstArchivePart(const std::vector<ManifestFile>& files) {
+  for (const auto& file : files) {
+    const auto path = file.path.generic_string();
+    if (EndsWithInsensitive(path, ".7z.001") || EndsWithInsensitive(path, ".zip.001")) {
+      return file.path;
+    }
+  }
+  for (const auto& file : files) {
+    const auto path = file.path.generic_string();
+    if (EndsWithInsensitive(path, ".7z") || EndsWithInsensitive(path, ".zip")) {
+      return file.path;
+    }
+  }
+  return files.empty() ? std::filesystem::path{} : files.front().path;
+}
+
+Result<Manifest> ParsePackerManifest(const JsonValue& root) {
+  Manifest manifest;
+  manifest.version = "modlist-manifest-chunks-v1";
+  manifest.torrent.type = TorrentSourceType::TorrentFile;
+  manifest.torrent.source = "package";
+
+  const JsonValue* files = root.Find("files");
+  if (files == nullptr || !files->IsArray() || files->AsArray().empty()) {
+    return Result<Manifest>::Error("Manifest field 'files' must be a non-empty array");
+  }
+  for (size_t i = 0; i < files->AsArray().size(); ++i) {
+    auto file = ParseFile(files->AsArray()[i], i);
+    if (!file.ok()) {
+      return Result<Manifest>::Error(file.error());
+    }
+    manifest.files.push_back(std::move(file.value()));
+  }
+
+  manifest.extract.firstArchivePart = SelectFirstArchivePart(manifest.files);
+  if (manifest.extract.firstArchivePart.empty() || !IsSafeManifestRelativePath(manifest.extract.firstArchivePart)) {
+    return Result<Manifest>::Error("Unable to infer a safe archive file from packer manifest");
+  }
+  manifest.extract.targetSubfolder.clear();
+  manifest.extract.cleanupAfterSuccess = false;
+  manifest.extract.useSameDiskTemp = true;
+  return Result<Manifest>::Ok(std::move(manifest));
+}
+
 }  // namespace
 
 Result<Manifest> ManifestLoader::LoadFromFile(const std::filesystem::path& path) const {
@@ -90,6 +141,11 @@ Result<Manifest> ManifestLoader::LoadFromString(const std::string& jsonText) con
   const JsonValue& root = parsed.value();
   if (!root.IsObject()) {
     return Result<Manifest>::Error("Manifest root must be an object");
+  }
+
+  if (const JsonValue* schema = root.Find("schema");
+      schema != nullptr && schema->IsString() && schema->AsString() == "modlist-manifest-chunks-v1") {
+    return ParsePackerManifest(root);
   }
 
   Manifest manifest;

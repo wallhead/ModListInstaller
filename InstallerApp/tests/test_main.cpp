@@ -50,6 +50,27 @@ std::string ValidManifestJson(const std::string& hash) {
   })";
 }
 
+std::string PackerManifestJson(const std::string& hash) {
+  return std::string(R"({
+    "schema": "modlist-manifest-chunks-v1",
+    "archive_name": "MyPack",
+    "hash": {
+      "algorithm": "sha256",
+      "chunk_size": 67108864
+    },
+    "files": [
+      {
+        "path": "MyPack.7z.001",
+        "size": 3,
+        "sha256": ")") + hash + R"(",
+        "chunks": [
+          ")" + hash + R"("
+        ]
+      }
+    ]
+  })";
+}
+
 void TestSha256() {
   Expect(Sha256::HexDigest("abc") == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
          "SHA256 digest mismatch");
@@ -61,6 +82,16 @@ void TestManifestLoader() {
   Expect(manifest.ok(), manifest.error().c_str());
   Expect(manifest.value().files.size() == 1, "Manifest file count mismatch");
   Expect(manifest.value().extract.firstArchivePart == "modpack.7z.001", "Manifest extract archive mismatch");
+}
+
+void TestPackerManifestLoader() {
+  ManifestLoader loader;
+  auto manifest = loader.LoadFromString(PackerManifestJson(Sha256::HexDigest("abc")));
+  Expect(manifest.ok(), manifest.error().c_str());
+  Expect(manifest.value().version == "modlist-manifest-chunks-v1", "Packer manifest schema mismatch");
+  Expect(manifest.value().files.size() == 1, "Packer manifest file count mismatch");
+  Expect(manifest.value().files[0].path == "MyPack.7z.001", "Packer manifest file path mismatch");
+  Expect(manifest.value().extract.firstArchivePart == "MyPack.7z.001", "Packer manifest archive mismatch");
 }
 
 void TestManifestRejectsTraversal() {
@@ -134,6 +165,7 @@ int main() {
   try {
     TestSha256();
     TestManifestLoader();
+    TestPackerManifestLoader();
     TestManifestRejectsTraversal();
     TestTrackerParsing();
     TestVerifier();

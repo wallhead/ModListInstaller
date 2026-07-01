@@ -3,8 +3,10 @@
 #include "app/PackageDiscovery.h"
 #include "downloader/LibtorrentDownloader.h"
 #include "extractor/SevenZipExtractor.h"
+#include "manifest/Manifest.h"
 #include "paths/PathValidator.h"
 #include "resource.h"
+#include "verifier/Verifier.h"
 
 #include <windows.h>
 #include <commctrl.h>
@@ -278,6 +280,15 @@ std::filesystem::path ArchiveFolder() {
 
 std::filesystem::path PackageFolder() {
   return ExeFolder() / "package";
+}
+
+std::filesystem::path ManifestPath() {
+  return PackageFolder() / "manifest.json";
+}
+
+bool PackageManifestFileExists() {
+  std::error_code ec;
+  return std::filesystem::exists(ManifestPath(), ec) && !ec;
 }
 
 void WriteLastSevenZipLog(const std::string& output) {
@@ -660,13 +671,75 @@ void Layout(HWND hwnd) {
 std::wstring StageToText(modlist::DownloadStage stage);
 std::wstring FormatBytes(uintmax_t bytes);
 std::optional<std::filesystem::path> FindFirstArchivePart(const std::filesystem::path& folder);
+std::optional<modlist::Manifest> LoadPackageManifest(std::wstring& message);
+std::optional<std::filesystem::path> ArchivePartFromManifest(const modlist::Manifest& manifest);
 
 modlist::Result<modlist::PackageDiscovery> ReadPackageFromUi() {
   auto package = modlist::DiscoverPackageNear(PackageFolder());
   if (package.ok() && !package.value().firstArchivePart.has_value()) {
     package.value().firstArchivePart = FindFirstArchivePart(ArchiveFolder());
   }
+  if (package.ok() && !package.value().firstArchivePart.has_value()) {
+    std::wstring message;
+    auto manifest = LoadPackageManifest(message);
+    if (manifest.has_value()) {
+      package.value().firstArchivePart = ArchivePartFromManifest(*manifest);
+    }
+  }
   return package;
+}
+
+std::optional<modlist::Manifest> LoadPackageManifest(std::wstring& message) {
+  std::error_code ec;
+  const auto path = ManifestPath();
+  if (!std::filesystem::exists(path, ec) || ec) {
+    message = L"No packer manifest found at: " + PathToDisplay(path);
+    return std::nullopt;
+  }
+
+  modlist::ManifestLoader loader;
+  auto manifest = loader.LoadFromFile(path);
+  if (!manifest.ok()) {
+    message = L"Manifest error: " + Widen(manifest.error());
+    return std::nullopt;
+  }
+
+  message = L"Manifest loaded: " + PathToDisplay(path);
+  return std::move(manifest.value());
+}
+
+uintmax_t ManifestRequiredBytes(const modlist::Manifest& manifest) {
+  uintmax_t total = 0;
+  for (const auto& file : manifest.files) {
+    total += file.size;
+  }
+  return total;
+}
+
+std::optional<std::filesystem::path> ArchivePartFromManifest(const modlist::Manifest& manifest) {
+  if (manifest.extract.firstArchivePart.empty()) {
+    return std::nullopt;
+  }
+  return ArchiveFolder() / manifest.extract.firstArchivePart;
+}
+
+bool VerifyPackageManifest(HWND hwnd, const modlist::Manifest& manifest) {
+  PostStatus(hwnd, L"Verifying manifest SHA-256");
+  PostLog(hwnd, L"Verifying manifest SHA-256 for " + std::to_wstring(manifest.files.size()) + L" archive file(s)...");
+  modlist::Verifier verifier;
+  const auto summary = verifier.Verify(ArchiveFolder(), manifest.files);
+  if (summary.ok) {
+    PostLog(hwnd, L"Manifest verification completed.");
+    return true;
+  }
+
+  for (const auto& file : summary.files) {
+    if (file.message != "OK") {
+      PostLog(hwnd, L"Manifest verification failed for " + PathToDisplay(file.path) + L": " + Widen(file.message));
+    }
+  }
+  PostValidationFailed(hwnd);
+  return false;
 }
 
 std::optional<std::filesystem::path> FindFirstArchivePart(const std::filesystem::path& folder) {
@@ -685,7 +758,7 @@ std::optional<std::filesystem::path> FindFirstArchivePart(const std::filesystem:
     for (auto& ch : name) {
       ch = static_cast<wchar_t>(towlower(ch));
     }
-    if (name.ends_with(L".7z.001")) {
+    if (name.ends_with(L".7z.001") || name.ends_with(L".zip.001") || name.ends_with(L".7z") || name.ends_with(L".zip")) {
       return entry.path();
     }
   }
@@ -697,7 +770,10 @@ bool IsArchiveVolume(const std::filesystem::path& path) {
   for (auto& ch : name) {
     ch = static_cast<wchar_t>(std::towlower(ch));
   }
-  return name.find(L".7z.") != std::wstring::npos || name.ends_with(L".7z");
+  return name.find(L".7z.") != std::wstring::npos ||
+         name.find(L".zip.") != std::wstring::npos ||
+         name.ends_with(L".7z") ||
+         name.ends_with(L".zip");
 }
 
 bool IsPlainSevenZipArchive(const std::filesystem::path& path) {
@@ -752,6 +828,15 @@ uintmax_t EstimateNearbyArchiveBytes(const std::filesystem::path& folder) {
 }
 
 uintmax_t EstimateRequiredBytes(const modlist::PackageDiscovery& package) {
+  std::wstring manifestMessage;
+  auto manifest = LoadPackageManifest(manifestMessage);
+  if (manifest.has_value()) {
+    const uintmax_t manifestBytes = ManifestRequiredBytes(*manifest);
+    AppendLog(manifestMessage);
+    AppendLog(L"Manifest archive size: " + FormatBytes(manifestBytes));
+    return manifestBytes;
+  }
+
   auto torrentSize = modlist::LibtorrentDownloader::ReadTorrentPayloadSize(package.torrentFile);
   if (torrentSize.ok()) {
     AppendLog(L"Torrent payload size: " + FormatBytes(torrentSize.value()));
@@ -1445,13 +1530,32 @@ void RunInstallWorker(HWND hwnd,
   }
   downloader->ReleaseFiles();
 
-  PostLog(hwnd, L"Looking for first .7z.001 archive part...");
+  std::optional<modlist::Manifest> manifest;
+  {
+    std::wstring manifestMessage;
+    manifest = LoadPackageManifest(manifestMessage);
+    PostLog(hwnd, manifestMessage);
+  }
+  if (!manifest.has_value() && PackageManifestFileExists()) {
+    PostValidationFailed(hwnd);
+    FinishWorker(hwnd, downloader);
+    return;
+  }
+  if (manifest.has_value() && !VerifyPackageManifest(hwnd, *manifest)) {
+    FinishWorker(hwnd, downloader);
+    return;
+  }
+
+  PostLog(hwnd, L"Looking for archive file to unpack...");
   auto firstArchivePart = package.firstArchivePart;
+  if (manifest.has_value()) {
+    firstArchivePart = ArchivePartFromManifest(*manifest);
+  }
   if (!firstArchivePart.has_value()) {
     firstArchivePart = FindFirstArchivePart(ArchiveFolder());
   }
   if (!firstArchivePart.has_value()) {
-    PostLog(hwnd, L"No .7z.001 archive part found beside the installer. Cannot extract automatically.");
+    PostLog(hwnd, L"No archive file found beside the installer. Cannot extract automatically.");
     FinishWorker(hwnd, downloader);
     return;
   }
@@ -1542,7 +1646,15 @@ void ValidatePackage() {
   if (package.value().firstArchivePart.has_value()) {
     AppendLog(L"Archive first part: " + PathToDisplay(*package.value().firstArchivePart));
   } else {
-    AppendLog(L"No .7z.001 found beside the installer.");
+    AppendLog(L"No archive file found beside the installer.");
+  }
+
+  std::wstring manifestMessage;
+  auto manifest = LoadPackageManifest(manifestMessage);
+  AppendLog(manifestMessage);
+  if (manifest.has_value()) {
+    AppendLog(L"Manifest files: " + std::to_wstring(manifest->files.size()));
+    AppendLog(L"Manifest archive entry: " + PathToDisplay(manifest->extract.firstArchivePart));
   }
 
   const uintmax_t knownRequiredBytes = EstimateRequiredBytes(package.value());
@@ -1687,7 +1799,17 @@ void UnpackOnly(HWND hwnd) {
 
   auto archive = FindFirstArchivePart(ArchiveFolder());
   if (!archive.has_value()) {
-    AppendLog(L"No .7z.001 archive part found beside the installer.");
+    std::wstring manifestMessage;
+    auto manifest = LoadPackageManifest(manifestMessage);
+    AppendLog(manifestMessage);
+    if (manifest.has_value()) {
+      archive = ArchivePartFromManifest(*manifest);
+    } else if (PackageManifestFileExists()) {
+      return;
+    }
+  }
+  if (!archive.has_value()) {
+    AppendLog(L"No archive file found beside the installer.");
     return;
   }
 

@@ -82,6 +82,7 @@ InstallerApp\dist\
   YourPack.7z.002
   package\
     YourPack.torrent
+    manifest.json
   logs\
 ```
 
@@ -140,6 +141,8 @@ modlist-installer.exe
 ```
 
 The GUI scans `package` for exactly one `.torrent` file and validates the archive parts beside the exe against it. It does not fetch missing pieces from the network.
+
+If `package\manifest.json` exists, the GUI also loads the packer manifest, uses its archive filename, uses its file sizes for space checks, and verifies SHA256 before extraction. If the manifest exists but is invalid or the hashes fail, install stops and shows `Rehash torrent`.
 
 The console harness can still pass a torrent explicitly for testing:
 
