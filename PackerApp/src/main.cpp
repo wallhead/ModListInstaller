@@ -366,6 +366,13 @@ std::filesystem::path ArchivePath(const PackerConfig& config) {
   return config.releaseFolder / (config.archiveName + SelectArchiveExtension(config));
 }
 
+bool IsNumericVolumeSuffix(const std::wstring& suffix) {
+  return !suffix.empty() &&
+         std::all_of(suffix.begin(), suffix.end(), [](wchar_t ch) {
+           return iswdigit(ch) != 0;
+         });
+}
+
 std::wstring BuildSevenZipCommand(const PackerConfig& config) {
   std::wstring command = Quote(config.sevenZipExe) + L" a " + Quote(ArchivePath(config)) + L" " +
                          Quote(config.sourceFolder / L"*") + L" -t" + config.format +
@@ -545,7 +552,9 @@ std::vector<std::filesystem::path> FindArchiveParts(const PackerConfig& config) 
       continue;
     }
     const auto name = entry.path().filename().wstring();
-    if (name == base || name.starts_with(base + L".")) {
+    const auto volumePrefix = base + L".";
+    if (name == base ||
+        (name.starts_with(volumePrefix) && IsNumericVolumeSuffix(name.substr(volumePrefix.size())))) {
       files.push_back(entry.path());
     }
   }
