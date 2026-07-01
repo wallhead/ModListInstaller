@@ -12,10 +12,12 @@
 #include <chrono>
 #include <cstdint>
 #include <cwctype>
+#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -482,7 +484,7 @@ bool HashArchiveFile(HWND hwnd,
                      const std::filesystem::path& file,
                      uint64_t chunkSize,
                      FileManifest& manifest,
-                     uint64_t& doneBytes,
+                     std::atomic_uint64_t& doneBytes,
                      uint64_t totalBytes) {
   std::ifstream input(file, std::ios::binary);
   if (!input) {
@@ -550,10 +552,10 @@ bool HashArchiveFile(HWND hwnd,
         chunkDone = 0;
       }
     }
-    doneBytes += static_cast<uint64_t>(read);
-    const int percent = totalBytes > 0 ? static_cast<int>((doneBytes * 100) / totalBytes) : 0;
+    const uint64_t done = doneBytes.fetch_add(static_cast<uint64_t>(read)) + static_cast<uint64_t>(read);
+    const int percent = totalBytes > 0 ? static_cast<int>((done * 100) / totalBytes) : 0;
     PostProgress(hwnd, percent);
-    PostStatus(hwnd, L"Hashing " + std::to_wstring(percent) + L"% | " + FormatBytes(doneBytes) + L" / " + FormatBytes(totalBytes));
+    PostStatus(hwnd, L"Hashing " + std::to_wstring(percent) + L"% | " + FormatBytes(done) + L" / " + FormatBytes(totalBytes));
   }
 
   if (chunkDone > 0) {
@@ -713,14 +715,64 @@ bool WriteManifest(HWND hwnd, const PackerConfig& config) {
   }
 
   PostLog(hwnd, L"Generating manifest for " + std::to_wstring(files.size()) + L" archive file(s).");
-  std::vector<FileManifest> manifests;
-  uint64_t doneBytes = 0;
-  for (const auto& file : files) {
-    FileManifest manifest;
-    if (!HashArchiveFile(hwnd, config.releaseFolder, file, config.chunkSize, manifest, doneBytes, totalBytes)) {
-      return false;
+  const unsigned int hardwareThreads = std::max(1u, std::thread::hardware_concurrency());
+  const size_t workerCount = std::max<size_t>(
+      1, std::min<size_t>(files.size(), std::min<size_t>(4, hardwareThreads)));
+  PostLog(hwnd, L"Manifest hashing workers: " + std::to_wstring(workerCount));
+
+  std::vector<FileManifest> manifests(files.size());
+  std::deque<size_t> jobs;
+  for (size_t i = 0; i < files.size(); ++i) {
+    jobs.push_back(i);
+  }
+
+  std::mutex jobsMutex;
+  std::atomic_uint64_t doneBytes{0};
+  std::atomic_bool failed{false};
+
+  auto fail = [&](std::wstring message) {
+    bool expected = false;
+    if (failed.compare_exchange_strong(expected, true)) {
+      PostLog(hwnd, std::move(message));
     }
-    manifests.push_back(std::move(manifest));
+  };
+
+  auto worker = [&]() {
+    while (!g_cancelRequested.load() && !failed.load()) {
+      size_t index = 0;
+      {
+        std::lock_guard<std::mutex> lock(jobsMutex);
+        if (jobs.empty()) {
+          return;
+        }
+        index = jobs.front();
+        jobs.pop_front();
+      }
+
+      PostLog(hwnd, L"Hashing archive file: " + files[index].filename().wstring());
+      if (!HashArchiveFile(hwnd, config.releaseFolder, files[index], config.chunkSize, manifests[index], doneBytes, totalBytes)) {
+        fail(L"Hashing failed: " + files[index].wstring());
+        return;
+      }
+    }
+  };
+
+  std::vector<std::thread> workers;
+  workers.reserve(workerCount);
+  for (size_t i = 0; i < workerCount; ++i) {
+    workers.emplace_back(worker);
+  }
+  for (auto& thread : workers) {
+    if (thread.joinable()) {
+      thread.join();
+    }
+  }
+
+  if (g_cancelRequested.load()) {
+    return false;
+  }
+  if (failed.load()) {
+    return false;
   }
 
   std::error_code ec;
