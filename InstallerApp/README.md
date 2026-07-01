@@ -45,6 +45,7 @@ The `Install` button runs the install pipeline on a background thread:
 - look for a `.7z.001` archive beside the exe
 - check unpack free space again before extraction
 - show live unpack percentage, speed, and ETA in the progress bar and status line
+- show live install percentage, speed, ETA, and elapsed time in the status line
 - install from the unpack folder into the final install folder, using same-drive move/cut semantics instead of copying when both folders are on the same drive
 - stream full 7-Zip diagnostics to `dist\logs` while keeping only a small in-memory tail for the GUI
 - run 7-Zip inside a memory-limited child process so oversized archives fail cleanly instead of exhausting system RAM

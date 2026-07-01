@@ -29,6 +29,7 @@ Put exactly one `.torrent` file in `package\` and the complete multi-volume arch
 - Force-checks torrent data before unpacking.
 - Releases torrent file handles before extraction.
 - Live unpack progress percentage, speed, and ETA.
+- Live install progress percentage, speed, ETA, and elapsed time.
 - Installs from the unpack folder into the final install folder; same-drive installs use move/cut semantics instead of copying.
 - Supports split `.7z.001` packages that contain an inner `.7z` archive.
 - Keeps full 7-Zip diagnostics in `dist/logs`, while the GUI log stays concise.

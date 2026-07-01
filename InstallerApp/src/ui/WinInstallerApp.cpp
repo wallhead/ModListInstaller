@@ -1098,30 +1098,87 @@ bool IsChildFolder(const std::filesystem::path& child, const std::filesystem::pa
          (childText[parentText.size()] == L'\\' || childText[parentText.size()] == L'/');
 }
 
-bool MoveEntrySameDrive(const std::filesystem::path& source, const std::filesystem::path& target, std::wstring& error) {
+struct InstallProgress {
+  HWND hwnd{nullptr};
+  uintmax_t totalBytes{0};
+  uintmax_t doneBytes{0};
+  int lastPercent{-1};
+  std::chrono::steady_clock::time_point startedAt{std::chrono::steady_clock::now()};
+};
+
+uintmax_t EstimateInstallBytes(const std::filesystem::path& path) {
+  std::error_code ec;
+  if (!std::filesystem::exists(path, ec) || ec) {
+    return 0;
+  }
+  if (std::filesystem::is_regular_file(path, ec) && !ec) {
+    return std::filesystem::file_size(path, ec);
+  }
+  if (!std::filesystem::is_directory(path, ec) || ec) {
+    return 0;
+  }
+
+  uintmax_t total = 0;
+  for (const auto& entry : std::filesystem::recursive_directory_iterator(path, std::filesystem::directory_options::skip_permission_denied, ec)) {
+    if (ec) {
+      break;
+    }
+    if (entry.is_regular_file(ec) && !ec) {
+      total += entry.file_size(ec);
+      if (ec) {
+        ec.clear();
+      }
+    }
+  }
+  return total;
+}
+
+void UpdateInstallProgress(InstallProgress& progress, uintmax_t bytes, bool force = false) {
+  progress.doneBytes = std::min(progress.totalBytes, progress.doneBytes + bytes);
+  const int percent = progress.totalBytes > 0
+                          ? static_cast<int>((progress.doneBytes * 100) / progress.totalBytes)
+                          : 0;
+  if (!force && percent == progress.lastPercent) {
+    return;
+  }
+  progress.lastPercent = percent;
+
+  const auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+      std::chrono::steady_clock::now() - progress.startedAt).count();
+  uintmax_t speed = 0;
+  int eta = -1;
+  if (elapsed > 0 && progress.doneBytes > 0) {
+    speed = progress.doneBytes / static_cast<uintmax_t>(elapsed);
+    if (speed > 0 && progress.totalBytes > progress.doneBytes) {
+      eta = static_cast<int>((progress.totalBytes - progress.doneBytes) / speed);
+    }
+  }
+
+  std::wostringstream status;
+  status << L"Installing " << percent << L"%";
+  if (progress.totalBytes > 0) {
+    status << L" | " << FormatBytes(progress.doneBytes) << L" / " << FormatBytes(progress.totalBytes);
+  }
+  if (speed > 0) {
+    status << L" | " << FormatBytesPerSecond(speed);
+  }
+  if (eta >= 0) {
+    status << L" | ETA " << FormatEta(eta);
+  }
+  status << L" | Elapsed " << FormatEta(static_cast<int>(elapsed));
+
+  PostProgress(progress.hwnd, 95 + (percent * 5) / 100);
+  PostStatus(progress.hwnd, status.str());
+}
+
+bool MoveWholeEntry(const std::filesystem::path& source,
+                    const std::filesystem::path& target,
+                    std::wstring& error) {
   std::error_code ec;
   std::filesystem::create_directories(target.parent_path(), ec);
   if (ec) {
     error = L"Unable to create install folder: " + Widen(ec.message());
     return false;
-  }
-
-  if (std::filesystem::is_directory(source, ec) && !ec && std::filesystem::exists(target, ec) && std::filesystem::is_directory(target, ec)) {
-    for (const auto& entry : std::filesystem::directory_iterator(source, ec)) {
-      if (ec) {
-        error = L"Unable to read unpacked folder: " + Widen(ec.message());
-        return false;
-      }
-      if (!MoveEntrySameDrive(entry.path(), target / entry.path().filename(), error)) {
-        return false;
-      }
-    }
-    std::filesystem::remove(source, ec);
-    if (ec) {
-      error = L"Unable to remove emptied unpack folder: " + Widen(ec.message());
-      return false;
-    }
-    return true;
   }
 
   DWORD flags = MOVEFILE_WRITE_THROUGH;
@@ -1136,24 +1193,113 @@ bool MoveEntrySameDrive(const std::filesystem::path& source, const std::filesyst
   return true;
 }
 
-bool CopyThenRemoveEntry(const std::filesystem::path& source, const std::filesystem::path& target, std::wstring& error) {
+bool CopyFileWithProgress(const std::filesystem::path& source,
+                          const std::filesystem::path& target,
+                          InstallProgress& progress,
+                          std::wstring& error) {
+  constexpr size_t kBufferSize = 4 * 1024 * 1024;
   std::error_code ec;
   std::filesystem::create_directories(target.parent_path(), ec);
   if (ec) {
     error = L"Unable to create install folder: " + Widen(ec.message());
     return false;
   }
-  std::filesystem::copy(source, target,
-                        std::filesystem::copy_options::recursive |
-                            std::filesystem::copy_options::overwrite_existing,
-                        ec);
-  if (ec) {
-    error = L"Unable to copy unpacked files: " + Widen(ec.message());
+
+  std::ifstream input(source, std::ios::binary);
+  if (!input) {
+    error = L"Unable to read unpacked file: " + PathToDisplay(source);
     return false;
   }
-  std::filesystem::remove_all(source, ec);
+  std::ofstream output(target, std::ios::binary | std::ios::trunc);
+  if (!output) {
+    error = L"Unable to write install file: " + PathToDisplay(target);
+    return false;
+  }
+
+  std::vector<char> buffer(kBufferSize);
+  while (input) {
+    input.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
+    const auto read = input.gcount();
+    if (read <= 0) {
+      break;
+    }
+    output.write(buffer.data(), read);
+    if (!output) {
+      error = L"Unable to write install file: " + PathToDisplay(target);
+      return false;
+    }
+    UpdateInstallProgress(progress, static_cast<uintmax_t>(read));
+  }
+  if (!input.eof()) {
+    error = L"Unable to copy unpacked file: " + PathToDisplay(source);
+    return false;
+  }
+  output.close();
+  if (!output) {
+    error = L"Unable to finish writing install file: " + PathToDisplay(target);
+    return false;
+  }
+  const auto sourceTime = std::filesystem::last_write_time(source, ec);
+  if (!ec) {
+    std::filesystem::last_write_time(target, sourceTime, ec);
+  }
+  return true;
+}
+
+bool InstallEntry(HWND hwnd,
+                  const std::filesystem::path& source,
+                  const std::filesystem::path& target,
+                  bool sameDrive,
+                  InstallProgress& progress,
+                  std::wstring& error) {
+  std::error_code ec;
+  if (sameDrive && !std::filesystem::exists(target, ec)) {
+    const uintmax_t movedBytes = EstimateInstallBytes(source);
+    if (!MoveWholeEntry(source, target, error)) {
+      return false;
+    }
+    UpdateInstallProgress(progress, movedBytes, true);
+    return true;
+  }
+
+  if (std::filesystem::is_directory(source, ec) && !ec) {
+    std::filesystem::create_directories(target, ec);
+    if (ec) {
+      error = L"Unable to create install folder: " + Widen(ec.message());
+      return false;
+    }
+    for (const auto& entry : std::filesystem::directory_iterator(source, ec)) {
+      if (ec) {
+        error = L"Unable to read unpacked folder: " + Widen(ec.message());
+        return false;
+      }
+      if (!InstallEntry(hwnd, entry.path(), target / entry.path().filename(), sameDrive, progress, error)) {
+        return false;
+      }
+    }
+    std::filesystem::remove(source, ec);
+    if (ec) {
+      error = L"Unable to remove installed source folder: " + Widen(ec.message());
+      return false;
+    }
+    return true;
+  }
+
+  if (sameDrive) {
+    const uintmax_t movedBytes = EstimateInstallBytes(source);
+    if (!MoveWholeEntry(source, target, error)) {
+      return false;
+    }
+    UpdateInstallProgress(progress, movedBytes, true);
+    return true;
+  }
+
+  if (!CopyFileWithProgress(source, target, progress, error)) {
+    return false;
+  }
+  std::filesystem::remove(source, ec);
   if (ec) {
-    error = L"Unable to remove copied unpacked files: " + Widen(ec.message());
+    error = L"Unable to remove copied unpacked file: " + Widen(ec.message());
     return false;
   }
   return true;
@@ -1185,6 +1331,20 @@ bool InstallExtractedFiles(HWND hwnd, const std::filesystem::path& unpackFolder,
   PostLog(hwnd, sameDrive ? L"Installing with same-drive cut/move; files will not be copied."
                           : L"Installing across drives; Windows must copy files, then remove unpacked originals.");
 
+  InstallProgress installProgress;
+  installProgress.hwnd = hwnd;
+  for (const auto& entry : std::filesystem::directory_iterator(unpackFolder, ec)) {
+    if (ec) {
+      PostLog(hwnd, L"Unable to read unpack folder: " + Widen(ec.message()));
+      return false;
+    }
+    if (entry.path().filename() != ".install_temp") {
+      installProgress.totalBytes += EstimateInstallBytes(entry.path());
+    }
+  }
+  PostLog(hwnd, L"Install payload size: " + FormatBytes(installProgress.totalBytes));
+  UpdateInstallProgress(installProgress, 0, true);
+
   std::wstring error;
   for (const auto& entry : std::filesystem::directory_iterator(unpackFolder, ec)) {
     if (ec) {
@@ -1200,9 +1360,7 @@ bool InstallExtractedFiles(HWND hwnd, const std::filesystem::path& unpackFolder,
       continue;
     }
     const auto target = installFolder / entry.path().filename();
-    const bool ok = sameDrive ? MoveEntrySameDrive(entry.path(), target, error)
-                              : CopyThenRemoveEntry(entry.path(), target, error);
-    if (!ok) {
+    if (!InstallEntry(hwnd, entry.path(), target, sameDrive, installProgress, error)) {
       PostLog(hwnd, error);
       return false;
     }
