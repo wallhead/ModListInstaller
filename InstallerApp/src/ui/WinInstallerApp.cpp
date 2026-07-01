@@ -86,23 +86,29 @@ std::atomic_bool g_closeAfterWorker{false};
 std::mutex g_downloaderMutex;
 std::shared_ptr<modlist::LibtorrentDownloader> g_activeDownloader;
 
-constexpr COLORREF kRailColor = RGB(12, 18, 24);
-constexpr COLORREF kRailDarkColor = RGB(5, 8, 11);
-constexpr COLORREF kContentColor = RGB(17, 24, 31);
-constexpr COLORREF kHeaderColor = RGB(23, 42, 55);
-constexpr COLORREF kPanelColor = RGB(20, 29, 38);
-constexpr COLORREF kEditColor = RGB(11, 17, 23);
-constexpr COLORREF kFooterColor = RGB(13, 18, 24);
-constexpr COLORREF kLineColor = RGB(43, 55, 68);
-constexpr COLORREF kPrimaryTextColor = RGB(220, 226, 232);
-constexpr COLORREF kMutedTextColor = RGB(139, 151, 163);
-constexpr COLORREF kAccentTextColor = RGB(136, 188, 225);
-constexpr COLORREF kButtonFaceColor = RGB(24, 34, 45);
-constexpr COLORREF kButtonHoverColor = RGB(33, 50, 66);
-constexpr COLORREF kButtonPressedColor = RGB(13, 23, 33);
-constexpr COLORREF kButtonBorderColor = RGB(70, 86, 103);
-constexpr COLORREF kButtonHoverBorderColor = RGB(132, 191, 232);
-constexpr COLORREF kButtonDisabledTextColor = RGB(94, 106, 118);
+constexpr COLORREF kRailColor = RGB(23, 28, 31);
+constexpr COLORREF kRailDarkColor = RGB(16, 20, 22);
+constexpr COLORREF kContentColor = RGB(16, 20, 22);
+constexpr COLORREF kHeaderColor = RGB(29, 36, 40);
+constexpr COLORREF kPanelColor = RGB(23, 28, 31);
+constexpr COLORREF kEditColor = RGB(18, 23, 25);
+constexpr COLORREF kFooterColor = RGB(29, 36, 40);
+constexpr COLORREF kLineColor = RGB(42, 50, 54);
+constexpr COLORREF kStrongLineColor = RGB(58, 68, 74);
+constexpr COLORREF kPrimaryTextColor = RGB(216, 216, 210);
+constexpr COLORREF kMutedTextColor = RGB(143, 150, 152);
+constexpr COLORREF kDimTextColor = RGB(102, 111, 115);
+constexpr COLORREF kAccentTextColor = RGB(143, 186, 208);
+constexpr COLORREF kAccentStrongColor = RGB(184, 215, 232);
+constexpr COLORREF kDangerColor = RGB(168, 111, 111);
+constexpr COLORREF kButtonTopColor = RGB(34, 41, 45);
+constexpr COLORREF kButtonBottomColor = RGB(23, 28, 31);
+constexpr COLORREF kButtonHoverTopColor = RGB(42, 51, 56);
+constexpr COLORREF kButtonHoverBottomColor = RGB(27, 33, 37);
+constexpr COLORREF kButtonPressedTopColor = RGB(18, 23, 25);
+constexpr COLORREF kButtonPressedBottomColor = RGB(16, 20, 22);
+constexpr COLORREF kButtonBorderColor = RGB(58, 68, 74);
+constexpr COLORREF kButtonDisabledTextColor = RGB(102, 111, 115);
 
 std::wstring Widen(const std::string& text) {
   if (text.empty()) {
@@ -159,6 +165,25 @@ void ApplyWindowFrameTheme(HWND hwnd) {
   SetDwmColorAttribute(hwnd, kDwmwaBorderColor, kLineColor);
   SetDwmColorAttribute(hwnd, kDwmwaCaptionColor, kHeaderColor);
   SetDwmColorAttribute(hwnd, kDwmwaTextColor, kPrimaryTextColor);
+}
+
+void FillVerticalGradient(HDC dc, RECT rect, COLORREF top, COLORREF bottom) {
+  const int height = rect.bottom - rect.top;
+  if (height <= 0) {
+    return;
+  }
+
+  for (int y = 0; y < height; ++y) {
+    const int red = GetRValue(top) + (GetRValue(bottom) - GetRValue(top)) * y / height;
+    const int green = GetGValue(top) + (GetGValue(bottom) - GetGValue(top)) * y / height;
+    const int blue = GetBValue(top) + (GetBValue(bottom) - GetBValue(top)) * y / height;
+    HPEN pen = CreatePen(PS_SOLID, 1, RGB(red, green, blue));
+    HPEN oldPen = static_cast<HPEN>(SelectObject(dc, pen));
+    MoveToEx(dc, rect.left, rect.top + y, nullptr);
+    LineTo(dc, rect.right, rect.top + y);
+    SelectObject(dc, oldPen);
+    DeleteObject(pen);
+  }
 }
 
 std::filesystem::path ModuleFolder() {
@@ -407,12 +432,12 @@ HWND CreateButton(HWND parent, int id, const wchar_t* text, int x, int y, int wi
   return button;
 }
 
-HFONT CreateUiFont(int pointSize, int weight = FW_NORMAL) {
+HFONT CreateUiFont(int pointSize, int weight = FW_NORMAL, const wchar_t* family = L"Segoe UI") {
   HDC screen = GetDC(nullptr);
   const int height = -MulDiv(pointSize, GetDeviceCaps(screen, LOGPIXELSY), 72);
   ReleaseDC(nullptr, screen);
   return CreateFontW(height, 0, 0, 0, weight, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
-                     CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+                     CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, family);
 }
 
 void SetControlFont(HWND hwnd, HFONT font) {
@@ -437,7 +462,7 @@ void PaintInstallerChrome(HWND hwnd, HDC dc) {
   FillRect(dc, &panel, g_panelBrush);
 
   RECT header{railWidth, 0, width, headerHeight};
-  FillRect(dc, &header, g_headerBrush);
+  FillVerticalGradient(dc, header, RGB(31, 38, 42), kHeaderColor);
 
   RECT rail{0, 0, railWidth, height - footerHeight};
   HBRUSH railBrush = CreateSolidBrush(kRailColor);
@@ -450,7 +475,7 @@ void PaintInstallerChrome(HWND hwnd, HDC dc) {
   DeleteObject(railDarkBrush);
 
   RECT footer{0, height - footerHeight, width, height};
-  FillRect(dc, &footer, g_footerBrush);
+  FillVerticalGradient(dc, footer, kFooterColor, kPanelColor);
 
   HPEN linePen = CreatePen(PS_SOLID, 1, kLineColor);
   HPEN oldPen = static_cast<HPEN>(SelectObject(dc, linePen));
@@ -464,7 +489,7 @@ void PaintInstallerChrome(HWND hwnd, HDC dc) {
   DeleteObject(linePen);
 
   SetBkMode(dc, TRANSPARENT);
-  SetTextColor(dc, RGB(180, 195, 207));
+  SetTextColor(dc, kMutedTextColor);
   HFONT oldFont = static_cast<HFONT>(SelectObject(dc, g_labelFont));
   RECT railText{18, 26, railWidth - 12, 88};
   DrawTextW(dc, L"MODLIST", -1, &railText, DT_LEFT | DT_TOP | DT_SINGLELINE);
@@ -479,26 +504,36 @@ void DrawNsisButton(const DRAWITEMSTRUCT& item) {
   const bool pressed = (item.itemState & ODS_SELECTED) != 0;
   const bool focused = (item.itemState & ODS_FOCUS) != 0;
   const bool hot = item.hwndItem == g_hotButton && !disabled;
+  const int controlId = GetDlgCtrlID(item.hwndItem);
+  const bool primary = controlId == kStartButton || controlId == kNextButton;
+  const bool danger = controlId == kStopButton;
 
   RECT rect = item.rcItem;
-  COLORREF fill = kButtonFaceColor;
+  COLORREF top = kButtonTopColor;
+  COLORREF bottom = kButtonBottomColor;
   COLORREF border = kButtonBorderColor;
   COLORREF textColor = kPrimaryTextColor;
   if (disabled) {
-    fill = RGB(18, 25, 33);
-    border = RGB(45, 55, 66);
+    top = RGB(22, 27, 30);
+    bottom = RGB(18, 22, 24);
+    border = kLineColor;
     textColor = kButtonDisabledTextColor;
   } else if (pressed) {
-    fill = kButtonPressedColor;
-    border = RGB(48, 94, 158);
+    top = kButtonPressedTopColor;
+    bottom = kButtonPressedBottomColor;
+    border = primary ? kAccentTextColor : kStrongLineColor;
   } else if (hot) {
-    fill = kButtonHoverColor;
-    border = kButtonHoverBorderColor;
+    top = kButtonHoverTopColor;
+    bottom = kButtonHoverBottomColor;
+    border = danger ? kDangerColor : kAccentTextColor;
+  } else if (primary) {
+    top = RGB(27, 40, 45);
+    bottom = RGB(23, 32, 37);
+    border = kAccentTextColor;
+    textColor = kAccentStrongColor;
   }
 
-  HBRUSH fillBrush = CreateSolidBrush(fill);
-  FillRect(item.hDC, &rect, fillBrush);
-  DeleteObject(fillBrush);
+  FillVerticalGradient(item.hDC, rect, top, bottom);
 
   HPEN borderPen = CreatePen(PS_SOLID, 1, border);
   HPEN oldPen = static_cast<HPEN>(SelectObject(item.hDC, borderPen));
@@ -508,8 +543,8 @@ void DrawNsisButton(const DRAWITEMSTRUCT& item) {
   SelectObject(item.hDC, oldPen);
   DeleteObject(borderPen);
 
-  HPEN lightPen = CreatePen(PS_SOLID, 1, pressed ? RGB(33, 49, 64) : RGB(58, 73, 90));
-  HPEN shadowPen = CreatePen(PS_SOLID, 1, pressed ? RGB(90, 108, 128) : RGB(8, 12, 17));
+  HPEN lightPen = CreatePen(PS_SOLID, 1, pressed ? kLineColor : RGB(52, 61, 66));
+  HPEN shadowPen = CreatePen(PS_SOLID, 1, pressed ? kStrongLineColor : RGB(9, 12, 13));
   oldPen = static_cast<HPEN>(SelectObject(item.hDC, lightPen));
   MoveToEx(item.hDC, rect.left + 1, rect.bottom - 2, nullptr);
   LineTo(item.hDC, rect.left + 1, rect.top + 1);
@@ -538,7 +573,13 @@ void DrawNsisButton(const DRAWITEMSTRUCT& item) {
   if (focused && !disabled) {
     RECT focusRect = rect;
     InflateRect(&focusRect, -4, -4);
-    DrawFocusRect(item.hDC, &focusRect);
+    HPEN focusPen = CreatePen(PS_DOT, 1, kAccentTextColor);
+    HPEN oldFocusPen = static_cast<HPEN>(SelectObject(item.hDC, focusPen));
+    HBRUSH oldFocusBrush = static_cast<HBRUSH>(SelectObject(item.hDC, GetStockObject(NULL_BRUSH)));
+    Rectangle(item.hDC, focusRect.left, focusRect.top, focusRect.right, focusRect.bottom);
+    SelectObject(item.hDC, oldFocusBrush);
+    SelectObject(item.hDC, oldFocusPen);
+    DeleteObject(focusPen);
   }
 }
 
@@ -1363,7 +1404,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
       g_footerBrush = CreateSolidBrush(kFooterColor);
       g_editBrush = CreateSolidBrush(kEditColor);
       g_stepFont = CreateUiFont(10, FW_SEMIBOLD);
-      g_titleFont = CreateUiFont(22, FW_SEMIBOLD);
+      g_titleFont = CreateUiFont(22, FW_NORMAL, L"Georgia");
       g_bodyFont = CreateUiFont(10);
       g_labelFont = CreateUiFont(9, FW_SEMIBOLD);
 
@@ -1419,8 +1460,8 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
       SetControlFont(g_previousButton, g_bodyFont);
       SetControlFont(g_nextButton, g_bodyFont);
       SendMessageW(g_progress, PBM_SETRANGE, 0, MAKELPARAM(0, 100));
-      SendMessageW(g_progress, PBM_SETBARCOLOR, 0, static_cast<LPARAM>(RGB(94, 154, 196)));
-      SendMessageW(g_progress, PBM_SETBKCOLOR, 0, static_cast<LPARAM>(RGB(9, 14, 20)));
+      SendMessageW(g_progress, PBM_SETBARCOLOR, 0, static_cast<LPARAM>(RGB(159, 196, 216)));
+      SendMessageW(g_progress, PBM_SETBKCOLOR, 0, static_cast<LPARAM>(kContentColor));
       SetText(g_downloadEdit, DownloadsFolder().wstring());
       PopulateDriveCombo();
       SetText(g_installEdit, L"");
