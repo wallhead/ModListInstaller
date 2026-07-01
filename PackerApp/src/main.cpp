@@ -5,6 +5,8 @@
 #include <shlobj.h>
 #include <bcrypt.h>
 
+#include "resource.h"
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -26,8 +28,6 @@ constexpr int kSourceEdit = 1001;
 constexpr int kSourceBrowse = 1002;
 constexpr int kReleaseEdit = 1003;
 constexpr int kReleaseBrowse = 1004;
-constexpr int kSevenZipEdit = 1005;
-constexpr int kSevenZipBrowse = 1006;
 constexpr int kArchiveNameEdit = 1007;
 constexpr int kFormatCombo = 1008;
 constexpr int kLevelCombo = 1009;
@@ -54,7 +54,6 @@ constexpr UINT kWorkerFinishedMessage = WM_APP + 4;
 HINSTANCE g_instance = nullptr;
 HWND g_sourceEdit = nullptr;
 HWND g_releaseEdit = nullptr;
-HWND g_sevenZipEdit = nullptr;
 HWND g_archiveNameEdit = nullptr;
 HWND g_formatCombo = nullptr;
 HWND g_levelCombo = nullptr;
@@ -90,6 +89,8 @@ struct PackerConfig {
   bool archiveFirst{true};
 };
 
+std::wstring Widen(const std::string& text);
+
 std::filesystem::path ModuleFolder() {
   std::wstring buffer(MAX_PATH, L'\0');
   DWORD size = 0;
@@ -105,6 +106,71 @@ std::filesystem::path ModuleFolder() {
     buffer.resize(buffer.size() * 2);
   }
   return std::filesystem::path(buffer).parent_path();
+}
+
+std::filesystem::path LocalToolCacheFolder() {
+  std::wstring localAppData(MAX_PATH, L'\0');
+  const DWORD localAppDataSize = GetEnvironmentVariableW(
+      L"LOCALAPPDATA", localAppData.data(), static_cast<DWORD>(localAppData.size()));
+  if (localAppDataSize > 0 && localAppDataSize < localAppData.size()) {
+    localAppData.resize(localAppDataSize);
+    return std::filesystem::path(localAppData) / "ModlistPacker" / "tools" / "7zip";
+  }
+
+  std::error_code ec;
+  auto temp = std::filesystem::temp_directory_path(ec);
+  if (!ec) {
+    return temp / "ModlistPacker" / "tools" / "7zip";
+  }
+
+  return ModuleFolder() / "tools" / "7zip";
+}
+
+std::optional<std::filesystem::path> ExtractEmbeddedSevenZip(std::wstring& error) {
+  HMODULE module = GetModuleHandleW(nullptr);
+  HRSRC resource = FindResourceW(module, MAKEINTRESOURCEW(IDR_7ZIP_EXE), MAKEINTRESOURCEW(10));
+  if (resource == nullptr) {
+    error = L"Embedded 7-Zip resource was not found.";
+    return std::nullopt;
+  }
+
+  HGLOBAL loaded = LoadResource(module, resource);
+  const DWORD size = SizeofResource(module, resource);
+  const void* data = LockResource(loaded);
+  if (loaded == nullptr || data == nullptr || size == 0) {
+    error = L"Embedded 7-Zip resource could not be loaded.";
+    return std::nullopt;
+  }
+
+  const auto outputFolder = LocalToolCacheFolder();
+  std::error_code ec;
+  std::filesystem::create_directories(outputFolder, ec);
+  if (ec) {
+    error = L"Unable to create embedded 7-Zip cache folder: " + Widen(ec.message());
+    return std::nullopt;
+  }
+
+  const auto outputPath = outputFolder / "7z.exe";
+  bool writeFile = true;
+  if (std::filesystem::exists(outputPath, ec) && !ec) {
+    const auto existingSize = std::filesystem::file_size(outputPath, ec);
+    writeFile = ec || existingSize != size;
+  }
+
+  if (writeFile) {
+    std::ofstream output(outputPath, std::ios::binary | std::ios::trunc);
+    if (!output) {
+      error = L"Unable to write embedded 7-Zip executable.";
+      return std::nullopt;
+    }
+    output.write(static_cast<const char*>(data), size);
+    if (!output) {
+      error = L"Unable to finish writing embedded 7-Zip executable.";
+      return std::nullopt;
+    }
+  }
+
+  return outputPath;
 }
 
 std::wstring GetText(HWND hwnd) {
@@ -253,21 +319,6 @@ std::optional<std::filesystem::path> PickFolder(HWND owner) {
     return std::nullopt;
   }
   return std::filesystem::path(path);
-}
-
-std::optional<std::filesystem::path> PickSevenZip(HWND owner) {
-  wchar_t file[MAX_PATH]{};
-  OPENFILENAMEW dialog{};
-  dialog.lStructSize = sizeof(dialog);
-  dialog.hwndOwner = owner;
-  dialog.lpstrFilter = L"7-Zip executable\0*.exe\0All files\0*.*\0";
-  dialog.lpstrFile = file;
-  dialog.nMaxFile = MAX_PATH;
-  dialog.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
-  if (!GetOpenFileNameW(&dialog)) {
-    return std::nullopt;
-  }
-  return std::filesystem::path(file);
 }
 
 uint64_t ParseSizeText(const std::wstring& text, uint64_t fallback) {
@@ -627,7 +678,6 @@ PackerConfig ReadConfig(bool archiveFirst) {
   PackerConfig config;
   config.sourceFolder = GetText(g_sourceEdit);
   config.releaseFolder = GetText(g_releaseEdit);
-  config.sevenZipExe = GetText(g_sevenZipEdit);
   config.archiveName = GetText(g_archiveNameEdit);
   config.format = ComboText(g_formatCombo);
   config.level = ComboText(g_levelCombo);
@@ -663,11 +713,23 @@ bool ValidateConfig(HWND hwnd, const PackerConfig& config) {
       PostLog(hwnd, L"Source folder is required.");
       return false;
     }
-    if (!std::filesystem::exists(config.sevenZipExe, ec)) {
-      PostLog(hwnd, L"7z.exe path is required for archive creation.");
-      return false;
-    }
   }
+  return true;
+}
+
+bool ResolveSevenZip(HWND hwnd, PackerConfig& config) {
+  if (!config.archiveFirst) {
+    return true;
+  }
+
+  std::wstring error;
+  auto embedded = ExtractEmbeddedSevenZip(error);
+  if (!embedded.has_value()) {
+    PostLog(hwnd, L"Embedded 7-Zip error: " + error);
+    return false;
+  }
+  config.sevenZipExe = *embedded;
+  PostLog(hwnd, L"Using embedded 7-Zip: " + config.sevenZipExe.wstring());
   return true;
 }
 
@@ -676,7 +738,7 @@ void Worker(HWND hwnd, PackerConfig config) {
   g_cancelRequested = false;
   PostProgress(hwnd, 0);
 
-  if (!ValidateConfig(hwnd, config)) {
+  if (!ResolveSevenZip(hwnd, config) || !ValidateConfig(hwnd, config)) {
     g_workerRunning = false;
     PostMessageW(hwnd, kWorkerFinishedMessage, 0, 0);
     return;
@@ -791,10 +853,6 @@ void SetDefaults(HWND hwnd) {
   SelectCombo(g_chunkCombo, 1);
 
   SetText(g_archiveNameEdit, L"MyPack");
-  const auto resource7z = ModuleFolder().parent_path().parent_path() / "InstallerApp" / "resources" / "7z.exe";
-  if (std::filesystem::exists(resource7z)) {
-    SetText(g_sevenZipEdit, resource7z.wstring());
-  }
   SendMessageW(g_copyInstallerCheck, BM_SETCHECK, BST_CHECKED, 0);
   EnableWindow(GetDlgItem(hwnd, kStopButton), FALSE);
 }
@@ -815,51 +873,47 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
       g_releaseEdit = CreateEdit(hwnd, kReleaseEdit, 140, 44, 520, 24);
       CreateButton(hwnd, kReleaseBrowse, L"...", 668, 44, 34, 24);
 
-      CreateLabel(hwnd, L"7z.exe", 14, 80, 120, 20);
-      g_sevenZipEdit = CreateEdit(hwnd, kSevenZipEdit, 140, 76, 520, 24);
-      CreateButton(hwnd, kSevenZipBrowse, L"...", 668, 76, 34, 24);
+      CreateLabel(hwnd, L"Archive name", 14, 86, 120, 20);
+      g_archiveNameEdit = CreateEdit(hwnd, kArchiveNameEdit, 140, 82, 170, 24);
+      CreateLabel(hwnd, L"Format", 326, 86, 70, 20);
+      g_formatCombo = CreateCombo(hwnd, kFormatCombo, 388, 82, 100, 160);
+      CreateLabel(hwnd, L"Level", 504, 86, 70, 20);
+      g_levelCombo = CreateCombo(hwnd, kLevelCombo, 562, 82, 90, 160);
 
-      CreateLabel(hwnd, L"Archive name", 14, 118, 120, 20);
-      g_archiveNameEdit = CreateEdit(hwnd, kArchiveNameEdit, 140, 114, 170, 24);
-      CreateLabel(hwnd, L"Format", 326, 118, 70, 20);
-      g_formatCombo = CreateCombo(hwnd, kFormatCombo, 388, 114, 100, 160);
-      CreateLabel(hwnd, L"Level", 504, 118, 70, 20);
-      g_levelCombo = CreateCombo(hwnd, kLevelCombo, 562, 114, 90, 160);
+      CreateLabel(hwnd, L"Method", 14, 120, 120, 20);
+      g_methodCombo = CreateCombo(hwnd, kMethodCombo, 140, 116, 120, 160);
+      CreateLabel(hwnd, L"Dictionary", 280, 120, 90, 20);
+      g_dictionaryCombo = CreateCombo(hwnd, kDictionaryCombo, 370, 116, 100, 160);
+      CreateLabel(hwnd, L"Word", 490, 120, 60, 20);
+      g_wordCombo = CreateCombo(hwnd, kWordCombo, 550, 116, 100, 160);
 
-      CreateLabel(hwnd, L"Method", 14, 152, 120, 20);
-      g_methodCombo = CreateCombo(hwnd, kMethodCombo, 140, 148, 120, 160);
-      CreateLabel(hwnd, L"Dictionary", 280, 152, 90, 20);
-      g_dictionaryCombo = CreateCombo(hwnd, kDictionaryCombo, 370, 148, 100, 160);
-      CreateLabel(hwnd, L"Word", 490, 152, 60, 20);
-      g_wordCombo = CreateCombo(hwnd, kWordCombo, 550, 148, 100, 160);
+      CreateLabel(hwnd, L"Solid block", 14, 154, 120, 20);
+      g_solidCombo = CreateCombo(hwnd, kSolidCombo, 140, 150, 120, 160);
+      CreateLabel(hwnd, L"Split volume", 280, 154, 90, 20);
+      g_volumeCombo = CreateCombo(hwnd, kVolumeCombo, 370, 150, 100, 160);
+      CreateLabel(hwnd, L"Threads", 490, 154, 60, 20);
+      g_threadsCombo = CreateCombo(hwnd, kThreadsCombo, 550, 150, 100, 160);
 
-      CreateLabel(hwnd, L"Solid block", 14, 186, 120, 20);
-      g_solidCombo = CreateCombo(hwnd, kSolidCombo, 140, 182, 120, 160);
-      CreateLabel(hwnd, L"Split volume", 280, 186, 90, 20);
-      g_volumeCombo = CreateCombo(hwnd, kVolumeCombo, 370, 182, 100, 160);
-      CreateLabel(hwnd, L"Threads", 490, 186, 60, 20);
-      g_threadsCombo = CreateCombo(hwnd, kThreadsCombo, 550, 182, 100, 160);
-
-      CreateLabel(hwnd, L"Manifest chunk", 14, 220, 120, 20);
-      g_chunkCombo = CreateCombo(hwnd, kChunkCombo, 140, 216, 120, 160);
+      CreateLabel(hwnd, L"Manifest chunk", 14, 188, 120, 20);
+      g_chunkCombo = CreateCombo(hwnd, kChunkCombo, 140, 184, 120, 160);
       g_copyInstallerCheck = CreateWindowExW(0, L"BUTTON", L"Copy modlist-installer.exe into release folder",
                                              WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
-                                             280, 216, 360, 24, hwnd,
+                                             280, 184, 360, 24, hwnd,
                                              reinterpret_cast<HMENU>(static_cast<INT_PTR>(kCopyInstallerCheck)), g_instance, nullptr);
 
-      CreateButton(hwnd, kBuildButton, L"Build Package", 14, 260, 130, 30);
-      CreateButton(hwnd, kManifestButton, L"Manifest Only", 154, 260, 130, 30);
-      CreateButton(hwnd, kStopButton, L"Stop", 294, 260, 90, 30);
+      CreateButton(hwnd, kBuildButton, L"Build Package", 14, 228, 130, 30);
+      CreateButton(hwnd, kManifestButton, L"Manifest Only", 154, 228, 130, 30);
+      CreateButton(hwnd, kStopButton, L"Stop", 294, 228, 90, 30);
 
       g_progress = CreateWindowExW(0, PROGRESS_CLASSW, L"", WS_CHILD | WS_VISIBLE,
-                                   400, 264, 300, 20, hwnd,
+                                   400, 232, 300, 20, hwnd,
                                    reinterpret_cast<HMENU>(static_cast<INT_PTR>(kProgress)), g_instance, nullptr);
       g_statusLabel = CreateWindowExW(0, L"STATIC", L"Ready", WS_CHILD | WS_VISIBLE,
-                                      14, 304, 690, 22, hwnd,
+                                      14, 272, 690, 22, hwnd,
                                       reinterpret_cast<HMENU>(static_cast<INT_PTR>(kStatusLabel)), g_instance, nullptr);
       g_logEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
                                   WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL,
-                                  14, 330, 690, 190, hwnd,
+                                  14, 298, 690, 222, hwnd,
                                   reinterpret_cast<HMENU>(static_cast<INT_PTR>(kLogEdit)), g_instance, nullptr);
       SendMessageW(g_progress, PBM_SETRANGE, 0, MAKELPARAM(0, 100));
       SetDefaults(hwnd);
@@ -875,10 +929,6 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
       } else if (id == kReleaseBrowse) {
         if (auto path = PickFolder(hwnd)) {
           SetText(g_releaseEdit, path->wstring());
-        }
-      } else if (id == kSevenZipBrowse) {
-        if (auto path = PickSevenZip(hwnd)) {
-          SetText(g_sevenZipEdit, path->wstring());
         }
       } else if (id == kBuildButton) {
         StartWork(hwnd, true);

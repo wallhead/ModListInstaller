@@ -2,7 +2,7 @@
 
 Native Windows helper for building modlist release folders.
 
-It provides a 7-Zip-style archive settings window, runs `7z.exe`, then writes a chunked SHA-256 manifest into `package\manifest.json`.
+It provides a 7-Zip-style archive settings window, runs embedded 7-Zip, then writes a chunked SHA-256 manifest into `package\manifest.json`.
 
 ## Release Layout
 
@@ -26,6 +26,8 @@ The manifest stores:
 - chunk size
 
 The default chunk size is 64 MiB.
+
+7-Zip is embedded inside `modlist-packer.exe` and extracted to a per-user cache when archive creation starts.
 
 ## Build
 
