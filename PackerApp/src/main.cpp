@@ -45,6 +45,9 @@ constexpr int kStopButton = 1020;
 constexpr int kLogEdit = 1021;
 constexpr int kProgress = 1022;
 constexpr int kStatusLabel = 1023;
+constexpr int kParametersEdit = 1024;
+constexpr int kPathModeCombo = 1025;
+constexpr int kTestArchiveCheck = 1026;
 
 constexpr UINT kLogMessage = WM_APP + 1;
 constexpr UINT kStatusMessage = WM_APP + 2;
@@ -68,6 +71,9 @@ HWND g_copyInstallerCheck = nullptr;
 HWND g_logEdit = nullptr;
 HWND g_progress = nullptr;
 HWND g_statusLabel = nullptr;
+HWND g_parametersEdit = nullptr;
+HWND g_pathModeCombo = nullptr;
+HWND g_testArchiveCheck = nullptr;
 std::atomic_bool g_workerRunning{false};
 std::atomic_bool g_cancelRequested{false};
 
@@ -84,8 +90,11 @@ struct PackerConfig {
   std::wstring solid;
   std::wstring volumeSize;
   std::wstring threads;
+  std::wstring parameters;
+  std::wstring pathMode;
   uint64_t chunkSize{64ull * 1024ull * 1024ull};
   bool copyInstaller{true};
+  bool testArchive{true};
   bool archiveFirst{true};
 };
 
@@ -363,6 +372,9 @@ std::wstring BuildSevenZipCommand(const PackerConfig& config) {
                          L" -mx=" + config.level +
                          L" -mmt=" + config.threads +
                          L" -y -bsp1";
+  if (config.pathMode == L"Full paths") {
+    command += L" -spf";
+  }
   if (config.format == L"7z") {
     if (!config.method.empty()) {
       command += L" -m0=" + config.method;
@@ -373,12 +385,29 @@ std::wstring BuildSevenZipCommand(const PackerConfig& config) {
     if (!config.wordSize.empty()) {
       command += L" -mfb=" + config.wordSize;
     }
-    command += (config.solid == L"Solid") ? L" -ms=on" : L" -ms=off";
+    if (config.solid == L"Solid") {
+      command += L" -ms=on";
+    } else if (config.solid == L"Non-solid") {
+      command += L" -ms=off";
+    } else if (!config.solid.empty()) {
+      command += L" -ms=" + config.solid;
+    }
   }
   if (!config.volumeSize.empty() && config.volumeSize != L"none") {
     command += L" -v" + config.volumeSize;
   }
+  if (!config.parameters.empty()) {
+    command += L" " + config.parameters;
+  }
   return command;
+}
+
+std::wstring BuildSevenZipTestCommand(const PackerConfig& config) {
+  auto archive = ArchivePath(config);
+  if (!config.volumeSize.empty() && config.volumeSize != L"none") {
+    archive += L".001";
+  }
+  return Quote(config.sevenZipExe) + L" t " + Quote(archive) + L" -y -bsp1";
 }
 
 std::wstring Hex(const std::vector<unsigned char>& bytes) {
@@ -388,17 +417,6 @@ std::wstring Hex(const std::vector<unsigned char>& bytes) {
     out << std::setw(2) << static_cast<int>(byte);
   }
   return out.str();
-}
-
-bool Sha256Bytes(const void* data, size_t size, std::vector<unsigned char>& digest) {
-  digest.assign(32, 0);
-  return BCryptHash(BCRYPT_SHA256_ALG_HANDLE,
-                    nullptr,
-                    0,
-                    const_cast<PUCHAR>(static_cast<const unsigned char*>(data)),
-                    static_cast<ULONG>(size),
-                    digest.data(),
-                    static_cast<ULONG>(digest.size())) == 0;
 }
 
 struct FileManifest {
@@ -437,9 +455,27 @@ bool HashArchiveFile(HWND hwnd,
     return false;
   }
 
+  BCRYPT_HASH_HANDLE chunkHash = nullptr;
+  if (BCryptCreateHash(BCRYPT_SHA256_ALG_HANDLE, &chunkHash, nullptr, 0, nullptr, 0, 0) != 0) {
+    BCryptDestroyHash(fullHash);
+    PostLog(hwnd, L"Unable to initialize chunk SHA-256.");
+    return false;
+  }
+
+  auto finishChunk = [&]() -> bool {
+    std::vector<unsigned char> digest(32);
+    const bool ok = BCryptFinishHash(chunkHash, digest.data(), static_cast<ULONG>(digest.size()), 0) == 0;
+    BCryptDestroyHash(chunkHash);
+    chunkHash = nullptr;
+    if (!ok) {
+      return false;
+    }
+    manifest.chunks.push_back(Hex(digest));
+    return BCryptCreateHash(BCRYPT_SHA256_ALG_HANDLE, &chunkHash, nullptr, 0, nullptr, 0, 0) == 0;
+  };
+
   std::vector<char> buffer(static_cast<size_t>(std::min<uint64_t>(chunkSize, 8ull * 1024ull * 1024ull)));
-  std::vector<char> chunk;
-  chunk.reserve(static_cast<size_t>(std::min<uint64_t>(chunkSize, 64ull * 1024ull * 1024ull)));
+  uint64_t chunkDone = 0;
   while (input && !g_cancelRequested) {
     input.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
     const std::streamsize read = input.gcount();
@@ -447,29 +483,42 @@ bool HashArchiveFile(HWND hwnd,
       break;
     }
     BCryptHashData(fullHash, reinterpret_cast<PUCHAR>(buffer.data()), static_cast<ULONG>(read), 0);
-    chunk.insert(chunk.end(), buffer.data(), buffer.data() + read);
-    doneBytes += static_cast<uint64_t>(read);
-    if (chunk.size() >= chunkSize) {
-      std::vector<unsigned char> digest;
-      if (!Sha256Bytes(chunk.data(), chunk.size(), digest)) {
-        BCryptDestroyHash(fullHash);
-        return false;
+    size_t offset = 0;
+    while (offset < static_cast<size_t>(read)) {
+      const uint64_t remainingInChunk = chunkSize - chunkDone;
+      const size_t toHash = static_cast<size_t>(std::min<uint64_t>(
+          remainingInChunk, static_cast<uint64_t>(read) - offset));
+      BCryptHashData(chunkHash, reinterpret_cast<PUCHAR>(buffer.data() + offset), static_cast<ULONG>(toHash), 0);
+      offset += toHash;
+      chunkDone += toHash;
+      if (chunkDone == chunkSize) {
+        if (!finishChunk()) {
+          BCryptDestroyHash(fullHash);
+          return false;
+        }
+        chunkDone = 0;
       }
-      manifest.chunks.push_back(Hex(digest));
-      chunk.clear();
     }
+    doneBytes += static_cast<uint64_t>(read);
     const int percent = totalBytes > 0 ? static_cast<int>((doneBytes * 100) / totalBytes) : 0;
     PostProgress(hwnd, percent);
     PostStatus(hwnd, L"Hashing " + std::to_wstring(percent) + L"% | " + FormatBytes(doneBytes) + L" / " + FormatBytes(totalBytes));
   }
 
-  if (!chunk.empty()) {
-    std::vector<unsigned char> digest;
-    if (!Sha256Bytes(chunk.data(), chunk.size(), digest)) {
+  if (chunkDone > 0) {
+    std::vector<unsigned char> digest(32);
+    const bool ok = BCryptFinishHash(chunkHash, digest.data(), static_cast<ULONG>(digest.size()), 0) == 0;
+    BCryptDestroyHash(chunkHash);
+    chunkHash = nullptr;
+    if (!ok) {
       BCryptDestroyHash(fullHash);
       return false;
     }
     manifest.chunks.push_back(Hex(digest));
+  }
+  if (chunkHash != nullptr) {
+    BCryptDestroyHash(chunkHash);
+    chunkHash = nullptr;
   }
 
   std::vector<unsigned char> fullDigest(32);
@@ -687,8 +736,11 @@ PackerConfig ReadConfig(bool archiveFirst) {
   config.solid = ComboText(g_solidCombo);
   config.volumeSize = ComboText(g_volumeCombo);
   config.threads = ComboText(g_threadsCombo);
+  config.parameters = GetText(g_parametersEdit);
+  config.pathMode = ComboText(g_pathModeCombo);
   config.chunkSize = ParseSizeText(ComboText(g_chunkCombo), 64ull * 1024ull * 1024ull);
   config.copyInstaller = SendMessageW(g_copyInstallerCheck, BM_GETCHECK, 0, 0) == BST_CHECKED;
+  config.testArchive = SendMessageW(g_testArchiveCheck, BM_GETCHECK, 0, 0) == BST_CHECKED;
   config.archiveFirst = archiveFirst;
   return config;
 }
@@ -756,6 +808,17 @@ void Worker(HWND hwnd, PackerConfig config) {
     } else {
       PostLog(hwnd, L"Archive creation completed.");
     }
+    if (ok && config.testArchive && !g_cancelRequested) {
+      PostLog(hwnd, L"Testing archive...");
+      PostStatus(hwnd, L"Testing archive");
+      const int testExitCode = RunProcess(hwnd, BuildSevenZipTestCommand(config));
+      if (testExitCode != 0) {
+        PostLog(hwnd, L"7-Zip test failed with exit code " + std::to_wstring(testExitCode));
+        ok = false;
+      } else {
+        PostLog(hwnd, L"Archive test completed.");
+      }
+    }
   }
 
   if (ok && !g_cancelRequested) {
@@ -791,6 +854,11 @@ HWND CreateButton(HWND parent, int id, const wchar_t* text, int x, int y, int w,
 HWND CreateCombo(HWND parent, int id, int x, int y, int w, int h) {
   return CreateWindowExW(0, WC_COMBOBOXW, L"", WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL,
                          x, y, w, h, parent, reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), g_instance, nullptr);
+}
+
+HWND CreateGroupBox(HWND parent, const wchar_t* text, int x, int y, int w, int h) {
+  return CreateWindowExW(0, L"BUTTON", text, WS_CHILD | WS_VISIBLE | BS_GROUPBOX,
+                         x, y, w, h, parent, nullptr, g_instance, nullptr);
 }
 
 void EnableRunningControls(HWND hwnd, bool running) {
@@ -833,8 +901,9 @@ void SetDefaults(HWND hwnd) {
   }
   SelectCombo(g_wordCombo, 3);
 
-  AddComboItem(g_solidCombo, L"Solid");
-  AddComboItem(g_solidCombo, L"Non-solid");
+  for (const wchar_t* item : {L"Solid", L"Non-solid", L"1g", L"4g", L"8g"}) {
+    AddComboItem(g_solidCombo, item);
+  }
   SelectCombo(g_solidCombo, 0);
 
   for (const wchar_t* item : {L"none", L"2g", L"4g", L"8g", L"16g"}) {
@@ -852,8 +921,13 @@ void SetDefaults(HWND hwnd) {
   }
   SelectCombo(g_chunkCombo, 1);
 
+  AddComboItem(g_pathModeCombo, L"Relative paths");
+  AddComboItem(g_pathModeCombo, L"Full paths");
+  SelectCombo(g_pathModeCombo, 0);
+
   SetText(g_archiveNameEdit, L"MyPack");
   SendMessageW(g_copyInstallerCheck, BM_SETCHECK, BST_CHECKED, 0);
+  SendMessageW(g_testArchiveCheck, BM_SETCHECK, BST_CHECKED, 0);
   EnableWindow(GetDlgItem(hwnd, kStopButton), FALSE);
 }
 
@@ -865,55 +939,69 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
       controls.dwICC = ICC_PROGRESS_CLASS;
       InitCommonControlsEx(&controls);
 
-      CreateLabel(hwnd, L"Source folder", 14, 16, 120, 20);
-      g_sourceEdit = CreateEdit(hwnd, kSourceEdit, 140, 12, 520, 24);
-      CreateButton(hwnd, kSourceBrowse, L"...", 668, 12, 34, 24);
+      CreateGroupBox(hwnd, L"Folders", 10, 8, 704, 78);
+      CreateLabel(hwnd, L"Source folder", 24, 30, 110, 20);
+      g_sourceEdit = CreateEdit(hwnd, kSourceEdit, 140, 26, 520, 24);
+      CreateButton(hwnd, kSourceBrowse, L"...", 668, 26, 34, 24);
 
-      CreateLabel(hwnd, L"Release folder", 14, 48, 120, 20);
-      g_releaseEdit = CreateEdit(hwnd, kReleaseEdit, 140, 44, 520, 24);
-      CreateButton(hwnd, kReleaseBrowse, L"...", 668, 44, 34, 24);
+      CreateLabel(hwnd, L"Release folder", 24, 60, 110, 20);
+      g_releaseEdit = CreateEdit(hwnd, kReleaseEdit, 140, 56, 520, 24);
+      CreateButton(hwnd, kReleaseBrowse, L"...", 668, 56, 34, 24);
 
-      CreateLabel(hwnd, L"Archive name", 14, 86, 120, 20);
-      g_archiveNameEdit = CreateEdit(hwnd, kArchiveNameEdit, 140, 82, 170, 24);
-      CreateLabel(hwnd, L"Format", 326, 86, 70, 20);
-      g_formatCombo = CreateCombo(hwnd, kFormatCombo, 388, 82, 100, 160);
-      CreateLabel(hwnd, L"Level", 504, 86, 70, 20);
-      g_levelCombo = CreateCombo(hwnd, kLevelCombo, 562, 82, 90, 160);
+      CreateGroupBox(hwnd, L"Archive", 10, 92, 704, 78);
+      CreateLabel(hwnd, L"Archive", 24, 116, 110, 20);
+      g_archiveNameEdit = CreateEdit(hwnd, kArchiveNameEdit, 140, 112, 190, 24);
+      CreateLabel(hwnd, L"Archive format", 350, 116, 110, 20);
+      g_formatCombo = CreateCombo(hwnd, kFormatCombo, 462, 112, 92, 160);
+      CreateLabel(hwnd, L"Path mode", 24, 146, 110, 20);
+      g_pathModeCombo = CreateCombo(hwnd, kPathModeCombo, 140, 142, 190, 160);
 
-      CreateLabel(hwnd, L"Method", 14, 120, 120, 20);
-      g_methodCombo = CreateCombo(hwnd, kMethodCombo, 140, 116, 120, 160);
-      CreateLabel(hwnd, L"Dictionary", 280, 120, 90, 20);
-      g_dictionaryCombo = CreateCombo(hwnd, kDictionaryCombo, 370, 116, 100, 160);
-      CreateLabel(hwnd, L"Word", 490, 120, 60, 20);
-      g_wordCombo = CreateCombo(hwnd, kWordCombo, 550, 116, 100, 160);
+      CreateGroupBox(hwnd, L"Compression", 10, 176, 704, 172);
+      CreateLabel(hwnd, L"Compression level", 24, 200, 130, 20);
+      g_levelCombo = CreateCombo(hwnd, kLevelCombo, 164, 196, 110, 160);
+      CreateLabel(hwnd, L"Compression method", 300, 200, 150, 20);
+      g_methodCombo = CreateCombo(hwnd, kMethodCombo, 460, 196, 110, 160);
 
-      CreateLabel(hwnd, L"Solid block", 14, 154, 120, 20);
-      g_solidCombo = CreateCombo(hwnd, kSolidCombo, 140, 150, 120, 160);
-      CreateLabel(hwnd, L"Split volume", 280, 154, 90, 20);
-      g_volumeCombo = CreateCombo(hwnd, kVolumeCombo, 370, 150, 100, 160);
-      CreateLabel(hwnd, L"Threads", 490, 154, 60, 20);
-      g_threadsCombo = CreateCombo(hwnd, kThreadsCombo, 550, 150, 100, 160);
+      CreateLabel(hwnd, L"Dictionary size", 24, 232, 130, 20);
+      g_dictionaryCombo = CreateCombo(hwnd, kDictionaryCombo, 164, 228, 110, 160);
+      CreateLabel(hwnd, L"Word size", 300, 232, 150, 20);
+      g_wordCombo = CreateCombo(hwnd, kWordCombo, 460, 228, 110, 160);
 
-      CreateLabel(hwnd, L"Manifest chunk", 14, 188, 120, 20);
-      g_chunkCombo = CreateCombo(hwnd, kChunkCombo, 140, 184, 120, 160);
+      CreateLabel(hwnd, L"Solid block size", 24, 264, 130, 20);
+      g_solidCombo = CreateCombo(hwnd, kSolidCombo, 164, 260, 110, 160);
+      CreateLabel(hwnd, L"Split to volumes, bytes", 300, 264, 150, 20);
+      g_volumeCombo = CreateCombo(hwnd, kVolumeCombo, 460, 260, 110, 160);
+
+      CreateLabel(hwnd, L"Number of CPU threads", 24, 296, 140, 20);
+      g_threadsCombo = CreateCombo(hwnd, kThreadsCombo, 164, 292, 110, 160);
+      CreateLabel(hwnd, L"Parameters", 300, 296, 150, 20);
+      g_parametersEdit = CreateEdit(hwnd, kParametersEdit, 460, 292, 210, 24);
+
+      CreateGroupBox(hwnd, L"Manifest / Release", 10, 354, 704, 74);
+      CreateLabel(hwnd, L"Manifest chunk size", 24, 380, 130, 20);
+      g_chunkCombo = CreateCombo(hwnd, kChunkCombo, 164, 376, 110, 160);
       g_copyInstallerCheck = CreateWindowExW(0, L"BUTTON", L"Copy modlist-installer.exe into release folder",
                                              WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
-                                             280, 184, 360, 24, hwnd,
+                                             300, 376, 360, 24, hwnd,
                                              reinterpret_cast<HMENU>(static_cast<INT_PTR>(kCopyInstallerCheck)), g_instance, nullptr);
+      g_testArchiveCheck = CreateWindowExW(0, L"BUTTON", L"Test archive after compression",
+                                           WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
+                                           300, 400, 260, 24, hwnd,
+                                           reinterpret_cast<HMENU>(static_cast<INT_PTR>(kTestArchiveCheck)), g_instance, nullptr);
 
-      CreateButton(hwnd, kBuildButton, L"Build Package", 14, 228, 130, 30);
-      CreateButton(hwnd, kManifestButton, L"Manifest Only", 154, 228, 130, 30);
-      CreateButton(hwnd, kStopButton, L"Stop", 294, 228, 90, 30);
+      CreateButton(hwnd, kBuildButton, L"Build Package", 14, 438, 130, 30);
+      CreateButton(hwnd, kManifestButton, L"Manifest Only", 154, 438, 130, 30);
+      CreateButton(hwnd, kStopButton, L"Stop", 294, 438, 90, 30);
 
       g_progress = CreateWindowExW(0, PROGRESS_CLASSW, L"", WS_CHILD | WS_VISIBLE,
-                                   400, 232, 300, 20, hwnd,
+                                   400, 442, 300, 20, hwnd,
                                    reinterpret_cast<HMENU>(static_cast<INT_PTR>(kProgress)), g_instance, nullptr);
       g_statusLabel = CreateWindowExW(0, L"STATIC", L"Ready", WS_CHILD | WS_VISIBLE,
-                                      14, 272, 690, 22, hwnd,
+                                      14, 478, 690, 22, hwnd,
                                       reinterpret_cast<HMENU>(static_cast<INT_PTR>(kStatusLabel)), g_instance, nullptr);
       g_logEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
                                   WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL,
-                                  14, 298, 690, 222, hwnd,
+                                  14, 504, 690, 156, hwnd,
                                   reinterpret_cast<HMENU>(static_cast<INT_PTR>(kLogEdit)), g_instance, nullptr);
       SendMessageW(g_progress, PBM_SETRANGE, 0, MAKELPARAM(0, 100));
       SetDefaults(hwnd);
@@ -987,7 +1075,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
 
   HWND hwnd = CreateWindowExW(0, className, L"Modlist Packer",
                               WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
-                              CW_USEDEFAULT, CW_USEDEFAULT, 735, 570,
+                              CW_USEDEFAULT, CW_USEDEFAULT, 735, 710,
                               nullptr, nullptr, instance, nullptr);
   if (hwnd == nullptr) {
     OleUninitialize();
