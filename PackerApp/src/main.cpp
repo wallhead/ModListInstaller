@@ -527,7 +527,7 @@ bool HashArchiveFile(HWND hwnd,
     return BCryptCreateHash(BCRYPT_SHA256_ALG_HANDLE, &chunkHash, nullptr, 0, nullptr, 0, 0) == 0;
   };
 
-  std::vector<char> buffer(static_cast<size_t>(std::min<uint64_t>(chunkSize, 8ull * 1024ull * 1024ull)));
+  std::vector<char> buffer(static_cast<size_t>(std::min<uint64_t>(chunkSize, 16ull * 1024ull * 1024ull)));
   uint64_t chunkDone = 0;
   while (input && !g_cancelRequested) {
     input.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
@@ -715,10 +715,8 @@ bool WriteManifest(HWND hwnd, const PackerConfig& config) {
   }
 
   PostLog(hwnd, L"Generating manifest for " + std::to_wstring(files.size()) + L" archive file(s).");
-  const unsigned int hardwareThreads = std::max(1u, std::thread::hardware_concurrency());
-  const size_t workerCount = std::max<size_t>(
-      1, std::min<size_t>(files.size(), std::min<size_t>(4, hardwareThreads)));
-  PostLog(hwnd, L"Manifest hashing workers: " + std::to_wstring(workerCount));
+  constexpr size_t workerCount = 1;
+  PostLog(hwnd, L"Manifest hashing workers: 1 (sequential HDD-friendly read)");
 
   std::vector<FileManifest> manifests(files.size());
   std::deque<size_t> jobs;

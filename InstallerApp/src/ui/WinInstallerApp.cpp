@@ -770,13 +770,11 @@ bool VerifyPackageManifest(HWND hwnd, const modlist::Manifest& manifest) {
                    L" | Elapsed " + FormatEta(static_cast<int>(elapsed)));
   };
 
-  const unsigned int hardwareThreads = std::max(1u, std::thread::hardware_concurrency());
-  const size_t workerCount = std::max<size_t>(
-      1, std::min<size_t>(manifest.files.size(), std::min<size_t>(4, hardwareThreads)));
-  PostLog(hwnd, L"Manifest validation workers: " + std::to_wstring(workerCount));
+  constexpr size_t workerCount = 1;
+  PostLog(hwnd, L"Manifest validation workers: 1 (sequential HDD-friendly read)");
 
   auto worker = [&]() {
-    std::vector<uint8_t> buffer(4 * 1024 * 1024);
+    std::vector<uint8_t> buffer(16 * 1024 * 1024);
     while (!g_stopRequested.load() && !failed.load()) {
       modlist::ManifestFile expected;
       {
