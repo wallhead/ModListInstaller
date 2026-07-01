@@ -47,20 +47,14 @@ std::filesystem::path MakeOutputCapturePath(const std::filesystem::path& sevenZi
   return logFolder / ("7z-extract-" + std::to_string(stamp) + ".log");
 }
 
-std::string ReadTextFile(const std::filesystem::path& path) {
-  std::ifstream input(path, std::ios::binary);
-  if (!input) {
-    return {};
+void AppendBoundedTail(std::string& tail, const char* data, size_t size, size_t maxSize) {
+  if (size >= maxSize) {
+    tail.assign(data + size - maxSize, maxSize);
+    return;
   }
-  std::ostringstream buffer;
-  buffer << input.rdbuf();
-  return buffer.str();
-}
-
-void WriteTextFile(const std::filesystem::path& path, const std::string& text) {
-  std::ofstream output(path, std::ios::binary);
-  if (output) {
-    output << text;
+  tail.append(data, size);
+  if (tail.size() > maxSize) {
+    tail.erase(0, tail.size() - maxSize);
   }
 }
 
@@ -105,8 +99,16 @@ std::optional<int> LastPercentIn(const std::string& text) {
 }
 
 int RunProcessAndCapture(const std::string& command,
-                         std::string& output,
+                         const std::filesystem::path& outputPath,
+                         std::string& outputTail,
                          const SevenZipExtractor::ProgressCallback& progressCallback) {
+  constexpr size_t kOutputTailLimit = 64 * 1024;
+
+  std::ofstream log(outputPath, std::ios::binary);
+  if (log) {
+    log << "Command:\n" << command << "\n\n7-Zip output:\n";
+  }
+
   SECURITY_ATTRIBUTES security{};
   security.nLength = sizeof(security);
   security.bInheritHandle = TRUE;
@@ -140,6 +142,9 @@ int RunProcessAndCapture(const std::string& command,
   CloseHandle(writePipe);
   if (!created) {
     CloseHandle(readPipe);
+    if (log) {
+      log << "\n\nCreateProcess failed: " << GetLastError() << "\n";
+    }
     return static_cast<int>(GetLastError());
   }
 
@@ -148,7 +153,10 @@ int RunProcessAndCapture(const std::string& command,
   DWORD bytesRead = 0;
   int lastPercent = -1;
   while (ReadFile(readPipe, buffer, sizeof(buffer), &bytesRead, nullptr) && bytesRead > 0) {
-    output.append(buffer, bytesRead);
+    if (log) {
+      log.write(buffer, bytesRead);
+    }
+    AppendBoundedTail(outputTail, buffer, bytesRead, kOutputTailLimit);
     parseTail.append(buffer, bytesRead);
     if (parseTail.size() > 256) {
       parseTail.erase(0, parseTail.size() - 256);
@@ -168,6 +176,9 @@ int RunProcessAndCapture(const std::string& command,
   CloseHandle(process.hThread);
   CloseHandle(process.hProcess);
   CloseHandle(readPipe);
+  if (log) {
+    log << "\n\nExit code:\n" << exitCode << "\n";
+  }
   return static_cast<int>(exitCode);
 }
 
@@ -224,11 +235,9 @@ ExtractionResult SevenZipExtractor::Extract(const ExtractionConfig& config, Prog
   const auto outputPath = MakeOutputCapturePath(config.sevenZipExe);
   result.outputLogPath = outputPath;
   result.command = BuildCommand(config);
-  result.exitCode = RunProcessAndCapture(result.command, result.output, progressCallback);
-  const std::string logText = "Command:\n" + result.command + "\n\nExit code:\n" +
-                              std::to_string(result.exitCode) + "\n\n7-Zip output:\n" + result.output;
-  WriteTextFile(outputPath, logText);
-  result.output = logText;
+  std::string outputTail;
+  result.exitCode = RunProcessAndCapture(result.command, outputPath, outputTail, progressCallback);
+  result.output = "Full 7-Zip output is streamed to:\n" + outputPath.string() + "\n\nLast captured output:\n" + outputTail;
   result.ok = result.exitCode == 0 || result.exitCode == 1;
   result.message = SevenZipExitMessage(result.exitCode);
   return result;

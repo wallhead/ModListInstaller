@@ -22,6 +22,15 @@ lt::session MakeSession() {
   lt::settings_pack settings;
   settings.set_bool(lt::settings_pack::enable_dht, true);
   settings.set_bool(lt::settings_pack::enable_lsd, true);
+  settings.set_int(lt::settings_pack::active_downloads, 1);
+  settings.set_int(lt::settings_pack::active_limit, 1);
+  settings.set_int(lt::settings_pack::connections_limit, 80);
+  settings.set_int(lt::settings_pack::aio_threads, 2);
+  settings.set_int(lt::settings_pack::hashing_threads, 1);
+  settings.set_int(lt::settings_pack::checking_mem_usage, 512);
+  settings.set_int(lt::settings_pack::max_queued_disk_bytes, 16 * 1024 * 1024);
+  settings.set_int(lt::settings_pack::disk_io_read_mode, lt::settings_pack::disable_os_cache);
+  settings.set_int(lt::settings_pack::disk_io_write_mode, lt::settings_pack::write_through);
   return lt::session(settings);
 }
 

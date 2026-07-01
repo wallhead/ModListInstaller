@@ -38,6 +38,7 @@ The `Start` button runs the install pipeline on a background thread:
 - read total payload size directly from the `.torrent` file before downloading
 - check remaining torrent size against download free space once torrent metadata is available
 - start the torrent downloader
+- write torrent payloads to disk through bounded libtorrent queues instead of keeping full payloads in RAM
 - show progress, download speed, upload speed, seeds, peers, and ETA
 - pause/resume or stop the active download
 - force-check existing files when starting, so closing the exe mid-download and choosing the same download folder resumes after validation
@@ -47,6 +48,7 @@ The `Start` button runs the install pipeline on a background thread:
 - look for a `.7z.001` archive after download
 - check unpack free space again before extraction
 - show live unpack percentage in the progress bar and status line
+- stream full 7-Zip diagnostics to `dist\logs` while keeping only a small in-memory tail for the GUI
 - automatically run a second extraction pass when a split `.7z.001` contains one inner `.7z`
 - extract with bundled 7-Zip into the selected install folder
 

@@ -23,6 +23,7 @@ Put exactly one `.torrent` file in `InstallerApp/dist/package`, then run the exe
 - Download and validation page.
 - Auto-detects one `.torrent` from the `package` folder.
 - Torrent download through libtorrent-rasterbar.
+- Torrent data is written to disk with bounded libtorrent queues; the installer does not load full payloads into RAM.
 - DHT, PEX, and local service discovery enabled.
 - Download progress, speed, seeds, peers, and ETA.
 - Pause, resume, and stop controls.
@@ -33,6 +34,7 @@ Put exactly one `.torrent` file in `InstallerApp/dist/package`, then run the exe
 - Live unpack progress percentage.
 - Supports split `.7z.001` packages that contain an inner `.7z` archive.
 - Keeps full 7-Zip diagnostics in `dist/logs`, while the GUI log stays concise.
+- Streams 7-Zip diagnostics to disk and keeps only a small in-memory tail for error display.
 
 ## Quick Use
 
