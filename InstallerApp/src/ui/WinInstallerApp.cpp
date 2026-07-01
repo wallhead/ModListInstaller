@@ -828,7 +828,7 @@ bool HasEnoughSpace(const std::filesystem::path& folder, uintmax_t requiredBytes
   return free >= requiredBytes;
 }
 
-std::wstring FormatDownloadStatus(const modlist::DownloadStatus& status) {
+std::wstring FormatDownloadStatus(const modlist::DownloadStatus& status, int elapsedSeconds = -1) {
   std::wostringstream out;
   out << StageToText(status.stage)
       << L" | " << static_cast<int>(status.progress * 100.0f) << L"%";
@@ -841,6 +841,9 @@ std::wstring FormatDownloadStatus(const modlist::DownloadStatus& status) {
     if (status.etaSeconds >= 0) {
       out << L" | ETA " << FormatEta(status.etaSeconds);
     }
+  }
+  if (elapsedSeconds >= 0) {
+    out << L" | Elapsed " << FormatEta(elapsedSeconds);
   }
   return out.str();
 }
@@ -946,7 +949,11 @@ std::wstring StageToText(modlist::DownloadStage stage) {
   return L"Unknown";
 }
 
-std::wstring FormatExtractionStatus(const std::wstring& label, int percent, uintmax_t bytesPerSecond = 0, int etaSeconds = -1) {
+std::wstring FormatExtractionStatus(const std::wstring& label,
+                                    int percent,
+                                    uintmax_t bytesPerSecond = 0,
+                                    int etaSeconds = -1,
+                                    int elapsedSeconds = -1) {
   std::wostringstream out;
   out << label << L" " << percent << L"%";
   if (bytesPerSecond > 0) {
@@ -954,6 +961,9 @@ std::wstring FormatExtractionStatus(const std::wstring& label, int percent, uint
   }
   if (etaSeconds >= 0) {
     out << L" | ETA " << FormatEta(etaSeconds);
+  }
+  if (elapsedSeconds >= 0) {
+    out << L" | Elapsed " << FormatEta(elapsedSeconds);
   }
   return out.str();
 }
@@ -967,7 +977,7 @@ bool RunExtractionStep(HWND hwnd,
                        uintmax_t estimatedBytes) {
   PostLog(hwnd, L"Extracting: " + PathToDisplay(extraction.archiveFirstPart));
   PostProgress(hwnd, progressBase);
-  PostStatus(hwnd, FormatExtractionStatus(statusLabel, 0));
+  PostStatus(hwnd, FormatExtractionStatus(statusLabel, 0, 0, -1, 0));
   int lastPercent = -1;
   const auto startedAt = std::chrono::steady_clock::now();
   const auto result = extractor.Extract(extraction, [hwnd, statusLabel, progressBase, progressSpan, estimatedBytes, startedAt, &lastPercent](int percent) {
@@ -988,7 +998,7 @@ bool RunExtractionStep(HWND hwnd,
       }
     }
     PostProgress(hwnd, mapped);
-    PostStatus(hwnd, FormatExtractionStatus(statusLabel, percent, speed, eta));
+    PostStatus(hwnd, FormatExtractionStatus(statusLabel, percent, speed, eta, static_cast<int>(elapsed)));
   });
   PostLog(hwnd, Widen(result.message));
   WriteLastSevenZipLog(result.output);
@@ -1007,7 +1017,9 @@ bool RunExtractionStep(HWND hwnd,
   }
   if (result.ok) {
     PostProgress(hwnd, progressBase + progressSpan);
-    PostStatus(hwnd, FormatExtractionStatus(statusLabel, 100));
+    const auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::steady_clock::now() - startedAt).count();
+    PostStatus(hwnd, FormatExtractionStatus(statusLabel, 100, 0, -1, static_cast<int>(elapsed)));
   }
   return result.ok;
 }
@@ -1229,10 +1241,12 @@ void RunInstallWorker(HWND hwnd,
       lastStage = status.stage;
       PostLog(hwnd, L"Validation stage: " + StageToText(status.stage));
     }
+    int elapsedSeconds = 0;
     if (status.totalBytes > 0) {
       status.downloadedBytes = static_cast<int64_t>(status.totalBytes * status.progress);
       const auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
           std::chrono::steady_clock::now() - validationStartedAt).count();
+      elapsedSeconds = static_cast<int>(elapsed);
       if (elapsed > 0 && status.downloadedBytes > 0 && status.totalBytes > status.downloadedBytes) {
         const auto speed = static_cast<uintmax_t>(status.downloadedBytes / elapsed);
         if (speed > 0) {
@@ -1244,7 +1258,7 @@ void RunInstallWorker(HWND hwnd,
       }
     }
     PostProgress(hwnd, static_cast<int>(status.progress * 35.0f));
-    PostStatus(hwnd, FormatDownloadStatus(status));
+    PostStatus(hwnd, FormatDownloadStatus(status, elapsedSeconds));
 
     if (status.stage == modlist::DownloadStage::Completed) {
       PostLog(hwnd, L"Local package validation completed.");
