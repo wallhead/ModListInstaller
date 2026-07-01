@@ -16,7 +16,9 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
+#include <deque>
 #include <fstream>
 #include <sstream>
 #include <thread>
@@ -100,40 +102,29 @@ private:
   bool ok_{false};
 };
 
-bool FeedZeros(Sha1Hasher& hasher, std::int64_t bytes) {
-  constexpr int kChunkSize = 4 * 1024 * 1024;
-  std::vector<char> zeros(kChunkSize, '\0');
-  while (bytes > 0) {
-    const int chunk = static_cast<int>(std::min<std::int64_t>(bytes, kChunkSize));
-    if (!hasher.Update(zeros.data(), static_cast<size_t>(chunk))) {
-      return false;
-    }
-    bytes -= chunk;
-  }
-  return true;
-}
+struct PieceJob {
+  int pieceIndex{0};
+  std::int64_t pieceSize{0};
+  std::vector<char> data;
+};
 
-bool ValidatePiece(const lt::torrent_info& info,
+bool ReadPieceData(const lt::torrent_info& info,
                    int pieceIndex,
                    const std::filesystem::path& root,
+                   PieceJob& job,
                    std::string& error) {
   constexpr int kChunkSize = 4 * 1024 * 1024;
   const lt::piece_index_t piece(pieceIndex);
   const int pieceSize = info.piece_size(piece);
   const auto slices = info.map_block(piece, 0, pieceSize);
-  std::vector<char> buffer(kChunkSize);
-  Sha1Hasher hasher;
-  if (!hasher.ok()) {
-    error = "Unable to initialize SHA1 validator.";
-    return false;
-  }
+  job.pieceIndex = pieceIndex;
+  job.pieceSize = pieceSize;
+  job.data.clear();
+  job.data.reserve(static_cast<size_t>(pieceSize));
 
   for (const auto& slice : slices) {
     if (info.files().pad_file_at(slice.file_index)) {
-      if (!FeedZeros(hasher, slice.size)) {
-        error = "Unable to hash torrent padding data.";
-        return false;
-      }
+      job.data.insert(job.data.end(), static_cast<size_t>(slice.size), '\0');
       continue;
     }
 
@@ -152,8 +143,10 @@ bool ValidatePiece(const lt::torrent_info& info,
     std::int64_t remaining = slice.size;
     while (remaining > 0) {
       const std::streamsize chunk = static_cast<std::streamsize>(
-          std::min<std::int64_t>(remaining, static_cast<std::int64_t>(buffer.size())));
-      file.read(buffer.data(), chunk);
+          std::min<std::int64_t>(remaining, static_cast<std::int64_t>(kChunkSize)));
+      const auto oldSize = job.data.size();
+      job.data.resize(oldSize + static_cast<size_t>(chunk));
+      file.read(job.data.data() + oldSize, chunk);
       const std::streamsize read = file.gcount();
       if (read <= 0) {
         std::ostringstream out;
@@ -161,12 +154,31 @@ bool ValidatePiece(const lt::torrent_info& info,
         error = out.str();
         return false;
       }
-      if (!hasher.Update(buffer.data(), static_cast<size_t>(read))) {
-        error = "Unable to hash package data.";
-        return false;
+      if (read < chunk) {
+        job.data.resize(oldSize + static_cast<size_t>(read));
       }
       remaining -= read;
     }
+  }
+
+  if (job.data.size() != static_cast<size_t>(pieceSize)) {
+    std::ostringstream out;
+    out << "Piece " << pieceIndex << " read " << job.data.size() << " bytes instead of " << pieceSize << ".";
+    error = out.str();
+    return false;
+  }
+  return true;
+}
+
+bool ValidatePieceData(const lt::torrent_info& info, const PieceJob& job, std::string& error) {
+  Sha1Hasher hasher;
+  if (!hasher.ok()) {
+    error = "Unable to initialize SHA1 validator.";
+    return false;
+  }
+  if (!hasher.Update(job.data.data(), job.data.size())) {
+    error = "Unable to hash package data.";
+    return false;
   }
 
   lt::sha1_hash actual;
@@ -174,14 +186,23 @@ bool ValidatePiece(const lt::torrent_info& info,
     error = "Unable to finish SHA1 validation.";
     return false;
   }
-  if (actual != info.hash_for_piece(piece)) {
+  if (actual != info.hash_for_piece(lt::piece_index_t(job.pieceIndex))) {
     std::ostringstream out;
-    out << "Piece hash mismatch at piece " << pieceIndex << ".";
+    out << "Piece hash mismatch at piece " << job.pieceIndex << ".";
     error = out.str();
     return false;
   }
 
   return true;
+}
+
+int MemoryBoundedWorkerCount(int requestedWorkers, int pieceLength) {
+  constexpr std::int64_t kValidationMemoryBudget = 384LL * 1024LL * 1024LL;
+  if (pieceLength <= 0) {
+    return requestedWorkers;
+  }
+  const auto maxInFlightPieces = std::max<std::int64_t>(2, kValidationMemoryBudget / pieceLength);
+  return std::clamp(static_cast<int>(maxInFlightPieces - 1), 1, requestedWorkers);
 }
 
 }  // namespace
@@ -425,7 +446,7 @@ void LibtorrentDownloader::RunLocalValidation(DownloadConfig config) {
     return;
   }
 
-  const int workerCount = std::min(ValidationWorkerCount(), totalPieces);
+  const int workerCount = std::min(MemoryBoundedWorkerCount(ValidationWorkerCount(), info.piece_length()), totalPieces);
   {
     std::lock_guard<std::mutex> lock(mutex_);
     status_.stage = DownloadStage::Checking;
@@ -436,9 +457,13 @@ void LibtorrentDownloader::RunLocalValidation(DownloadConfig config) {
     status_.trackerCount = workerCount;
   }
 
-  std::atomic<int> nextPiece{0};
   std::atomic<std::int64_t> validatedBytes{0};
   std::atomic_bool failed{false};
+  std::deque<PieceJob> jobs;
+  std::mutex jobsMutex;
+  std::condition_variable jobsCv;
+  bool producerDone = false;
+  constexpr size_t kQueuedPieceLimit = 1;
   std::vector<std::thread> workers;
   workers.reserve(static_cast<size_t>(workerCount));
 
@@ -453,6 +478,51 @@ void LibtorrentDownloader::RunLocalValidation(DownloadConfig config) {
       impl_->validationPauseRequested = false;
       impl_->validationPauseCv.notify_all();
     }
+    jobsCv.notify_all();
+  };
+
+  auto waitForResume = [&]() {
+    if (impl_ == nullptr) {
+      return false;
+    }
+    std::unique_lock<std::mutex> pauseLock(impl_->validationPauseMutex);
+    impl_->validationPauseCv.wait(pauseLock, [&]() {
+      return !impl_->validationPauseRequested || impl_->validationCancelRequested || failed.load();
+    });
+    return !impl_->validationCancelRequested && !failed;
+  };
+
+  auto producer = [&]() {
+    for (int pieceIndex = 0; pieceIndex < totalPieces; ++pieceIndex) {
+      if (!waitForResume()) {
+        break;
+      }
+
+      PieceJob job;
+      std::string error;
+      if (!ReadPieceData(info, pieceIndex, config.downloadFolder, job, error)) {
+        failValidation(error);
+        break;
+      }
+
+      std::unique_lock<std::mutex> lock(jobsMutex);
+      while (jobs.size() >= kQueuedPieceLimit &&
+             (impl_ == nullptr || !impl_->validationCancelRequested) &&
+             !failed) {
+        jobsCv.wait_for(lock, std::chrono::milliseconds(100));
+      }
+      if ((impl_ != nullptr && impl_->validationCancelRequested) || failed) {
+        break;
+      }
+      jobs.push_back(std::move(job));
+      jobsCv.notify_all();
+    }
+
+    {
+      std::lock_guard<std::mutex> lock(jobsMutex);
+      producerDone = true;
+    }
+    jobsCv.notify_all();
   };
 
   auto worker = [&]() {
@@ -460,29 +530,39 @@ void LibtorrentDownloader::RunLocalValidation(DownloadConfig config) {
       if (impl_ == nullptr || impl_->validationCancelRequested || failed) {
         return;
       }
-      {
-        std::unique_lock<std::mutex> pauseLock(impl_->validationPauseMutex);
-        impl_->validationPauseCv.wait(pauseLock, [&]() {
-          return !impl_->validationPauseRequested || impl_->validationCancelRequested || failed.load();
-        });
-      }
-      if (impl_->validationCancelRequested || failed) {
+      if (!waitForResume()) {
         return;
       }
 
-      const int pieceIndex = nextPiece.fetch_add(1);
-      if (pieceIndex >= totalPieces) {
-        return;
+      PieceJob job;
+      {
+        std::unique_lock<std::mutex> lock(jobsMutex);
+        while (jobs.empty() && !producerDone &&
+               (impl_ == nullptr || !impl_->validationCancelRequested) &&
+               !failed) {
+          jobsCv.wait_for(lock, std::chrono::milliseconds(100));
+        }
+        if ((impl_ != nullptr && impl_->validationCancelRequested) || failed) {
+          return;
+        }
+        if (jobs.empty()) {
+          if (producerDone) {
+            return;
+          }
+          continue;
+        }
+        job = std::move(jobs.front());
+        jobs.pop_front();
+        jobsCv.notify_all();
       }
 
       std::string error;
-      if (!ValidatePiece(info, pieceIndex, config.downloadFolder, error)) {
+      if (!ValidatePieceData(info, job, error)) {
         failValidation(error);
         return;
       }
 
-      const auto done = validatedBytes.fetch_add(info.piece_size(lt::piece_index_t(pieceIndex))) +
-                        info.piece_size(lt::piece_index_t(pieceIndex));
+      const auto done = validatedBytes.fetch_add(job.pieceSize) + job.pieceSize;
       std::lock_guard<std::mutex> lock(mutex_);
       if (status_.stage == DownloadStage::Checking || status_.stage == DownloadStage::Paused) {
         status_.stage = impl_->validationPauseRequested ? DownloadStage::Paused : DownloadStage::Checking;
@@ -495,8 +575,12 @@ void LibtorrentDownloader::RunLocalValidation(DownloadConfig config) {
     }
   };
 
+  std::thread reader(producer);
   for (int i = 0; i < workerCount; ++i) {
     workers.emplace_back(worker);
+  }
+  if (reader.joinable()) {
+    reader.join();
   }
   for (auto& thread : workers) {
     if (thread.joinable()) {
