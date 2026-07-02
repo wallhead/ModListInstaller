@@ -35,6 +35,7 @@ The `Install` button runs the install pipeline on a background thread:
 - check manifest archive size against free space
 - verify archive file sizes and SHA256 hashes from the manifest
 - show validation progress, speed, ETA, and elapsed time
+- auto-select sequential HDD validation or parallel SSD validation
 - look for the archive named by the manifest beside the exe
 - check unpack free space again before extraction
 - show live unpack percentage, speed, and ETA in the progress bar and status line

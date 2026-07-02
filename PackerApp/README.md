@@ -31,6 +31,8 @@ The default chunk size is 64 MiB.
 
 `Manifest Only` scans the release folder for archive outputs only. It includes the exact archive file or numeric split volumes such as `MyPack.7z.001`, ignores side files like `.tmp` and logs, and writes `archive_name` from the real detected archive name. If more than one archive set is present, enter the wanted archive name first.
 
+Manifest hashing auto-selects sequential HDD reads or parallel SSD reads, with a measured 4 MiB per-worker buffer.
+
 ## Build
 
 ```powershell

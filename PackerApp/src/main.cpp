@@ -3,6 +3,7 @@
 #include <windows.h>
 #include <commctrl.h>
 #include <shlobj.h>
+#include <winioctl.h>
 #include <bcrypt.h>
 
 #include "resource.h"
@@ -419,6 +420,58 @@ std::wstring ArchiveNameFromBaseName(const std::wstring& baseName) {
   return baseName;
 }
 
+std::optional<bool> DriveIncursSeekPenalty(const std::filesystem::path& path) {
+  std::error_code ec;
+  const auto absolute = std::filesystem::absolute(path, ec);
+  const auto rootName = (ec ? path : absolute).root_name().wstring();
+  if (rootName.empty()) {
+    return std::nullopt;
+  }
+
+  const std::wstring volumePath = L"\\\\.\\" + rootName;
+  HANDLE volume = CreateFileW(volumePath.c_str(),
+                              0,
+                              FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                              nullptr,
+                              OPEN_EXISTING,
+                              0,
+                              nullptr);
+  if (volume == INVALID_HANDLE_VALUE) {
+    return std::nullopt;
+  }
+
+  STORAGE_PROPERTY_QUERY query{};
+  query.PropertyId = StorageDeviceSeekPenaltyProperty;
+  query.QueryType = PropertyStandardQuery;
+  DEVICE_SEEK_PENALTY_DESCRIPTOR descriptor{};
+  DWORD bytesReturned = 0;
+  const BOOL ok = DeviceIoControl(volume,
+                                  IOCTL_STORAGE_QUERY_PROPERTY,
+                                  &query,
+                                  sizeof(query),
+                                  &descriptor,
+                                  sizeof(descriptor),
+                                  &bytesReturned,
+                                  nullptr);
+  CloseHandle(volume);
+  if (!ok || bytesReturned < sizeof(descriptor)) {
+    return std::nullopt;
+  }
+  return descriptor.IncursSeekPenalty != FALSE;
+}
+
+size_t SelectHashWorkerCount(const std::filesystem::path& folder, size_t fileCount) {
+  if (fileCount == 0) {
+    return 1;
+  }
+  const auto incursSeekPenalty = DriveIncursSeekPenalty(folder);
+  if (!incursSeekPenalty.has_value() || *incursSeekPenalty) {
+    return 1;
+  }
+  const unsigned int hardwareThreads = std::max(1u, std::thread::hardware_concurrency());
+  return std::max<size_t>(1, std::min<size_t>(fileCount, std::min<size_t>(4, hardwareThreads)));
+}
+
 std::wstring BuildSevenZipCommand(const PackerConfig& config) {
   std::wstring command = Quote(config.sevenZipExe) + L" a " + Quote(ArchivePath(config)) + L" " +
                          Quote(config.sourceFolder / L"*") + L" -t" + config.format +
@@ -715,8 +768,10 @@ bool WriteManifest(HWND hwnd, const PackerConfig& config) {
   }
 
   PostLog(hwnd, L"Generating manifest for " + std::to_wstring(files.size()) + L" archive file(s).");
-  constexpr size_t workerCount = 1;
-  PostLog(hwnd, L"Manifest hashing workers: 1 (sequential HDD-friendly read)");
+  const size_t workerCount = SelectHashWorkerCount(config.releaseFolder, files.size());
+  PostLog(hwnd, workerCount == 1
+                    ? L"Manifest hashing workers: 1 (sequential HDD-friendly read)"
+                    : L"Manifest hashing workers: " + std::to_wstring(workerCount) + L" (SSD parallel read)");
 
   std::vector<FileManifest> manifests(files.size());
   std::deque<size_t> jobs;

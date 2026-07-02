@@ -10,6 +10,7 @@
 #include <windows.h>
 #include <commctrl.h>
 #include <shlobj.h>
+#include <winioctl.h>
 
 #include <algorithm>
 #include <atomic>
@@ -673,6 +674,7 @@ std::wstring FormatBytes(uintmax_t bytes);
 std::wstring FormatBytesPerSecond(uintmax_t bytesPerSecond);
 std::wstring FormatEta(int seconds);
 std::string HexDigest(const std::array<uint8_t, 32>& digest);
+size_t SelectHashWorkerCount(const std::filesystem::path& folder, size_t fileCount);
 std::optional<std::filesystem::path> FindFirstArchivePart(const std::filesystem::path& folder);
 std::optional<modlist::Manifest> LoadPackageManifest(std::wstring& message);
 std::optional<std::filesystem::path> ArchivePartFromManifest(const modlist::Manifest& manifest);
@@ -770,8 +772,10 @@ bool VerifyPackageManifest(HWND hwnd, const modlist::Manifest& manifest) {
                    L" | Elapsed " + FormatEta(static_cast<int>(elapsed)));
   };
 
-  constexpr size_t workerCount = 1;
-  PostLog(hwnd, L"Manifest validation workers: 1 (sequential HDD-friendly read)");
+  const size_t workerCount = SelectHashWorkerCount(ArchiveFolder(), manifest.files.size());
+  PostLog(hwnd, workerCount == 1
+                    ? L"Manifest validation workers: 1 (sequential HDD-friendly read)"
+                    : L"Manifest validation workers: " + std::to_wstring(workerCount) + L" (SSD parallel read)");
 
   auto worker = [&]() {
     std::vector<uint8_t> buffer(4 * 1024 * 1024);
@@ -976,6 +980,58 @@ std::string HexDigest(const std::array<uint8_t, 32>& digest) {
     out << std::setw(2) << static_cast<int>(byte);
   }
   return out.str();
+}
+
+std::optional<bool> DriveIncursSeekPenalty(const std::filesystem::path& path) {
+  std::error_code ec;
+  const auto absolute = std::filesystem::absolute(path, ec);
+  const auto rootName = (ec ? path : absolute).root_name().wstring();
+  if (rootName.empty()) {
+    return std::nullopt;
+  }
+
+  const std::wstring volumePath = L"\\\\.\\" + rootName;
+  HANDLE volume = CreateFileW(volumePath.c_str(),
+                              0,
+                              FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                              nullptr,
+                              OPEN_EXISTING,
+                              0,
+                              nullptr);
+  if (volume == INVALID_HANDLE_VALUE) {
+    return std::nullopt;
+  }
+
+  STORAGE_PROPERTY_QUERY query{};
+  query.PropertyId = StorageDeviceSeekPenaltyProperty;
+  query.QueryType = PropertyStandardQuery;
+  DEVICE_SEEK_PENALTY_DESCRIPTOR descriptor{};
+  DWORD bytesReturned = 0;
+  const BOOL ok = DeviceIoControl(volume,
+                                  IOCTL_STORAGE_QUERY_PROPERTY,
+                                  &query,
+                                  sizeof(query),
+                                  &descriptor,
+                                  sizeof(descriptor),
+                                  &bytesReturned,
+                                  nullptr);
+  CloseHandle(volume);
+  if (!ok || bytesReturned < sizeof(descriptor)) {
+    return std::nullopt;
+  }
+  return descriptor.IncursSeekPenalty != FALSE;
+}
+
+size_t SelectHashWorkerCount(const std::filesystem::path& folder, size_t fileCount) {
+  if (fileCount == 0) {
+    return 1;
+  }
+  const auto incursSeekPenalty = DriveIncursSeekPenalty(folder);
+  if (!incursSeekPenalty.has_value() || *incursSeekPenalty) {
+    return 1;
+  }
+  const unsigned int hardwareThreads = std::max(1u, std::thread::hardware_concurrency());
+  return std::max<size_t>(1, std::min<size_t>(fileCount, std::min<size_t>(4, hardwareThreads)));
 }
 
 std::wstring FormatEta(int seconds) {
