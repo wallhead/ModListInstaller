@@ -30,7 +30,7 @@ body {
   background:
     linear-gradient(rgba(16, 20, 22, 0.9), rgba(16, 20, 22, 0.93)),
     url("assets/background.webp") center / cover fixed;
-  font: 13px/1.45 "Segoe UI", Tahoma, sans-serif;
+  font: 14px/1.42 "Segoe UI Variable Text", "Segoe UI", Tahoma, sans-serif;
   overflow: hidden;
 }
 
@@ -46,7 +46,7 @@ textarea {
   grid-template-columns: minmax(0, 1fr);
   width: 100%;
   height: 100%;
-  background: rgba(12, 16, 18, 0.58);
+  background: rgba(12, 16, 18, 0.72);
 }
 
 .content {
@@ -69,7 +69,7 @@ textarea {
 .eyebrow {
   margin: 0 0 2px;
   color: var(--accent);
-  font-size: 11px;
+  font-size: 12px;
   font-weight: 700;
 }
 
@@ -80,14 +80,13 @@ p {
 }
 
 h1 {
-  font-family: Georgia, "Times New Roman", serif;
-  font-size: 22px;
-  font-weight: 400;
+  font-size: 23px;
+  font-weight: 600;
 }
 
 h2 {
   margin-bottom: 8px;
-  font-size: 16px;
+  font-size: 17px;
   font-weight: 600;
 }
 
@@ -100,7 +99,7 @@ h2 {
 .panel {
   min-height: 0;
   padding: 16px 22px 72px;
-  background: rgba(23, 29, 32, 0.88);
+  background: rgba(23, 29, 32, 0.94);
   overflow: auto;
 }
 
@@ -151,8 +150,8 @@ textarea {
 
 input[type="text"],
 select {
-  height: 28px;
-  padding: 3px 8px;
+  height: 30px;
+  padding: 4px 8px;
 }
 
 input[type="text"]:focus,

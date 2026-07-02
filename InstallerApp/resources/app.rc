@@ -2,3 +2,4 @@
 
 IDI_MODLIST_INSTALLER ICON "app.ico"
 IDR_7ZIP_EXE RCDATA "7z.exe"
+1 RT_MANIFEST "app.manifest"
