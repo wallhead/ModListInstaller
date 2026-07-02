@@ -1195,10 +1195,10 @@ void Worker(HWND hwnd, PackerConfig config) {
     PostLog(hwnd, L"7-Zip command: " + BuildSevenZipCommand(config));
     const uint64_t sourceBytes = EstimateFolderBytes(config.sourceFolder);
     if (sourceBytes > 0) {
-      PostLog(hwnd, L"Packing source size estimate: " + FormatBytes(sourceBytes));
+      PostLog(hwnd, L"Packing input size estimate (uncompressed source): " + FormatBytes(sourceBytes));
     }
-    PostStatus(hwnd, L"Packing");
-    const int exitCode = RunProcess(hwnd, BuildSevenZipCommand(config), L"Packing", sourceBytes);
+    PostStatus(hwnd, L"Packing input");
+    const int exitCode = RunProcess(hwnd, BuildSevenZipCommand(config), L"Packing input", sourceBytes);
     if (exitCode != 0) {
       PostLog(hwnd, L"7-Zip failed with exit code " + std::to_wstring(exitCode));
       ok = false;
