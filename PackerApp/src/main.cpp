@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cctype>
 #include <cstdint>
 #include <cwctype>
 #include <deque>
@@ -246,6 +247,48 @@ std::wstring FormatBytes(uint64_t bytes) {
   return out.str();
 }
 
+std::wstring FormatDuration(int64_t seconds) {
+  if (seconds < 0) {
+    return L"unknown";
+  }
+  const int64_t hours = seconds / 3600;
+  const int64_t minutes = (seconds % 3600) / 60;
+  const int64_t secs = seconds % 60;
+  std::wostringstream out;
+  if (hours > 0) {
+    out << hours << L"h " << minutes << L"m";
+  } else if (minutes > 0) {
+    out << minutes << L"m " << secs << L"s";
+  } else {
+    out << secs << L"s";
+  }
+  return out.str();
+}
+
+std::wstring FormatBytesPerSecond(uint64_t bytesPerSecond) {
+  return FormatBytes(bytesPerSecond) + L"/s";
+}
+
+std::wstring FormatProgressStatus(const std::wstring& label,
+                                  int percent,
+                                  uint64_t doneBytes,
+                                  uint64_t totalBytes,
+                                  uint64_t bytesPerSecond,
+                                  int64_t etaSeconds,
+                                  int64_t elapsedSeconds) {
+  std::wostringstream out;
+  out << label << L" " << percent << L"%";
+  if (totalBytes > 0) {
+    out << L" | " << FormatBytes(doneBytes) << L" / " << FormatBytes(totalBytes);
+  }
+  if (bytesPerSecond > 0) {
+    out << L" | " << FormatBytesPerSecond(bytesPerSecond);
+  }
+  out << L" | ETA " << FormatDuration(etaSeconds)
+      << L" | Elapsed " << FormatDuration(elapsedSeconds);
+  return out.str();
+}
+
 std::string Narrow(const std::wstring& text) {
   if (text.empty()) {
     return {};
@@ -356,6 +399,31 @@ uint64_t ParseSizeText(const std::wstring& text, uint64_t fallback) {
   } catch (...) {
     return fallback;
   }
+}
+
+uint64_t EstimateFolderBytes(const std::filesystem::path& folder) {
+  std::error_code ec;
+  if (!std::filesystem::exists(folder, ec) || !std::filesystem::is_directory(folder, ec)) {
+    return 0;
+  }
+
+  uint64_t total = 0;
+  for (const auto& entry : std::filesystem::recursive_directory_iterator(
+           folder, std::filesystem::directory_options::skip_permission_denied, ec)) {
+    if (ec) {
+      ec.clear();
+      continue;
+    }
+    if (!entry.is_regular_file(ec) || ec) {
+      ec.clear();
+      continue;
+    }
+    total += entry.file_size(ec);
+    if (ec) {
+      ec.clear();
+    }
+  }
+  return total;
 }
 
 std::wstring SelectArchiveExtension(const PackerConfig& config) {
@@ -538,7 +606,8 @@ bool HashArchiveFile(HWND hwnd,
                      uint64_t chunkSize,
                      FileManifest& manifest,
                      std::atomic_uint64_t& doneBytes,
-                     uint64_t totalBytes) {
+                     uint64_t totalBytes,
+                     std::chrono::steady_clock::time_point startedAt) {
   std::ifstream input(file, std::ios::binary);
   if (!input) {
     PostLog(hwnd, L"Unable to open file for hashing: " + file.wstring());
@@ -607,8 +676,18 @@ bool HashArchiveFile(HWND hwnd,
     }
     const uint64_t done = doneBytes.fetch_add(static_cast<uint64_t>(read)) + static_cast<uint64_t>(read);
     const int percent = totalBytes > 0 ? static_cast<int>((done * 100) / totalBytes) : 0;
+    const auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::steady_clock::now() - startedAt).count();
+    uint64_t speed = 0;
+    int64_t eta = -1;
+    if (elapsed > 0 && done > 0) {
+      speed = done / static_cast<uint64_t>(elapsed);
+      if (speed > 0 && totalBytes > done) {
+        eta = static_cast<int64_t>((totalBytes - done) / speed);
+      }
+    }
     PostProgress(hwnd, percent);
-    PostStatus(hwnd, L"Hashing " + std::to_wstring(percent) + L"% | " + FormatBytes(done) + L" / " + FormatBytes(totalBytes));
+    PostStatus(hwnd, FormatProgressStatus(L"Hashing", percent, done, totalBytes, speed, eta, elapsed));
   }
 
   if (chunkDone > 0) {
@@ -782,6 +861,7 @@ bool WriteManifest(HWND hwnd, const PackerConfig& config) {
   std::mutex jobsMutex;
   std::atomic_uint64_t doneBytes{0};
   std::atomic_bool failed{false};
+  const auto hashingStartedAt = std::chrono::steady_clock::now();
 
   auto fail = [&](std::wstring message) {
     bool expected = false;
@@ -803,7 +883,14 @@ bool WriteManifest(HWND hwnd, const PackerConfig& config) {
       }
 
       PostLog(hwnd, L"Hashing archive file: " + files[index].filename().wstring());
-      if (!HashArchiveFile(hwnd, config.releaseFolder, files[index], config.chunkSize, manifests[index], doneBytes, totalBytes)) {
+      if (!HashArchiveFile(hwnd,
+                           config.releaseFolder,
+                           files[index],
+                           config.chunkSize,
+                           manifests[index],
+                           doneBytes,
+                           totalBytes,
+                           hashingStartedAt)) {
         fail(L"Hashing failed: " + files[index].wstring());
         return;
       }
@@ -878,7 +965,60 @@ bool WriteManifest(HWND hwnd, const PackerConfig& config) {
   return true;
 }
 
-int RunProcess(HWND hwnd, const std::wstring& command) {
+void UpdateProcessProgressStatus(HWND hwnd,
+                                 const std::wstring& label,
+                                 int percent,
+                                 uint64_t estimatedBytes,
+                                 std::chrono::steady_clock::time_point startedAt) {
+  const auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+      std::chrono::steady_clock::now() - startedAt).count();
+  uint64_t done = 0;
+  uint64_t speed = 0;
+  int64_t eta = -1;
+  if (estimatedBytes > 0) {
+    done = (estimatedBytes * static_cast<uint64_t>(percent)) / 100;
+    if (elapsed > 0 && done > 0) {
+      speed = done / static_cast<uint64_t>(elapsed);
+      if (speed > 0 && estimatedBytes > done) {
+        eta = static_cast<int64_t>((estimatedBytes - done) / speed);
+      }
+    }
+  }
+  PostProgress(hwnd, percent);
+  PostStatus(hwnd, FormatProgressStatus(label, percent, done, estimatedBytes, speed, eta, elapsed));
+}
+
+void ConsumeProcessOutput(HWND hwnd,
+                          const char* buffer,
+                          DWORD bytesRead,
+                          std::string& tail,
+                          int& lastPercent,
+                          const std::wstring& label,
+                          uint64_t estimatedBytes,
+                          std::chrono::steady_clock::time_point startedAt) {
+  tail.append(buffer, bytesRead);
+  if (tail.size() > 4096) {
+    tail.erase(0, tail.size() - 4096);
+  }
+  const auto percentPos = tail.rfind('%');
+  if (percentPos == std::string::npos) {
+    return;
+  }
+  size_t begin = percentPos;
+  while (begin > 0 && std::isdigit(static_cast<unsigned char>(tail[begin - 1]))) {
+    --begin;
+  }
+  if (begin >= percentPos) {
+    return;
+  }
+  const int percent = std::stoi(tail.substr(begin, percentPos - begin));
+  if (percent >= 0 && percent <= 100 && percent != lastPercent) {
+    lastPercent = percent;
+    UpdateProcessProgressStatus(hwnd, label, percent, estimatedBytes, startedAt);
+  }
+}
+
+int RunProcess(HWND hwnd, const std::wstring& command, const std::wstring& label, uint64_t estimatedBytes) {
   SECURITY_ATTRIBUTES security{};
   security.nLength = sizeof(security);
   security.bInheritHandle = TRUE;
@@ -916,31 +1056,36 @@ int RunProcess(HWND hwnd, const std::wstring& command) {
   }
 
   char buffer[4096];
-  DWORD bytesRead = 0;
   std::string tail;
-  while (!g_cancelRequested && ReadFile(readPipe, buffer, sizeof(buffer), &bytesRead, nullptr) && bytesRead > 0) {
-    tail.append(buffer, bytesRead);
-    if (tail.size() > 4096) {
-      tail.erase(0, tail.size() - 4096);
-    }
-    const auto percentPos = tail.rfind('%');
-    if (percentPos != std::string::npos) {
-      size_t begin = percentPos;
-      while (begin > 0 && std::isdigit(static_cast<unsigned char>(tail[begin - 1]))) {
-        --begin;
-      }
-      if (begin < percentPos) {
-        const int percent = std::stoi(tail.substr(begin, percentPos - begin));
-        if (percent >= 0 && percent <= 100) {
-          PostProgress(hwnd, percent);
-          PostStatus(hwnd, L"Compressing " + std::to_wstring(percent) + L"%");
-        }
-      }
-    }
-  }
+  int lastPercent = -1;
+  const auto startedAt = std::chrono::steady_clock::now();
+  UpdateProcessProgressStatus(hwnd, label, 0, estimatedBytes, startedAt);
 
-  if (g_cancelRequested) {
-    TerminateProcess(process.hProcess, 255);
+  while (true) {
+    if (g_cancelRequested.load()) {
+      TerminateProcess(process.hProcess, 255);
+      break;
+    }
+
+    DWORD available = 0;
+    while (PeekNamedPipe(readPipe, nullptr, 0, nullptr, &available, nullptr) && available > 0) {
+      DWORD bytesRead = 0;
+      const DWORD toRead = std::min<DWORD>(available, sizeof(buffer));
+      if (!ReadFile(readPipe, buffer, toRead, &bytesRead, nullptr) || bytesRead == 0) {
+        break;
+      }
+      ConsumeProcessOutput(hwnd, buffer, bytesRead, tail, lastPercent, label, estimatedBytes, startedAt);
+      available = 0;
+    }
+
+    const DWORD wait = WaitForSingleObject(process.hProcess, 100);
+    if (wait == WAIT_OBJECT_0) {
+      DWORD bytesRead = 0;
+      while (ReadFile(readPipe, buffer, sizeof(buffer), &bytesRead, nullptr) && bytesRead > 0) {
+        ConsumeProcessOutput(hwnd, buffer, bytesRead, tail, lastPercent, label, estimatedBytes, startedAt);
+      }
+      break;
+    }
   }
 
   WaitForSingleObject(process.hProcess, INFINITE);
@@ -1048,8 +1193,12 @@ void Worker(HWND hwnd, PackerConfig config) {
   if (config.archiveFirst) {
     PostLog(hwnd, L"Creating archive...");
     PostLog(hwnd, L"7-Zip command: " + BuildSevenZipCommand(config));
-    PostStatus(hwnd, L"Compressing");
-    const int exitCode = RunProcess(hwnd, BuildSevenZipCommand(config));
+    const uint64_t sourceBytes = EstimateFolderBytes(config.sourceFolder);
+    if (sourceBytes > 0) {
+      PostLog(hwnd, L"Packing source size estimate: " + FormatBytes(sourceBytes));
+    }
+    PostStatus(hwnd, L"Packing");
+    const int exitCode = RunProcess(hwnd, BuildSevenZipCommand(config), L"Packing", sourceBytes);
     if (exitCode != 0) {
       PostLog(hwnd, L"7-Zip failed with exit code " + std::to_wstring(exitCode));
       ok = false;
@@ -1059,7 +1208,15 @@ void Worker(HWND hwnd, PackerConfig config) {
     if (ok && config.testArchive && !g_cancelRequested) {
       PostLog(hwnd, L"Testing archive...");
       PostStatus(hwnd, L"Testing archive");
-      const int testExitCode = RunProcess(hwnd, BuildSevenZipTestCommand(config));
+      uint64_t archiveBytes = 0;
+      for (const auto& file : FindArchivePartsForBase(config.releaseFolder, config.archiveName + SelectArchiveExtension(config))) {
+        std::error_code ec;
+        archiveBytes += std::filesystem::file_size(file, ec);
+        if (ec) {
+          ec.clear();
+        }
+      }
+      const int testExitCode = RunProcess(hwnd, BuildSevenZipTestCommand(config), L"Testing archive", archiveBytes);
       if (testExitCode != 0) {
         PostLog(hwnd, L"7-Zip test failed with exit code " + std::to_wstring(testExitCode));
         ok = false;
