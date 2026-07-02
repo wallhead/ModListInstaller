@@ -433,6 +433,13 @@ std::wstring SelectArchiveExtension(const PackerConfig& config) {
   return L".7z";
 }
 
+std::wstring SevenZipVolumeSize(const std::wstring& value) {
+  if (value == L"4092M - FAT") {
+    return L"4092m";
+  }
+  return value;
+}
+
 std::filesystem::path ArchivePath(const PackerConfig& config) {
   return config.releaseFolder / (config.archiveName + SelectArchiveExtension(config));
 }
@@ -567,8 +574,9 @@ std::wstring BuildSevenZipCommand(const PackerConfig& config) {
       command += L" -ms=" + config.solid;
     }
   }
-  if (!config.volumeSize.empty() && config.volumeSize != L"none") {
-    command += L" -v" + config.volumeSize;
+  const auto volumeSize = SevenZipVolumeSize(config.volumeSize);
+  if (!volumeSize.empty() && volumeSize != L"none") {
+    command += L" -v" + volumeSize;
   }
   if (!config.parameters.empty()) {
     command += L" " + config.parameters;
@@ -578,7 +586,8 @@ std::wstring BuildSevenZipCommand(const PackerConfig& config) {
 
 std::wstring BuildSevenZipTestCommand(const PackerConfig& config) {
   auto archive = ArchivePath(config);
-  if (!config.volumeSize.empty() && config.volumeSize != L"none") {
+  const auto volumeSize = SevenZipVolumeSize(config.volumeSize);
+  if (!volumeSize.empty() && volumeSize != L"none") {
     archive += L".001";
   }
   return Quote(config.sevenZipExe) + L" t " + Quote(archive) + L" -y -bsp1";
@@ -1289,37 +1298,37 @@ void SetDefaults(HWND hwnd) {
   for (const wchar_t* item : {L"0", L"1", L"3", L"5", L"7", L"9"}) {
     AddComboItem(g_levelCombo, item);
   }
-  SelectCombo(g_levelCombo, 5);
+  SelectCombo(g_levelCombo, 3);
 
   for (const wchar_t* item : {L"LZMA2", L"LZMA", L"PPMd", L"BZip2"}) {
     AddComboItem(g_methodCombo, item);
   }
   SelectCombo(g_methodCombo, 0);
 
-  for (const wchar_t* item : {L"64m", L"128m", L"256m", L"512m", L"1g"}) {
+  for (const wchar_t* item : {L"32m", L"64m", L"128m", L"256m", L"512m", L"1g"}) {
     AddComboItem(g_dictionaryCombo, item);
   }
-  SelectCombo(g_dictionaryCombo, 1);
+  SelectCombo(g_dictionaryCombo, 0);
 
   for (const wchar_t* item : {L"32", L"64", L"128", L"273"}) {
     AddComboItem(g_wordCombo, item);
   }
-  SelectCombo(g_wordCombo, 3);
+  SelectCombo(g_wordCombo, 0);
 
   for (const wchar_t* item : {L"Solid", L"Non-solid", L"1g", L"4g", L"8g"}) {
     AddComboItem(g_solidCombo, item);
   }
-  SelectCombo(g_solidCombo, 0);
+  SelectCombo(g_solidCombo, 4);
 
-  for (const wchar_t* item : {L"none", L"2g", L"4g", L"8g", L"16g"}) {
+  for (const wchar_t* item : {L"none", L"2g", L"4092M - FAT", L"4g", L"8g", L"16g"}) {
     AddComboItem(g_volumeCombo, item);
   }
   SelectCombo(g_volumeCombo, 2);
 
-  for (const wchar_t* item : {L"on", L"2", L"4", L"8", L"16"}) {
+  for (const wchar_t* item : {L"on", L"2", L"4", L"8", L"16", L"20"}) {
     AddComboItem(g_threadsCombo, item);
   }
-  SelectCombo(g_threadsCombo, 0);
+  SelectCombo(g_threadsCombo, 5);
 
   for (const wchar_t* item : {L"16m", L"64m", L"128m", L"256m"}) {
     AddComboItem(g_chunkCombo, item);
