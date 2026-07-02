@@ -1,77 +1,69 @@
 # ModListInstaller
 
-Native Windows modlist installer with torrent support.
+Native Windows tools for building and installing local Skyrim modlist release packages.
 
-The ready-to-run build is included at:
+## Ready Binaries
 
 ```text
 InstallerApp/dist/modlist-installer.exe
-```
-
-The release preparation tool is included at:
-
-```text
 PackerApp/dist/modlist-packer.exe
 ```
 
-Put exactly one `.torrent` file in `package\` and the complete multi-volume archive beside `modlist-installer.exe`, then run the exe. The app validates the local archive files against the torrent, then unpacks them with embedded 7-Zip.
+`modlist-installer.exe` is the distributable launcher. Ship it beside the archive parts and keep installer support files under `data`.
 
-## Current Features
-
-- Native Windows GUI.
-- Three-step wizard with Previous/Next navigation.
-- Dark Nordic-inspired color scheme with charcoal panels, cool grey text, and icy blue accents.
-- Owner-drawn installer-style buttons with hover, pressed, focus, and disabled states.
-- Welcome page with placeholder greeting text.
-- Folder selection page.
-- Separate choices for unpack drive and final install folder.
-- Unpack drive selection automatically resolves to `X:\Sky`.
-- Validation and install page.
-- Auto-detects one `.torrent` from the `package` folder.
-- Validates local archive files through libtorrent-rasterbar without starting a network download.
-- Uses multithreaded local torrent validation with bounded parallel hashing and capped memory for large archives.
-- Shows local validation progress and ETA before unpacking.
-- Stop control for active validation.
-- Force-checks torrent data before unpacking.
-- Releases torrent file handles before extraction.
-- Live unpack progress percentage, speed, and ETA.
-- Live install progress percentage, speed, ETA, and elapsed time.
-- Installs from the unpack folder into the final install folder; same-drive installs use move/cut semantics instead of copying.
-- Supports split `.7z.001` packages that contain an inner `.7z` archive.
-- Embeds 7-Zip inside the installer exe and extracts it to a per-user cache when needed.
-- Keeps full 7-Zip diagnostics in `dist/logs`, while the GUI log stays concise.
-- Streams 7-Zip diagnostics to disk and keeps only a small in-memory tail for error display.
-- Runs 7-Zip in a memory-limited child process so oversized archives fail cleanly instead of exhausting system RAM.
-
-## Quick Use
+## Installer Runtime Layout
 
 ```text
 MyPack/
   modlist-installer.exe
   MyPack.7z.001
   MyPack.7z.002
-  package/
-    MyPack.torrent
+  data/
+    package/
+      manifest.json
+    downloads/
+    logs/
+    tools/
+      7zip/
+  ui/
+    index.html
+    style.css
+    app.js
+    assets/
 ```
 
-Run `modlist-installer.exe`, choose the drive to unpack to, choose the final install folder, then press `Install`. The unpack target is always generated as `<drive>:\Sky`.
+The installer looks for `data\package\manifest.json` beside the exe. Archive parts stay beside the exe root. There is no package-folder picker in the UI.
 
-## Build Setup
+## Current Installer Features
+
+- Native C++20 Win32 executable.
+- WebView2-powered local HTML/CSS/JS interface.
+- No Electron, no dev server, no remote UI assets.
+- Single-screen installer UI with unpack drive, final install folder, progress, status, and log output.
+- Manifest SHA256 verification before extraction.
+- Archive discovery beside the exe, using the archive filename from `data\package\manifest.json`.
+- Unpack drive selection automatically resolves to `<drive>:\Sky`.
+- Live validation, extraction, and install progress with status text.
+- Same-drive installs use move/cut semantics automatically when possible.
+- Embedded 7-Zip extraction to `data\tools\7zip`.
+- Full diagnostics under `data\logs`.
+
+## Quick Use
+
+1. Put `modlist-installer.exe` beside the archive parts.
+2. Put the manifest at `data\package\manifest.json`.
+3. Run `modlist-installer.exe`.
+4. Select an unpack drive and final install folder.
+5. Press `Install`.
+
+## Build
 
 Requirements:
 
 - Windows
 - Visual Studio C++ build tools
 - xmake
-- vcpkg at `%USERPROFILE%\vcpkg` or `VCPKG_ROOT`
-- `libtorrent:x64-windows-static` installed in vcpkg
-
-Install libtorrent:
-
-```powershell
-cd $env:USERPROFILE\vcpkg
-.\vcpkg install libtorrent:x64-windows-static
-```
+- WebView2 Runtime installed on the target machine
 
 Build and refresh `InstallerApp/dist/modlist-installer.exe`:
 
@@ -80,33 +72,22 @@ cd InstallerApp
 .\scripts\build-release.ps1
 ```
 
-Manual build:
-
-```powershell
-cd InstallerApp
-xmake f --use_libtorrent=y -m release
-xmake
-xmake run installer_core_tests
-Copy-Item .\build\windows\x64\release\modlist-installer-gui.exe .\dist\modlist-installer.exe -Force
-```
+The release script restores the WebView2 SDK package locally under ignored `third_party/webview2`, builds with xmake, runs tests, copies the local UI files, and refreshes the ready exe.
 
 ## Repository Layout
 
 ```text
 InstallerApp/
-  dist/       ready exe, package folder, and generated logs
-  resources/  Windows icon resources
-  docs/       architecture notes
-  examples/   example manifest
-  scripts/    build helper
-  src/        C++ source
-  tests/      core tests
-  xmake.lua   primary build
+  dist/       ready installer exe, ui files, and data folder
+  resources/ Windows icon and embedded 7-Zip resource
+  scripts/   build and dependency restore helpers
+  src/       C++ installer source
+  tests/     core tests
+  ui/        local WebView2 HTML/CSS/JS UI
+  xmake.lua  primary build
 PackerApp/
-  dist/       ready modlist packer exe
-  scripts/    build helper
-  src/        native packer GUI and manifest writer
-  xmake.lua   packer build
+  dist/      ready modlist packer exe
+  scripts/   build helper
+  src/       native packer GUI and manifest writer
+  xmake.lua  packer build
 ```
-
-The app can still build without libtorrent, but the real torrent backend requires `xmake f --use_libtorrent=y`.

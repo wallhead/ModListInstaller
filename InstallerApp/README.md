@@ -46,7 +46,7 @@ The `Install` button runs the install pipeline on a background thread:
 - run 7-Zip inside a memory-limited child process so oversized archives fail cleanly instead of exhausting system RAM
 - extract with bundled 7-Zip into the selected install folder
 
-The GUI is organized as a single WebView2-powered installer screen with unpack drive, final install folder, options, progress, and log output.
+The GUI is organized as a single WebView2-powered installer screen with unpack drive, final install folder, progress, and log output.
 
 The unpack drive selector asks only for a drive letter. The app derives the unpack target as `<drive>:\Sky`, for example `X:\Sky`.
 
@@ -69,8 +69,14 @@ InstallerApp\dist\
     package\
       manifest.json
     logs\
+    downloads\
     tools\
       7zip\
+  ui\
+    index.html
+    style.css
+    app.js
+    assets\
 ```
 
 Do not commit generated logs.
@@ -82,7 +88,7 @@ cd InstallerApp
 .\scripts\build-release.ps1
 ```
 
-The script configures xmake for release, runs tests, and copies the GUI exe into `dist\modlist-installer.exe`.
+The script restores the WebView2 SDK if needed, configures xmake for release, runs tests, copies local UI assets, and copies the GUI exe into `dist\modlist-installer.exe`.
 
 ## Build With CMake
 
