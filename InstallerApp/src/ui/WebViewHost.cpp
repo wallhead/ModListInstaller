@@ -55,7 +55,7 @@ struct WebViewHost::Impl {
   }
 };
 
-WebViewHost::WebViewHost() : impl_(std::make_unique<Impl>()) {}
+WebViewHost::WebViewHost() : impl_(std::make_shared<Impl>()) {}
 
 WebViewHost::~WebViewHost() = default;
 
@@ -73,51 +73,64 @@ void WebViewHost::Initialize(HWND parent,
       std::filesystem::path(LocalAppDataFolder()) / "ModlistInstaller" / "WebView2";
   const std::wstring userData = userDataFolder.wstring();
   const std::wstring targetUrl = FileUrlFromPath(htmlPath);
+  std::weak_ptr<Impl> weakImpl = impl_;
 
   HRESULT hr = CreateCoreWebView2EnvironmentWithOptions(
       nullptr,
       userData.c_str(),
       nullptr,
       Microsoft::WRL::Callback<ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler>(
-          [this, targetUrl](HRESULT result, ICoreWebView2Environment* environment) -> HRESULT {
+          [weakImpl, targetUrl](HRESULT result, ICoreWebView2Environment* environment) -> HRESULT {
+            auto impl = weakImpl.lock();
+            if (impl == nullptr) {
+              return S_OK;
+            }
             if (FAILED(result) || environment == nullptr) {
-              if (impl_->errorHandler) {
-                impl_->errorHandler(result);
+              if (impl->errorHandler) {
+                impl->errorHandler(result);
               }
               return S_OK;
             }
 
             environment->CreateCoreWebView2Controller(
-                impl_->parent,
+                impl->parent,
                 Microsoft::WRL::Callback<ICoreWebView2CreateCoreWebView2ControllerCompletedHandler>(
-                    [this, targetUrl](HRESULT controllerResult, ICoreWebView2Controller* controller) -> HRESULT {
+                    [weakImpl, targetUrl](HRESULT controllerResult, ICoreWebView2Controller* controller) -> HRESULT {
+                      auto impl = weakImpl.lock();
+                      if (impl == nullptr) {
+                        return S_OK;
+                      }
                       if (FAILED(controllerResult) || controller == nullptr) {
-                        if (impl_->errorHandler) {
-                          impl_->errorHandler(controllerResult);
+                        if (impl->errorHandler) {
+                          impl->errorHandler(controllerResult);
                         }
                         return S_OK;
                       }
 
-                      impl_->controller = controller;
-                      impl_->controller->get_CoreWebView2(&impl_->webView);
-                      impl_->Resize();
+                      impl->controller = controller;
+                      impl->controller->get_CoreWebView2(&impl->webView);
+                      impl->Resize();
 
                       Microsoft::WRL::ComPtr<ICoreWebView2Settings> settings;
-                      if (SUCCEEDED(impl_->webView->get_Settings(&settings)) && settings != nullptr) {
+                      if (SUCCEEDED(impl->webView->get_Settings(&settings)) && settings != nullptr) {
                         settings->put_AreDefaultContextMenusEnabled(FALSE);
                         settings->put_AreDevToolsEnabled(FALSE);
                       }
 
                       EventRegistrationToken messageToken{};
-                      impl_->webView->add_WebMessageReceived(
+                      impl->webView->add_WebMessageReceived(
                           Microsoft::WRL::Callback<ICoreWebView2WebMessageReceivedEventHandler>(
-                              [this](ICoreWebView2*, ICoreWebView2WebMessageReceivedEventArgs* args) -> HRESULT {
+                              [weakImpl](ICoreWebView2*, ICoreWebView2WebMessageReceivedEventArgs* args) -> HRESULT {
+                                auto impl = weakImpl.lock();
+                                if (impl == nullptr) {
+                                  return S_OK;
+                                }
                                 LPWSTR raw = nullptr;
                                 if (SUCCEEDED(args->get_WebMessageAsJson(&raw)) && raw != nullptr) {
                                   std::wstring message(raw);
                                   CoTaskMemFree(raw);
-                                  if (impl_->messageHandler) {
-                                    impl_->messageHandler(message);
+                                  if (impl->messageHandler) {
+                                    impl->messageHandler(message);
                                   }
                                 }
                                 return S_OK;
@@ -126,15 +139,19 @@ void WebViewHost::Initialize(HWND parent,
                           &messageToken);
 
                       EventRegistrationToken navigationToken{};
-                      impl_->webView->add_NavigationCompleted(
+                      impl->webView->add_NavigationCompleted(
                           Microsoft::WRL::Callback<ICoreWebView2NavigationCompletedEventHandler>(
-                              [this](ICoreWebView2*, ICoreWebView2NavigationCompletedEventArgs* args) -> HRESULT {
+                              [weakImpl](ICoreWebView2*, ICoreWebView2NavigationCompletedEventArgs* args) -> HRESULT {
+                                auto impl = weakImpl.lock();
+                                if (impl == nullptr) {
+                                  return S_OK;
+                                }
                                 BOOL success = FALSE;
                                 args->get_IsSuccess(&success);
                                 if (success) {
-                                  impl_->ready = true;
-                                  if (impl_->readyHandler) {
-                                    impl_->readyHandler();
+                                  impl->ready = true;
+                                  if (impl->readyHandler) {
+                                    impl->readyHandler();
                                   }
                                 }
                                 return S_OK;
@@ -142,9 +159,9 @@ void WebViewHost::Initialize(HWND parent,
                               .Get(),
                           &navigationToken);
 
-                      const HRESULT navigateResult = impl_->webView->Navigate(targetUrl.c_str());
-                      if (FAILED(navigateResult) && impl_->errorHandler) {
-                        impl_->errorHandler(navigateResult);
+                      const HRESULT navigateResult = impl->webView->Navigate(targetUrl.c_str());
+                      if (FAILED(navigateResult) && impl->errorHandler) {
+                        impl->errorHandler(navigateResult);
                       }
                       return S_OK;
                     })

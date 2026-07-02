@@ -444,6 +444,20 @@ std::filesystem::path ArchivePath(const PackerConfig& config) {
   return config.releaseFolder / (config.archiveName + SelectArchiveExtension(config));
 }
 
+bool IsSafeArchiveName(const std::wstring& name) {
+  if (name.empty() || name == L"." || name == L"..") {
+    return false;
+  }
+  if (name.back() == L'.' || name.back() == L' ') {
+    return false;
+  }
+  if (name.find_first_of(L"<>:\"/\\|?*") != std::wstring::npos) {
+    return false;
+  }
+  const std::filesystem::path path(name);
+  return !path.is_absolute() && path.filename().wstring() == name;
+}
+
 bool IsNumericVolumeSuffix(const std::wstring& suffix) {
   return !suffix.empty() &&
          std::all_of(suffix.begin(), suffix.end(), [](wchar_t ch) {
@@ -925,7 +939,7 @@ bool WriteManifest(HWND hwnd, const PackerConfig& config) {
   }
 
   std::error_code ec;
-  const auto packageFolder = config.releaseFolder / "package";
+  const auto packageFolder = config.releaseFolder / "data" / "package";
   std::filesystem::create_directories(packageFolder, ec);
   if (ec) {
     PostLog(hwnd, L"Unable to create package folder: " + Widen(ec.message()));
@@ -1110,7 +1124,8 @@ void CopyInstallerIfRequested(HWND hwnd, const PackerConfig& config) {
   if (!config.copyInstaller) {
     return;
   }
-  const auto source = ModuleFolder().parent_path().parent_path() / "InstallerApp" / "dist" / "modlist-installer.exe";
+  const auto installerDist = ModuleFolder().parent_path().parent_path() / "InstallerApp" / "dist";
+  const auto source = installerDist / "modlist-installer.exe";
   const auto target = config.releaseFolder / "modlist-installer.exe";
   std::error_code ec;
   if (std::filesystem::exists(source, ec)) {
@@ -1122,6 +1137,32 @@ void CopyInstallerIfRequested(HWND hwnd, const PackerConfig& config) {
     }
   } else {
     PostLog(hwnd, L"Installer copy warning: installer exe was not found next to the repo.");
+  }
+
+  const auto sourceUi = installerDist / "ui";
+  const auto targetUi = config.releaseFolder / "ui";
+  if (std::filesystem::exists(sourceUi, ec) && std::filesystem::is_directory(sourceUi, ec)) {
+    std::filesystem::remove_all(targetUi, ec);
+    ec.clear();
+    std::filesystem::copy(sourceUi, targetUi, std::filesystem::copy_options::recursive, ec);
+    if (ec) {
+      PostLog(hwnd, L"Installer UI copy warning: " + Widen(ec.message()));
+    } else {
+      PostLog(hwnd, L"Installer UI copied: " + targetUi.wstring());
+    }
+  } else {
+    PostLog(hwnd, L"Installer UI copy warning: ui folder was not found next to the installer exe.");
+  }
+
+  for (const auto& folder : {config.releaseFolder / "data" / "package",
+                            config.releaseFolder / "data" / "downloads",
+                            config.releaseFolder / "data" / "logs",
+                            config.releaseFolder / "data" / "tools" / "7zip"}) {
+    ec.clear();
+    std::filesystem::create_directories(folder, ec);
+    if (ec) {
+      PostLog(hwnd, L"Runtime folder warning: " + folder.wstring() + L" - " + Widen(ec.message()));
+    }
   }
 }
 
@@ -1160,6 +1201,10 @@ bool ValidateConfig(HWND hwnd, const PackerConfig& config) {
   }
   if (config.archiveName.empty()) {
     PostLog(hwnd, L"Archive name is required.");
+    return false;
+  }
+  if (!IsSafeArchiveName(config.archiveName)) {
+    PostLog(hwnd, L"Archive name cannot contain path separators, reserved characters, or parent-directory segments.");
     return false;
   }
   if (config.archiveFirst) {

@@ -1468,6 +1468,7 @@ bool ExtractArchiveChain(HWND hwnd,
   extraction.sevenZipExe = sevenZipExe;
   extraction.archiveFirstPart = std::move(archiveFirstPart);
   extraction.installFolder = installFolder;
+  extraction.cancelRequested = &g_stopRequested;
   extraction.useSameDiskTemp = true;
 
   const bool splitArchive = IsFirstSplitArchivePart(extraction.archiveFirstPart);
@@ -1592,6 +1593,10 @@ void UpdateInstallProgress(InstallProgress& progress, uintmax_t bytes, bool forc
 bool MoveWholeEntry(const std::filesystem::path& source,
                     const std::filesystem::path& target,
                     std::wstring& error) {
+  if (g_stopRequested.load()) {
+    error = L"Install stopped by user.";
+    return false;
+  }
   std::error_code ec;
   std::filesystem::create_directories(target.parent_path(), ec);
   if (ec) {
@@ -1636,6 +1641,10 @@ bool CopyFileWithProgress(const std::filesystem::path& source,
 
   std::vector<char> buffer(kBufferSize);
   while (input) {
+    if (g_stopRequested.load()) {
+      error = L"Install stopped by user.";
+      return false;
+    }
     input.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
     const auto read = input.gcount();
     if (read <= 0) {
@@ -1670,6 +1679,10 @@ bool InstallEntry(HWND hwnd,
                   bool sameDrive,
                   InstallProgress& progress,
                   std::wstring& error) {
+  if (g_stopRequested.load()) {
+    error = L"Install stopped by user.";
+    return false;
+  }
   std::error_code ec;
   if (sameDrive && !std::filesystem::exists(target, ec)) {
     const uintmax_t movedBytes = EstimateInstallBytes(source);
@@ -1687,6 +1700,10 @@ bool InstallEntry(HWND hwnd,
       return false;
     }
     for (const auto& entry : std::filesystem::directory_iterator(source, ec)) {
+      if (g_stopRequested.load()) {
+        error = L"Install stopped by user.";
+        return false;
+      }
       if (ec) {
         error = L"Unable to read unpacked folder: " + Widen(ec.message());
         return false;
@@ -1761,10 +1778,22 @@ bool InstallExtractedFiles(HWND hwnd, const std::filesystem::path& unpackFolder,
     }
   }
   PostLog(hwnd, L"Install payload size: " + FormatBytes(installProgress.totalBytes));
+  if (!sameDrive) {
+    const uintmax_t installFree = FreeBytes(installFolder);
+    PostLog(hwnd, L"Install free space: " + FormatBytes(installFree) + L"; extracted payload: " + FormatBytes(installProgress.totalBytes));
+    if (installProgress.totalBytes > 0 && installFree < installProgress.totalBytes) {
+      PostLog(hwnd, L"Not enough free space in the install folder for extracted files.");
+      return false;
+    }
+  }
   UpdateInstallProgress(installProgress, 0, true);
 
   std::wstring error;
   for (const auto& entry : std::filesystem::directory_iterator(unpackFolder, ec)) {
+    if (g_stopRequested.load()) {
+      PostLog(hwnd, L"Install stopped by user.");
+      return false;
+    }
     if (ec) {
       PostLog(hwnd, L"Unable to read unpack folder: " + Widen(ec.message()));
       return false;
@@ -1795,7 +1824,6 @@ void RunInstallWorker(HWND hwnd,
                       std::filesystem::path unpackFolder,
                       std::filesystem::path installFolder) {
   g_workerRunning = true;
-  g_stopRequested = false;
   PostProgress(hwnd, 0);
   PostLog(hwnd, L"Starting manifest validation...");
 
@@ -1923,6 +1951,11 @@ void ValidatePackage() {
   if (manifest.has_value()) {
     AppendLog(L"Manifest files: " + std::to_wstring(manifest->files.size()));
     AppendLog(L"Manifest archive entry: " + PathToDisplay(manifest->extract.firstArchivePart));
+    if (!VerifyPackageManifest(GetParent(g_progress), *manifest)) {
+      SendMessageW(g_progress, PBM_SETPOS, 0, 0);
+      SendUiProgress(0, L"Validation failed");
+      return;
+    }
   }
 
   const uintmax_t knownRequiredBytes = EstimateRequiredBytes(package.value());
@@ -1978,6 +2011,7 @@ void StartInstall(HWND hwnd) {
 
   const auto unpackFolder = SelectedUnpackFolder();
   const auto installFolder = std::filesystem::path(GetText(g_installEdit));
+  g_stopRequested = false;
   g_workerRunning = true;
   SetControlsRunning(hwnd, true);
   g_closeAfterWorker = false;
@@ -2058,6 +2092,7 @@ void UnpackOnly(HWND hwnd) {
   }
 
   g_workerRunning = true;
+  g_stopRequested = false;
   SetControlsRunning(hwnd, true);
   g_closeAfterWorker = false;
   std::thread(RunUnpackWorker, hwnd, *archive, unpackFolder).detach();

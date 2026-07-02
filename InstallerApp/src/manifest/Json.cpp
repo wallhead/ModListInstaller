@@ -9,6 +9,9 @@ namespace modlist {
 
 namespace {
 
+int HexValue(char c);
+void AppendUtf8(std::string& out, uint32_t codepoint);
+
 class Parser {
 public:
   explicit Parser(const std::string& input) : input_(input) {}
@@ -144,11 +147,7 @@ private:
           out.push_back('\t');
           break;
         case 'u':
-          if (pos_ + 4 > input_.size()) {
-            throw std::runtime_error("Invalid JSON unicode escape");
-          }
-          out.push_back('?');
-          pos_ += 4;
+          AppendUtf8(out, ParseUnicodeEscape());
           break;
         default:
           throw std::runtime_error("Invalid JSON escape");
@@ -175,6 +174,39 @@ private:
       ReadDigits();
     }
     return std::stod(input_.substr(start, pos_ - start));
+  }
+
+  uint32_t ParseUnicodeEscape() {
+    uint32_t value = ReadUnicodeWord();
+    if (value >= 0xD800 && value <= 0xDBFF) {
+      if (pos_ + 2 > input_.size() || input_[pos_] != '\\' || input_[pos_ + 1] != 'u') {
+        throw std::runtime_error("Invalid JSON unicode surrogate pair");
+      }
+      pos_ += 2;
+      const uint32_t low = ReadUnicodeWord();
+      if (low < 0xDC00 || low > 0xDFFF) {
+        throw std::runtime_error("Invalid JSON unicode surrogate pair");
+      }
+      value = 0x10000 + ((value - 0xD800) << 10) + (low - 0xDC00);
+    } else if (value >= 0xDC00 && value <= 0xDFFF) {
+      throw std::runtime_error("Invalid JSON unicode surrogate pair");
+    }
+    return value;
+  }
+
+  uint32_t ReadUnicodeWord() {
+    if (pos_ + 4 > input_.size()) {
+      throw std::runtime_error("Invalid JSON unicode escape");
+    }
+    uint32_t value = 0;
+    for (int i = 0; i < 4; ++i) {
+      const int digit = HexValue(input_[pos_++]);
+      if (digit < 0) {
+        throw std::runtime_error("Invalid JSON unicode escape");
+      }
+      value = (value << 4) | static_cast<uint32_t>(digit);
+    }
+    return value;
   }
 
   void ReadDigits() {
@@ -222,6 +254,39 @@ private:
 const std::string kEmptyString;
 const JsonValue::Array kEmptyArray;
 const JsonValue::Object kEmptyObject;
+
+int HexValue(char c) {
+  if (c >= '0' && c <= '9') {
+    return c - '0';
+  }
+  if (c >= 'a' && c <= 'f') {
+    return 10 + c - 'a';
+  }
+  if (c >= 'A' && c <= 'F') {
+    return 10 + c - 'A';
+  }
+  return -1;
+}
+
+void AppendUtf8(std::string& out, uint32_t codepoint) {
+  if (codepoint <= 0x7F) {
+    out.push_back(static_cast<char>(codepoint));
+  } else if (codepoint <= 0x7FF) {
+    out.push_back(static_cast<char>(0xC0 | (codepoint >> 6)));
+    out.push_back(static_cast<char>(0x80 | (codepoint & 0x3F)));
+  } else if (codepoint <= 0xFFFF) {
+    out.push_back(static_cast<char>(0xE0 | (codepoint >> 12)));
+    out.push_back(static_cast<char>(0x80 | ((codepoint >> 6) & 0x3F)));
+    out.push_back(static_cast<char>(0x80 | (codepoint & 0x3F)));
+  } else if (codepoint <= 0x10FFFF) {
+    out.push_back(static_cast<char>(0xF0 | (codepoint >> 18)));
+    out.push_back(static_cast<char>(0x80 | ((codepoint >> 12) & 0x3F)));
+    out.push_back(static_cast<char>(0x80 | ((codepoint >> 6) & 0x3F)));
+    out.push_back(static_cast<char>(0x80 | (codepoint & 0x3F)));
+  } else {
+    throw std::runtime_error("Invalid JSON unicode codepoint");
+  }
+}
 
 }  // namespace
 

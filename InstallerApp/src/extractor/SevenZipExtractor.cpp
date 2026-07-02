@@ -8,7 +8,9 @@
 #endif
 #include <windows.h>
 
+#include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cctype>
 #include <fstream>
@@ -20,18 +22,28 @@ namespace modlist {
 
 namespace {
 
-std::string Quote(const std::filesystem::path& path) {
-  std::string text = path.string();
-  std::string escaped;
+std::wstring QuoteWide(const std::filesystem::path& path) {
+  std::wstring text = path.wstring();
+  std::wstring escaped;
   escaped.reserve(text.size());
-  for (char c : text) {
-    if (c == '"') {
-      escaped += "\\\"";
+  for (wchar_t c : text) {
+    if (c == L'"') {
+      escaped += L"\\\"";
     } else {
       escaped += c;
     }
   }
-  return "\"" + escaped + "\"";
+  return L"\"" + escaped + L"\"";
+}
+
+std::string NarrowForLog(const std::wstring& text) {
+  if (text.empty()) {
+    return {};
+  }
+  const int size = WideCharToMultiByte(CP_UTF8, 0, text.data(), static_cast<int>(text.size()), nullptr, 0, nullptr, nullptr);
+  std::string result(static_cast<size_t>(size), '\0');
+  WideCharToMultiByte(CP_UTF8, 0, text.data(), static_cast<int>(text.size()), result.data(), size, nullptr, nullptr);
+  return result;
 }
 
 std::filesystem::path ModuleFolder() {
@@ -228,16 +240,26 @@ std::optional<int> LastPercentIn(const std::string& text) {
   return percent;
 }
 
-int RunProcessAndCapture(const std::string& command,
+std::wstring BuildCommandWide(const ExtractionConfig& config) {
+  std::wstring command = QuoteWide(config.sevenZipExe) + L" x " + QuoteWide(config.archiveFirstPart) +
+                         L" -o" + QuoteWide(config.installFolder) + L" -y -bsp1";
+  if (config.useSameDiskTemp) {
+    command += L" -w" + QuoteWide(SameDiskTempPath(config.installFolder));
+  }
+  return command;
+}
+
+int RunProcessAndCapture(const std::wstring& command,
                          const std::filesystem::path& outputPath,
                          std::string& outputTail,
+                         const std::atomic_bool* cancelRequested,
                          const SevenZipExtractor::ProgressCallback& progressCallback) {
   constexpr size_t kOutputTailLimit = 64 * 1024;
 
   std::ofstream log(outputPath, std::ios::binary);
   const SIZE_T memoryLimitBytes = SevenZipMemoryLimitBytes();
   if (log) {
-    log << "Command:\n" << command << "\n\n";
+    log << "Command:\n" << NarrowForLog(command) << "\n\n";
     log << "7-Zip process memory limit:\n" << BytesToDisplay(memoryLimitBytes)
         << " (" << memoryLimitBytes << " bytes)\n\n";
     log << "7-Zip output:\n";
@@ -254,7 +276,7 @@ int RunProcessAndCapture(const std::string& command,
   }
   SetHandleInformation(readPipe, HANDLE_FLAG_INHERIT, 0);
 
-  STARTUPINFOA startup{};
+  STARTUPINFOW startup{};
   startup.cb = sizeof(startup);
   startup.dwFlags = STARTF_USESTDHANDLES;
   startup.hStdOutput = writePipe;
@@ -262,9 +284,9 @@ int RunProcessAndCapture(const std::string& command,
   startup.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
 
   PROCESS_INFORMATION process{};
-  std::string mutableCommand = command;
+  std::wstring mutableCommand = command;
   HANDLE job = CreateMemoryLimitedJob(memoryLimitBytes, log);
-  const BOOL created = CreateProcessA(nullptr,
+  const BOOL created = CreateProcessW(nullptr,
                                       mutableCommand.data(),
                                       nullptr,
                                       nullptr,
@@ -298,23 +320,49 @@ int RunProcessAndCapture(const std::string& command,
 
   std::string parseTail;
   char buffer[4096];
-  DWORD bytesRead = 0;
   int lastPercent = -1;
-  while (ReadFile(readPipe, buffer, sizeof(buffer), &bytesRead, nullptr) && bytesRead > 0) {
-    if (log) {
-      log.write(buffer, bytesRead);
+  bool stopping = false;
+  while (true) {
+    if (cancelRequested != nullptr && cancelRequested->load() && !stopping) {
+      stopping = true;
+      TerminateProcess(process.hProcess, 255);
     }
-    AppendBoundedTail(outputTail, buffer, bytesRead, kOutputTailLimit);
-    parseTail.append(buffer, bytesRead);
-    if (parseTail.size() > 256) {
-      parseTail.erase(0, parseTail.size() - 256);
-    }
-    if (progressCallback) {
-      const auto percent = LastPercentIn(parseTail);
-      if (percent.has_value() && *percent != lastPercent) {
-        lastPercent = *percent;
-        progressCallback(*percent);
+
+    DWORD available = 0;
+    while (PeekNamedPipe(readPipe, nullptr, 0, nullptr, &available, nullptr) && available > 0) {
+      DWORD bytesRead = 0;
+      const DWORD toRead = std::min<DWORD>(available, sizeof(buffer));
+      if (!ReadFile(readPipe, buffer, toRead, &bytesRead, nullptr) || bytesRead == 0) {
+        break;
       }
+      if (log) {
+        log.write(buffer, bytesRead);
+      }
+      AppendBoundedTail(outputTail, buffer, bytesRead, kOutputTailLimit);
+      parseTail.append(buffer, bytesRead);
+      if (parseTail.size() > 256) {
+        parseTail.erase(0, parseTail.size() - 256);
+      }
+      if (progressCallback) {
+        const auto percent = LastPercentIn(parseTail);
+        if (percent.has_value() && *percent != lastPercent) {
+          lastPercent = *percent;
+          progressCallback(*percent);
+        }
+      }
+      available = 0;
+    }
+
+    const DWORD wait = WaitForSingleObject(process.hProcess, 100);
+    if (wait == WAIT_OBJECT_0) {
+      DWORD bytesRead = 0;
+      while (ReadFile(readPipe, buffer, sizeof(buffer), &bytesRead, nullptr) && bytesRead > 0) {
+        if (log) {
+          log.write(buffer, bytesRead);
+        }
+        AppendBoundedTail(outputTail, buffer, bytesRead, kOutputTailLimit);
+      }
+      break;
     }
   }
 
@@ -393,9 +441,10 @@ ExtractionResult SevenZipExtractor::Extract(const ExtractionConfig& config, Prog
 
   const auto outputPath = MakeOutputCapturePath(config.sevenZipExe);
   result.outputLogPath = outputPath;
-  result.command = BuildCommand(config);
+  const std::wstring command = BuildCommandWide(config);
+  result.command = NarrowForLog(command);
   std::string outputTail;
-  result.exitCode = RunProcessAndCapture(result.command, outputPath, outputTail, progressCallback);
+  result.exitCode = RunProcessAndCapture(command, outputPath, outputTail, config.cancelRequested, progressCallback);
   result.output = "Full 7-Zip output is streamed to:\n" + outputPath.string() + "\n\nLast captured output:\n" + outputTail;
   result.ok = result.exitCode == 0 || result.exitCode == 1;
   result.message = SevenZipExitMessage(result.exitCode);
@@ -403,12 +452,7 @@ ExtractionResult SevenZipExtractor::Extract(const ExtractionConfig& config, Prog
 }
 
 std::string SevenZipExtractor::BuildCommand(const ExtractionConfig& config) {
-  std::string command = Quote(config.sevenZipExe) + " x " + Quote(config.archiveFirstPart) +
-                        " -o" + Quote(config.installFolder) + " -y -bsp1";
-  if (config.useSameDiskTemp) {
-    command += " -w" + Quote(SameDiskTempPath(config.installFolder));
-  }
-  return command;
+  return NarrowForLog(BuildCommandWide(config));
 }
 
 }  // namespace modlist

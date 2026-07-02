@@ -2,7 +2,7 @@
 
 Native Windows helper for building modlist release folders.
 
-It provides a focused 7-Zip-style archive settings window, runs embedded 7-Zip, tests the archive when requested, then writes a chunked SHA-256 manifest into `package\manifest.json`.
+It provides a focused 7-Zip-style archive settings window, runs embedded 7-Zip, tests the archive when requested, then writes a chunked SHA-256 manifest into `data\package\manifest.json`.
 
 ## Release Layout
 
@@ -11,8 +11,12 @@ ReleaseFolder\
   modlist-installer.exe
   MyPack.7z.001
   MyPack.7z.002
-  package\
-    manifest.json
+  data\
+    package\
+      manifest.json
+    logs\
+    tools\
+      7zip\
 ```
 
 ## Manifest

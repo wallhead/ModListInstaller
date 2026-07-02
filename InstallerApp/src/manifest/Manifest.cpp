@@ -36,6 +36,21 @@ std::string NormalizePathForCheck(std::filesystem::path path) {
   return path.generic_string();
 }
 
+std::string NormalizeManifestPath(std::filesystem::path path) {
+  std::string text = path.generic_string();
+  std::transform(text.begin(), text.end(), text.begin(), [](unsigned char c) {
+    return static_cast<char>(std::tolower(c));
+  });
+  return text;
+}
+
+bool ManifestContainsFile(const std::vector<ManifestFile>& files, const std::filesystem::path& path) {
+  const std::string expected = NormalizeManifestPath(path);
+  return std::any_of(files.begin(), files.end(), [&](const ManifestFile& file) {
+    return NormalizeManifestPath(file.path) == expected;
+  });
+}
+
 Result<ManifestFile> ParseFile(const JsonValue& json, size_t index) {
   if (!json.IsObject()) {
     return Result<ManifestFile>::Error("Manifest file entry " + std::to_string(index) + " must be an object");
@@ -253,6 +268,9 @@ Result<Manifest> ManifestLoader::LoadFromString(const std::string& jsonText) con
   manifest.extract.firstArchivePart = firstArchivePart->AsString();
   if (!IsSafeManifestRelativePath(manifest.extract.firstArchivePart)) {
     return Result<Manifest>::Error("extract.first_archive_part is unsafe");
+  }
+  if (!ManifestContainsFile(manifest.files, manifest.extract.firstArchivePart)) {
+    return Result<Manifest>::Error("extract.first_archive_part must match an entry in files[]");
   }
   if (const JsonValue* value = extract->Find("target_subfolder"); value != nullptr && value->IsString()) {
     manifest.extract.targetSubfolder = value->AsString();

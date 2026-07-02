@@ -6,6 +6,7 @@
 #include <functional>
 #include <string>
 #include <vector>
+#include <atomic>
 
 namespace modlist {
 
@@ -13,6 +14,7 @@ struct ExtractionConfig {
   std::filesystem::path sevenZipExe;
   std::filesystem::path archiveFirstPart;
   std::filesystem::path installFolder;
+  const std::atomic_bool* cancelRequested{nullptr};
   bool useSameDiskTemp{true};
 };
 

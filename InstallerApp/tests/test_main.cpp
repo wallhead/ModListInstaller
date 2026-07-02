@@ -1,5 +1,6 @@
 #include "app/PackageDiscovery.h"
 #include "extractor/SevenZipExtractor.h"
+#include "manifest/Json.h"
 #include "manifest/Manifest.h"
 #include "paths/PathValidator.h"
 #include "tracker/TrackerProvider.h"
@@ -103,6 +104,17 @@ void TestManifestRejectsTraversal() {
   Expect(!manifest.ok(), "Manifest traversal path should fail");
 }
 
+void TestJsonUnicodeEscapes() {
+  auto parsed = ParseJson(R"({"name":"Sky \u0414\u0440\u0430\u0433\u043e\u043d \ud834\udd1e"})");
+  Expect(parsed.ok(), parsed.error().c_str());
+  const auto* name = parsed.value().Find("name");
+  Expect(name != nullptr && name->IsString(), "JSON unicode string missing");
+  const std::string expected = std::string("Sky ") +
+      "\xD0\x94\xD1\x80\xD0\xB0\xD0\xB3\xD0\xBE\xD0\xBD " +
+      "\xF0\x9D\x84\x9E";
+  Expect(name->AsString() == expected, "JSON unicode escapes should decode to UTF-8");
+}
+
 void TestTrackerParsing() {
   const auto trackers = TrackerProvider::ParseTrackers(" udp://tracker.example:80/announce \n\nbad://x\nhttps://tracker.example/a\nudp://tracker.example:80/announce\nwss://tracker.example/ws\n");
   Expect(trackers.size() == 3, "Tracker parsing should trim, validate, and deduplicate");
@@ -182,6 +194,7 @@ int main() {
     TestManifestLoader();
     TestPackerManifestLoader();
     TestManifestRejectsTraversal();
+    TestJsonUnicodeEscapes();
     TestTrackerParsing();
     TestVerifier();
     TestExtractorCommand();
