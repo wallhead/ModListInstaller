@@ -774,7 +774,7 @@ bool VerifyPackageManifest(HWND hwnd, const modlist::Manifest& manifest) {
   PostLog(hwnd, L"Manifest validation workers: 1 (sequential HDD-friendly read)");
 
   auto worker = [&]() {
-    std::vector<uint8_t> buffer(16 * 1024 * 1024);
+    std::vector<uint8_t> buffer(4 * 1024 * 1024);
     while (!g_stopRequested.load() && !failed.load()) {
       modlist::ManifestFile expected;
       {

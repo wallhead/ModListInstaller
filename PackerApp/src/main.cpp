@@ -527,7 +527,7 @@ bool HashArchiveFile(HWND hwnd,
     return BCryptCreateHash(BCRYPT_SHA256_ALG_HANDLE, &chunkHash, nullptr, 0, nullptr, 0, 0) == 0;
   };
 
-  std::vector<char> buffer(static_cast<size_t>(std::min<uint64_t>(chunkSize, 16ull * 1024ull * 1024ull)));
+  std::vector<char> buffer(static_cast<size_t>(std::min<uint64_t>(chunkSize, 4ull * 1024ull * 1024ull)));
   uint64_t chunkDone = 0;
   while (input && !g_cancelRequested) {
     input.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
