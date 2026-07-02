@@ -3,12 +3,15 @@
 #include "app/PackageDiscovery.h"
 #include "extractor/SevenZipExtractor.h"
 #include "manifest/Manifest.h"
+#include "manifest/Json.h"
 #include "paths/PathValidator.h"
 #include "resource.h"
+#include "ui/WebViewHost.h"
 #include "verifier/Sha256.h"
 
 #include <windows.h>
 #include <commctrl.h>
+#include <shellapi.h>
 #include <shlobj.h>
 #include <winioctl.h>
 
@@ -29,6 +32,7 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -78,6 +82,11 @@ HWND g_statusLabel = nullptr;
 HWND g_previousButton = nullptr;
 HWND g_nextButton = nullptr;
 HWND g_hotButton = nullptr;
+std::unique_ptr<modlist::WebViewHost> g_webView;
+std::vector<std::wstring> g_uiLogLines;
+std::wstring g_statusText = L"Idle | Ready for local validation";
+int g_progressPercent = 0;
+bool g_webUiVisible = false;
 WizardPage g_page = WizardPage::Welcome;
 HBRUSH g_contentBrush = nullptr;
 HBRUSH g_headerBrush = nullptr;
@@ -135,6 +144,64 @@ std::string Narrow(const std::wstring& text) {
   WideCharToMultiByte(CP_UTF8, 0, text.data(), static_cast<int>(text.size()), narrow.data(), size, nullptr, nullptr);
   return narrow;
 }
+
+std::wstring JsonEscape(const std::wstring& text) {
+  std::wostringstream out;
+  for (const wchar_t ch : text) {
+    switch (ch) {
+      case L'\\':
+        out << L"\\\\";
+        break;
+      case L'"':
+        out << L"\\\"";
+        break;
+      case L'\b':
+        out << L"\\b";
+        break;
+      case L'\f':
+        out << L"\\f";
+        break;
+      case L'\n':
+        out << L"\\n";
+        break;
+      case L'\r':
+        out << L"\\r";
+        break;
+      case L'\t':
+        out << L"\\t";
+        break;
+      default:
+        if (ch < 0x20) {
+          out << L"\\u" << std::hex << std::setw(4) << std::setfill(L'0') << static_cast<int>(ch)
+              << std::dec << std::setfill(L' ');
+        } else {
+          out << ch;
+        }
+        break;
+    }
+  }
+  return out.str();
+}
+
+std::wstring JsonString(const std::wstring& text) {
+  return L"\"" + JsonEscape(text) + L"\"";
+}
+
+void PostUiJson(const std::wstring& json) {
+  if (g_webView != nullptr && g_webView->IsReady()) {
+    g_webView->PostJson(json);
+  }
+}
+
+void SendUiProgress(int percent, const std::wstring& status);
+void SendUiStatus(const std::wstring& status);
+void SendUiLog(const std::wstring& message);
+void SendUiStep(const std::wstring& stepName);
+void SendUiPath(const std::wstring& fieldName, const std::wstring& path);
+void SendUiOption(const std::wstring& optionName, bool value);
+void SendUiError(const std::wstring& title, const std::wstring& message);
+void SendUiButtonEnabled(const std::wstring& buttonName, bool enabled);
+void SendUiState();
 
 void SetDwmColorAttribute(HWND hwnd, DWORD attribute, COLORREF color) {
   HMODULE dwm = LoadLibraryW(L"dwmapi.dll");
@@ -209,7 +276,7 @@ std::string Timestamp() {
 }
 
 std::filesystem::path AppLogPath() {
-  const auto logFolder = ModuleFolder() / "logs";
+  const auto logFolder = ModuleFolder() / "data" / "logs";
   std::error_code ec;
   std::filesystem::create_directories(logFolder, ec);
   return logFolder / "modlist-installer.log";
@@ -246,10 +313,15 @@ void SetText(HWND hwnd, const std::wstring& text) {
 
 void AppendLog(const std::wstring& text) {
   AppendAppLog(text);
+  g_uiLogLines.push_back(text);
+  if (g_uiLogLines.size() > 300) {
+    g_uiLogLines.erase(g_uiLogLines.begin(), g_uiLogLines.begin() + static_cast<std::ptrdiff_t>(g_uiLogLines.size() - 300));
+  }
   const int length = GetWindowTextLengthW(g_logEdit);
   SendMessageW(g_logEdit, EM_SETSEL, length, length);
   std::wstring line = text + L"\r\n";
   SendMessageW(g_logEdit, EM_REPLACESEL, FALSE, reinterpret_cast<LPARAM>(line.c_str()));
+  SendUiLog(text);
 }
 
 void PostLog(HWND hwnd, std::wstring text) {
@@ -280,8 +352,12 @@ std::filesystem::path ArchiveFolder() {
   return ExeFolder();
 }
 
+std::filesystem::path DataFolder() {
+  return ExeFolder() / "data";
+}
+
 std::filesystem::path PackageFolder() {
-  return ExeFolder() / "package";
+  return DataFolder() / "package";
 }
 
 std::filesystem::path ManifestPath() {
@@ -297,7 +373,9 @@ void WriteLastSevenZipLog(const std::string& output) {
   if (output.empty()) {
     return;
   }
-  std::ofstream log(ExeFolder() / "last-7z-output.log", std::ios::binary);
+  std::error_code ec;
+  std::filesystem::create_directories(DataFolder(), ec);
+  std::ofstream log(DataFolder() / "last-7z-output.log", std::ios::binary);
   if (log) {
     log << output;
   }
@@ -370,8 +448,10 @@ void UpdateUnpackTargetLabel() {
   const auto folder = SelectedUnpackFolder();
   if (folder.empty()) {
     SetText(g_unpackTargetLabel, L"Target: choose a drive");
+    SendUiPath(L"unpackTarget", L"Target: choose a drive");
   } else {
     SetText(g_unpackTargetLabel, L"Target: " + folder.wstring());
+    SendUiPath(L"unpackTarget", L"Target: " + folder.wstring());
   }
 }
 
@@ -612,6 +692,31 @@ void ShowControl(HWND parent, int id, bool visible) {
   ShowControl(GetDlgItem(parent, id), visible);
 }
 
+void HideNativeControls(HWND hwnd) {
+  ShowControl(g_stepLabel, false);
+  ShowControl(g_welcomeTitle, false);
+  ShowControl(g_welcomeBody, false);
+  ShowControl(g_downloadLabel, false);
+  ShowControl(g_unpackDriveLabel, false);
+  ShowControl(g_unpackTargetLabel, false);
+  ShowControl(g_installLabel, false);
+  ShowControl(g_downloadEdit, false);
+  ShowControl(g_unpackDriveCombo, false);
+  ShowControl(g_installEdit, false);
+  ShowControl(g_logEdit, false);
+  ShowControl(g_progress, false);
+  ShowControl(g_statusLabel, false);
+  ShowControl(g_previousButton, false);
+  ShowControl(g_nextButton, false);
+  ShowControl(hwnd, kDownloadBrowse, false);
+  ShowControl(hwnd, kInstallBrowse, false);
+  ShowControl(hwnd, kValidateButton, false);
+  ShowControl(hwnd, kStartButton, false);
+  ShowControl(hwnd, kUnpackButton, false);
+  ShowControl(hwnd, kPauseButton, false);
+  ShowControl(hwnd, kStopButton, false);
+}
+
 std::wstring WizardPageTitle(WizardPage page) {
   switch (page) {
     case WizardPage::Welcome:
@@ -622,6 +727,134 @@ std::wstring WizardPageTitle(WizardPage page) {
       return L"Step 3 of 3 - Validation and install";
   }
   return L"Modlist Installer";
+}
+
+std::wstring UiStepForPage(WizardPage page) {
+  switch (page) {
+    case WizardPage::Welcome:
+      return L"Welcome";
+    case WizardPage::Folders:
+      return L"Install Path";
+    case WizardPage::Activity:
+      return g_workerRunning.load() ? L"Install" : L"Verify Files";
+  }
+  return L"Welcome";
+}
+
+std::vector<std::wstring> AvailableDrives() {
+  std::vector<std::wstring> drives;
+  wchar_t buffer[512]{};
+  const DWORD length = GetLogicalDriveStringsW(static_cast<DWORD>(std::size(buffer)), buffer);
+  for (const wchar_t* drive = buffer; length > 0 && *drive != L'\0'; drive += wcslen(drive) + 1) {
+    const UINT type = GetDriveTypeW(drive);
+    if (type == DRIVE_FIXED || type == DRIVE_REMOVABLE) {
+      drives.emplace_back(drive);
+    }
+  }
+  return drives;
+}
+
+std::wstring JsonArray(const std::vector<std::wstring>& values) {
+  std::wostringstream out;
+  out << L"[";
+  for (size_t i = 0; i < values.size(); ++i) {
+    if (i > 0) {
+      out << L",";
+    }
+    out << JsonString(values[i]);
+  }
+  out << L"]";
+  return out.str();
+}
+
+bool IsWindowEnabledSafe(HWND hwnd) {
+  return hwnd != nullptr && IsWindowEnabled(hwnd) != FALSE;
+}
+
+void SendUiProgress(int percent, const std::wstring& status) {
+  g_progressPercent = std::clamp(percent, 0, 100);
+  if (!status.empty()) {
+    g_statusText = status;
+  }
+  PostUiJson(L"{\"type\":\"progress\",\"percent\":" + std::to_wstring(g_progressPercent) +
+             L",\"status\":" + JsonString(g_statusText) + L"}");
+}
+
+void SendUiStatus(const std::wstring& status) {
+  g_statusText = status;
+  PostUiJson(L"{\"type\":\"status\",\"status\":" + JsonString(status) + L"}");
+}
+
+void SendUiLog(const std::wstring& message) {
+  PostUiJson(L"{\"type\":\"log\",\"message\":" + JsonString(message) + L"}");
+}
+
+void SendUiStep(const std::wstring& stepName) {
+  PostUiJson(L"{\"type\":\"step\",\"step\":" + JsonString(stepName) + L"}");
+}
+
+void SendUiPath(const std::wstring& fieldName, const std::wstring& path) {
+  PostUiJson(L"{\"type\":\"path\",\"name\":" + JsonString(fieldName) +
+             L",\"value\":" + JsonString(path) + L"}");
+}
+
+void SendUiOption(const std::wstring& optionName, bool value) {
+  PostUiJson(L"{\"type\":\"option\",\"name\":" + JsonString(optionName) +
+             L",\"value\":" + (value ? L"true" : L"false") + L"}");
+}
+
+void SendUiError(const std::wstring& title, const std::wstring& message) {
+  PostUiJson(L"{\"type\":\"error\",\"title\":" + JsonString(title) +
+             L",\"message\":" + JsonString(message) + L"}");
+}
+
+void SendUiButtonEnabled(const std::wstring& buttonName, bool enabled) {
+  PostUiJson(L"{\"type\":\"button\",\"name\":" + JsonString(buttonName) +
+             L",\"enabled\":" + (enabled ? L"true" : L"false") + L"}");
+}
+
+void SendUiState() {
+  if (g_webView == nullptr || !g_webView->IsReady()) {
+    return;
+  }
+
+  const bool running = g_workerRunning.load();
+  const auto unpackFolder = SelectedUnpackFolder();
+  const std::wstring unpackTarget =
+      unpackFolder.empty() ? L"Target: choose a drive" : L"Target: " + unpackFolder.wstring();
+  HWND parent = g_progress != nullptr ? GetParent(g_progress) : nullptr;
+
+  std::wostringstream logs;
+  logs << L"[";
+  for (size_t i = 0; i < g_uiLogLines.size(); ++i) {
+    if (i > 0) {
+      logs << L",";
+    }
+    logs << JsonString(g_uiLogLines[i]);
+  }
+  logs << L"]";
+
+  std::wostringstream out;
+  out << L"{\"type\":\"state\",\"state\":{"
+      << L"\"step\":" << JsonString(UiStepForPage(g_page)) << L","
+      << L"\"installFolder\":" << JsonString(GetText(g_installEdit)) << L","
+      << L"\"unpackDrive\":" << JsonString(ComboText(g_unpackDriveCombo)) << L","
+      << L"\"unpackTarget\":" << JsonString(unpackTarget) << L","
+      << L"\"drives\":" << JsonArray(AvailableDrives()) << L","
+      << L"\"progress\":" << g_progressPercent << L","
+      << L"\"status\":" << JsonString(g_statusText) << L","
+      << L"\"logs\":" << logs.str() << L","
+      << L"\"version\":\"Modlist Installer 0.1.0\","
+      << L"\"options\":{},"
+      << L"\"buttons\":{"
+      << L"\"back\":false,"
+      << L"\"next\":false,"
+      << L"\"start\":" << (!running ? L"true" : L"false") << L","
+      << L"\"cancel\":" << (running ? L"true" : L"false") << L","
+      << L"\"browseInstall\":" << (IsWindowEnabledSafe(GetDlgItem(parent, kInstallBrowse)) ? L"true" : L"false")
+      << L"}}}";
+
+  PostUiJson(out.str());
 }
 
 void Layout(HWND hwnd) {
@@ -668,6 +901,10 @@ void Layout(HWND hwnd) {
 
   MoveWindow(g_previousButton, width - 228, navY, 100, 30, TRUE);
   MoveWindow(g_nextButton, width - 116, navY, 100, 30, TRUE);
+
+  if (g_webView != nullptr) {
+    g_webView->Resize();
+  }
 }
 
 std::wstring FormatBytes(uintmax_t bytes);
@@ -1096,14 +1333,26 @@ void ShowWizardPage(HWND hwnd, WizardPage page) {
   EnableWindow(g_previousButton, page != WizardPage::Welcome && !running);
   EnableWindow(g_nextButton, page != WizardPage::Activity && !running);
 
-  EnableWindow(GetDlgItem(hwnd, kDownloadBrowse), false);
+  EnableWindow(GetDlgItem(hwnd, kDownloadBrowse), !running);
   EnableWindow(g_unpackDriveCombo, folders && !running);
-  EnableWindow(GetDlgItem(hwnd, kInstallBrowse), folders && !running);
+  EnableWindow(GetDlgItem(hwnd, kInstallBrowse), !running);
   EnableWindow(GetDlgItem(hwnd, kValidateButton), activity && !running);
   EnableWindow(GetDlgItem(hwnd, kStartButton), activity && !running);
   EnableWindow(GetDlgItem(hwnd, kUnpackButton), false);
   EnableWindow(GetDlgItem(hwnd, kPauseButton), false);
   EnableWindow(GetDlgItem(hwnd, kStopButton), activity && running);
+
+  if (g_webUiVisible) {
+    HideNativeControls(hwnd);
+  }
+
+  SendUiStep(UiStepForPage(page));
+  SendUiButtonEnabled(L"back", false);
+  SendUiButtonEnabled(L"next", false);
+  SendUiButtonEnabled(L"start", !running);
+  SendUiButtonEnabled(L"cancel", activity && running);
+  SendUiButtonEnabled(L"browseInstall", !running);
+  SendUiState();
 }
 
 void GoToPreviousPage(HWND hwnd) {
@@ -1557,7 +1806,7 @@ void RunInstallWorker(HWND hwnd,
     PostLog(hwnd, manifestMessage);
   }
   if (!manifest.has_value()) {
-    PostLog(hwnd, L"package\\manifest.json is required.");
+    PostLog(hwnd, L"data\\package\\manifest.json is required.");
     PostValidationFailed(hwnd);
     FinishWorker(hwnd);
     return;
@@ -1654,6 +1903,7 @@ bool ValidateFolders(uintmax_t knownRequiredBytes = 0) {
 
 void ValidatePackage() {
   SendMessageW(g_progress, PBM_SETPOS, 0, 0);
+  SendUiProgress(0, g_statusText);
   AppendLog(L"Validating package...");
   auto package = ReadPackageFromUi();
   if (!package.ok()) {
@@ -1686,6 +1936,7 @@ void ValidatePackage() {
     AppendLog(L"7-Zip warning: " + Widen(sevenZip.error()));
   }
   SendMessageW(g_progress, PBM_SETPOS, 100, 0);
+  SendUiProgress(100, g_statusText);
 }
 
 void SetControlsRunning(HWND hwnd, bool running) {
@@ -1812,6 +2063,125 @@ void UnpackOnly(HWND hwnd) {
   std::thread(RunUnpackWorker, hwnd, *archive, unpackFolder).detach();
 }
 
+const modlist::JsonValue* RequireField(const modlist::JsonValue& object, const std::string& name) {
+  const auto* field = object.Find(name);
+  return field;
+}
+
+std::optional<std::wstring> JsonFieldString(const modlist::JsonValue& object, const std::string& name) {
+  const auto* field = RequireField(object, name);
+  if (field == nullptr || !field->IsString()) {
+    return std::nullopt;
+  }
+  return Widen(field->AsString());
+}
+
+std::optional<bool> JsonFieldBool(const modlist::JsonValue& object, const std::string& name) {
+  const auto* field = RequireField(object, name);
+  if (field == nullptr || !field->IsBool()) {
+    return std::nullopt;
+  }
+  return field->AsBool();
+}
+
+bool IsReasonableUiPath(const std::wstring& path) {
+  if (path.size() > 32767) {
+    return false;
+  }
+  return std::none_of(path.begin(), path.end(), [](wchar_t ch) {
+    return ch != L'\t' && ch != L'\r' && ch != L'\n' && ch < 0x20;
+  });
+}
+
+void SelectUnpackDrive(const std::wstring& drive) {
+  const int count = static_cast<int>(SendMessageW(g_unpackDriveCombo, CB_GETCOUNT, 0, 0));
+  for (int i = 0; i < count; ++i) {
+    const int length = static_cast<int>(SendMessageW(g_unpackDriveCombo, CB_GETLBTEXTLEN, static_cast<WPARAM>(i), 0));
+    if (length <= 0) {
+      continue;
+    }
+    std::wstring item(static_cast<size_t>(length) + 1, L'\0');
+    SendMessageW(g_unpackDriveCombo, CB_GETLBTEXT, static_cast<WPARAM>(i), reinterpret_cast<LPARAM>(item.data()));
+    item.resize(static_cast<size_t>(length));
+    if (_wcsicmp(item.c_str(), drive.c_str()) == 0) {
+      SendMessageW(g_unpackDriveCombo, CB_SETCURSEL, static_cast<WPARAM>(i), 0);
+      UpdateUnpackTargetLabel();
+      SendUiPath(L"unpackDrive", item);
+      return;
+    }
+  }
+  SendUiError(L"Invalid drive", L"The selected unpack drive is not available.");
+}
+
+void OpenLogFile() {
+  const auto path = AppLogPath();
+  ShellExecuteW(nullptr, L"open", path.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+}
+
+void HandleUiCommand(HWND hwnd, const std::wstring& rawJson) {
+  auto parsed = modlist::ParseJson(Narrow(rawJson));
+  if (!parsed.ok() || !parsed.value().IsObject()) {
+    SendUiError(L"Bridge message rejected", L"Malformed JSON command.");
+    return;
+  }
+
+  const auto command = JsonFieldString(parsed.value(), "command");
+  if (!command.has_value() || command->empty()) {
+    SendUiError(L"Bridge message rejected", L"Missing command name.");
+    return;
+  }
+
+  if (*command == L"uiReady") {
+    SendUiState();
+  } else if (*command == L"browseDownloadFolder") {
+    SendUiError(L"Package folder is automatic",
+                L"The installer reads data\\package\\manifest.json beside the executable.");
+  } else if (*command == L"browseInstallFolder") {
+    if (auto path = PickFolder(hwnd)) {
+      SetText(g_installEdit, path->wstring());
+      SendUiPath(L"installFolder", path->wstring());
+      SendUiState();
+    }
+  } else if (*command == L"setPath") {
+    const auto name = JsonFieldString(parsed.value(), "name");
+    const auto value = JsonFieldString(parsed.value(), "value");
+    if (!name.has_value() || !value.has_value() || !IsReasonableUiPath(*value)) {
+      SendUiError(L"Path rejected", L"The path update was malformed.");
+      return;
+    }
+    if (*name == L"downloadFolder") {
+      SendUiError(L"Package folder is automatic",
+                  L"The installer reads data\\package\\manifest.json beside the executable.");
+    } else if (*name == L"installFolder") {
+      SetText(g_installEdit, *value);
+      SendUiPath(L"installFolder", *value);
+    } else if (*name == L"unpackDrive") {
+      SelectUnpackDrive(*value);
+    } else {
+      SendUiError(L"Path rejected", L"Unknown path field.");
+    }
+    SendUiState();
+  } else if (*command == L"setOption") {
+    SendUiError(L"Option rejected", L"Installer defaults cannot be changed.");
+    SendUiState();
+  } else if (*command == L"startInstall") {
+    StartInstall(hwnd);
+  } else if (*command == L"cancelInstall") {
+    StopInstall();
+    SendUiState();
+  } else if (*command == L"nextStep") {
+    GoToNextPage(hwnd);
+  } else if (*command == L"previousStep") {
+    GoToPreviousPage(hwnd);
+  } else if (*command == L"openLog") {
+    OpenLogFile();
+  } else if (*command == L"closeWindow") {
+    SendMessageW(hwnd, WM_CLOSE, 0, 0);
+  } else {
+    SendUiError(L"Bridge command rejected", L"Unknown command: " + *command);
+  }
+}
+
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
   switch (message) {
     case WM_CREATE: {
@@ -1819,9 +2189,9 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
       controls.dwSize = sizeof(controls);
       controls.dwICC = ICC_PROGRESS_CLASS;
       InitCommonControlsEx(&controls);
-      std::filesystem::create_directories(ExeFolder() / "logs");
+      std::filesystem::create_directories(DataFolder() / "logs");
       std::filesystem::create_directories(PackageFolder());
-      std::filesystem::create_directories(ExeFolder() / "tools" / "7zip");
+      std::filesystem::create_directories(DataFolder() / "tools" / "7zip");
       ApplyWindowFrameTheme(hwnd);
       g_contentBrush = CreateSolidBrush(kContentColor);
       g_headerBrush = CreateSolidBrush(kHeaderColor);
@@ -1891,8 +2261,8 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
       PopulateDriveCombo();
       SetText(g_installEdit, L"");
       AppendLog(L"App log: " + PathToDisplay(AppLogPath()));
-      AppendLog(L"Place manifest.json in: " + PathToDisplay(PackageFolder()));
-      AppendLog(L"Place all archive parts beside this exe: " + PathToDisplay(ArchiveFolder()));
+      AppendLog(L"Manifest auto-detected at: " + PathToDisplay(ManifestPath()));
+      AppendLog(L"Archive parts are detected beside this exe: " + PathToDisplay(ArchiveFolder()));
       std::wstring manifestMessage;
       auto manifest = LoadPackageManifest(manifestMessage);
       AppendLog(manifestMessage);
@@ -1908,6 +2278,34 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
       AppendLog(L"Choose an unpack drive; the unpack folder will be created as <drive>:\\Sky.");
       Layout(hwnd);
       ShowWizardPage(hwnd, WizardPage::Welcome);
+
+      const auto uiPath = ExeFolder() / "ui" / "index.html";
+      if (!std::filesystem::exists(uiPath)) {
+        MessageBoxW(hwnd,
+                    L"Local UI files were not found. Expected ui\\index.html beside the installer executable.",
+                    L"Installer UI missing",
+                    MB_OK | MB_ICONWARNING);
+      } else {
+        g_webView = std::make_unique<modlist::WebViewHost>();
+        g_webView->Initialize(
+            hwnd,
+            uiPath,
+            [hwnd](const std::wstring& message) {
+              HandleUiCommand(hwnd, message);
+            },
+            [hwnd]() {
+              g_webUiVisible = true;
+              HideNativeControls(hwnd);
+              SendUiState();
+            },
+            [hwnd](HRESULT) {
+              MessageBoxW(hwnd,
+                          L"Microsoft Edge WebView2 Runtime is required to show the CSS installer UI. "
+                          L"The native fallback controls will remain available.",
+                          L"WebView2 Runtime required",
+                          MB_OK | MB_ICONERROR);
+            });
+      }
       return 0;
     }
     case WM_ERASEBKGND:
@@ -1965,11 +2363,20 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
       Layout(hwnd);
       InvalidateRect(hwnd, nullptr, TRUE);
       return 0;
+    case WM_GETMINMAXINFO: {
+      auto* info = reinterpret_cast<MINMAXINFO*>(lParam);
+      info->ptMinTrackSize.x = 760;
+      info->ptMinTrackSize.y = 560;
+      return 0;
+    }
     case WM_COMMAND: {
       const int id = LOWORD(wParam);
-      if (id == kInstallBrowse) {
+      if (id == kDownloadBrowse) {
+        AppendLog(L"Package folder selection is disabled; manifest is loaded beside the executable.");
+      } else if (id == kInstallBrowse) {
         if (auto path = PickFolder(hwnd)) {
           SetText(g_installEdit, path->wstring());
+          SendUiPath(L"installFolder", path->wstring());
         }
       } else if (id == kUnpackDriveCombo && HIWORD(wParam) == CBN_SELCHANGE) {
         UpdateUnpackTargetLabel();
@@ -1988,6 +2395,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
       } else if (id == kNextButton) {
         GoToNextPage(hwnd);
       }
+      SendUiState();
       return 0;
     }
     case kLogMessage: {
@@ -1997,17 +2405,21 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
     }
     case kProgressMessage:
       SendMessageW(g_progress, PBM_SETPOS, static_cast<int>(wParam), 0);
+      SendUiProgress(static_cast<int>(wParam), g_statusText);
       return 0;
     case kStatusMessage: {
       std::unique_ptr<std::wstring> text(reinterpret_cast<std::wstring*>(lParam));
       SetWindowTextW(g_statusLabel, text->c_str());
+      SendUiStatus(*text);
       return 0;
     }
     case kValidationFailedMessage:
+      SendUiError(L"Validation failed", L"Package validation failed. Rebuild the package.");
       MessageBoxW(hwnd, L"Package validation failed. Rebuild the package.", L"Validation failed", MB_OK | MB_ICONERROR);
       return 0;
     case kWorkerFinishedMessage:
       SetControlsRunning(hwnd, false);
+      SendUiState();
       if (g_closeAfterWorker) {
         DestroyWindow(hwnd);
       }
@@ -2032,6 +2444,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
       DeleteObject(g_titleFont);
       DeleteObject(g_bodyFont);
       DeleteObject(g_labelFont);
+      g_webView.reset();
       PostQuitMessage(0);
       return 0;
     default:
@@ -2057,7 +2470,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
 
   HWND hwnd = CreateWindowExW(0, className, L"Modlist Installer",
                               WS_OVERLAPPEDWINDOW,
-                              CW_USEDEFAULT, CW_USEDEFAULT, 860, 520,
+                              CW_USEDEFAULT, CW_USEDEFAULT, 920, 660,
                               nullptr, nullptr, instance, nullptr);
   if (hwnd == nullptr) {
     OleUninitialize();

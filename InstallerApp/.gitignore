@@ -10,7 +10,11 @@ out/
 *.ilk
 *.exe
 !dist/modlist-installer.exe
-!dist/tools/7zip/7z.exe
+dist/data/logs/
+dist/data/downloads/
+dist/data/tools/
 *.dll
 *.lib
 *.exp
+dist/ui/
+third_party/webview2/

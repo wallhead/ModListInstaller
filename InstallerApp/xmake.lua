@@ -36,6 +36,19 @@ local function add_vcpkg_libtorrent()
     end
 end
 
+local function add_webview2_sdk()
+    local sdk = path.join(os.projectdir(), "third_party", "webview2", "Microsoft.Web.WebView2")
+    add_includedirs(path.join(sdk, "build", "native", "include"))
+    if is_arch("x86") then
+        add_linkdirs(path.join(sdk, "build", "native", "x86"))
+    elseif is_arch("arm64") then
+        add_linkdirs(path.join(sdk, "build", "native", "arm64"))
+    else
+        add_linkdirs(path.join(sdk, "build", "native", "x64"))
+    end
+    add_links("WebView2LoaderStatic")
+end
+
 target("installer_core")
     set_kind("static")
     add_includedirs("src", "resources", {public = true})
@@ -79,13 +92,17 @@ target("modlist-installer-gui")
     end
     set_rundir("$(projectdir)")
     add_includedirs("resources")
-    add_files("src/ui/WinInstallerApp.cpp")
+    add_files("src/ui/WinInstallerApp.cpp", "src/ui/WebViewHost.cpp")
     add_deps("installer_core")
+    add_webview2_sdk()
     if is_plat("windows") then
         add_files("resources/app.rc")
-        add_syslinks("user32", "gdi32", "comdlg32", "shell32", "ole32", "comctl32")
+        add_syslinks("user32", "gdi32", "comdlg32", "shell32", "ole32", "oleaut32", "comctl32", "shlwapi", "advapi32")
         add_ldflags("/SUBSYSTEM:WINDOWS", {tools = "link"})
     end
+    after_build(function (target)
+        os.cp("ui", target:targetdir())
+    end)
 target_end()
 
 target("installer_core_tests")

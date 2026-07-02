@@ -52,21 +52,7 @@ std::filesystem::path ModuleFolder() {
 }
 
 std::filesystem::path LocalToolCacheFolder(const std::filesystem::path& appRoot) {
-  std::wstring localAppData(MAX_PATH, L'\0');
-  const DWORD localAppDataSize = GetEnvironmentVariableW(
-      L"LOCALAPPDATA", localAppData.data(), static_cast<DWORD>(localAppData.size()));
-  if (localAppDataSize > 0 && localAppDataSize < localAppData.size()) {
-    localAppData.resize(localAppDataSize);
-    return std::filesystem::path(localAppData) / "ModlistInstaller" / "tools" / "7zip";
-  }
-
-  std::error_code ec;
-  auto temp = std::filesystem::temp_directory_path(ec);
-  if (!ec) {
-    return temp / "ModlistInstaller" / "tools" / "7zip";
-  }
-
-  return appRoot / "tools" / "7zip";
+  return appRoot / "data" / "tools" / "7zip";
 }
 
 Result<std::filesystem::path> ExtractEmbeddedSevenZip(const std::filesystem::path& appRoot) {
@@ -114,7 +100,7 @@ Result<std::filesystem::path> ExtractEmbeddedSevenZip(const std::filesystem::pat
 std::filesystem::path MakeOutputCapturePath(const std::filesystem::path& sevenZipExe) {
   const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
   (void)sevenZipExe;
-  auto logFolder = ModuleFolder() / "logs";
+  auto logFolder = ModuleFolder() / "data" / "logs";
   std::error_code ec;
   std::filesystem::create_directories(logFolder, ec);
   if (ec) {
@@ -355,7 +341,10 @@ Result<std::filesystem::path> SevenZipExtractor::LocateExecutable(const std::fil
     return embedded;
   }
 
-  const std::array<std::filesystem::path, 9> candidates = {
+  const std::array<std::filesystem::path, 12> candidates = {
+      appRoot / "data" / "tools" / "7zip" / "7z.exe",
+      appRoot / "data" / "tools" / "7zip" / "7za.exe",
+      appRoot / "data" / "tools" / "7zip" / "7zz.exe",
       appRoot / "tools" / "7zip" / "7z.exe",
       appRoot / "tools" / "7zip" / "7za.exe",
       appRoot / "tools" / "7zip" / "7zz.exe",

@@ -1,12 +1,12 @@
 InstallerApp/.xmake/
 InstallerApp/build/
-InstallerApp/dist/logs/
-InstallerApp/dist/last-7z-output.log
+InstallerApp/dist/data/logs/
+InstallerApp/dist/data/last-7z-output.log
 InstallerApp/dist/Cyber_TEST/
 InstallerApp/CSS.txt
 InstallerApp/dist/*.torrent
-InstallerApp/dist/package/*.torrent
-InstallerApp/dist/downloads/
+InstallerApp/dist/data/package/*.torrent
+InstallerApp/dist/data/downloads/
 InstallerApp/dist/modlist-installer-updated.exe
 PackerApp/.xmake/
 PackerApp/build/
