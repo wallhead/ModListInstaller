@@ -90,6 +90,30 @@ cd InstallerApp
 
 The script restores the WebView2 SDK if needed, configures xmake for release, runs tests, copies local UI assets, and copies the GUI exe into `dist\modlist-installer.exe`.
 
+## Change CSS
+
+Edit the source stylesheet:
+
+```text
+InstallerApp\ui\style.css
+```
+
+For a quick local test without rebuilding the exe, copy the UI folder into `dist`:
+
+```powershell
+Copy-Item -Recurse -Force .\ui .\dist\
+```
+
+Then restart `dist\modlist-installer.exe`.
+
+For release builds, use:
+
+```powershell
+.\scripts\build-release.ps1
+```
+
+The release script copies `ui` into `dist\ui`. Treat edits in `dist\ui` as temporary because the next release build overwrites them.
+
 ## Build With CMake
 
 ```powershell

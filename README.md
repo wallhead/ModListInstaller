@@ -74,6 +74,31 @@ cd InstallerApp
 
 The release script restores the WebView2 SDK package locally under ignored `third_party/webview2`, builds with xmake, runs tests, copies the local UI files, and refreshes the ready exe.
 
+## Change Installer CSS
+
+Edit the source stylesheet:
+
+```text
+InstallerApp/ui/style.css
+```
+
+For a quick local test, copy the edited UI files into the ready installer folder:
+
+```powershell
+Copy-Item -Recurse -Force InstallerApp\ui InstallerApp\dist\
+```
+
+Then restart `InstallerApp\dist\modlist-installer.exe`.
+
+For a release build, run:
+
+```powershell
+cd InstallerApp
+.\scripts\build-release.ps1
+```
+
+The release script copies `InstallerApp\ui` into `InstallerApp\dist\ui`, so changes made only inside `dist\ui` are temporary and can be overwritten by the next build.
+
 ## Repository Layout
 
 ```text
