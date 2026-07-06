@@ -25,4 +25,5 @@ PackerApp/build/
 *.exe
 !InstallerApp/dist/modlist-installer.exe
 !InstallerApp/resources/7z.exe
+!PackerApp/dist/modlist-installer.exe
 !PackerApp/dist/modlist-packer.exe

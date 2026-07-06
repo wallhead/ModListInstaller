@@ -348,16 +348,20 @@ std::filesystem::path ExeFolder() {
   return ModuleFolder();
 }
 
-std::filesystem::path ArchiveFolder() {
-  return ExeFolder();
-}
-
 std::filesystem::path DataFolder() {
   return ExeFolder() / "data";
 }
 
+std::filesystem::path ArchiveFolder() {
+  return DataFolder() / "downloads";
+}
+
 std::filesystem::path PackageFolder() {
   return DataFolder() / "package";
+}
+
+std::filesystem::path UiFolder() {
+  return DataFolder() / "ui";
 }
 
 std::filesystem::path ManifestPath() {
@@ -1851,7 +1855,7 @@ void RunInstallWorker(HWND hwnd,
     firstArchivePart = FindFirstArchivePart(ArchiveFolder());
   }
   if (!firstArchivePart.has_value()) {
-    PostLog(hwnd, L"No archive file found beside the installer. Cannot extract automatically.");
+    PostLog(hwnd, L"No archive file found in data\\downloads. Cannot extract automatically.");
     FinishWorker(hwnd);
     return;
   }
@@ -1942,7 +1946,7 @@ void ValidatePackage() {
   if (package.value().firstArchivePart.has_value()) {
     AppendLog(L"Archive first part: " + PathToDisplay(*package.value().firstArchivePart));
   } else {
-    AppendLog(L"No archive file found beside the installer.");
+    AppendLog(L"No archive file found in data\\downloads.");
   }
 
   std::wstring manifestMessage;
@@ -2087,7 +2091,7 @@ void UnpackOnly(HWND hwnd) {
     }
   }
   if (!archive.has_value()) {
-    AppendLog(L"No archive file found beside the installer.");
+    AppendLog(L"No archive file found in data\\downloads.");
     return;
   }
 
@@ -2226,6 +2230,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
       InitCommonControlsEx(&controls);
       std::filesystem::create_directories(DataFolder() / "logs");
       std::filesystem::create_directories(PackageFolder());
+      std::filesystem::create_directories(ArchiveFolder());
       std::filesystem::create_directories(DataFolder() / "tools" / "7zip");
       ApplyWindowFrameTheme(hwnd);
       g_contentBrush = CreateSolidBrush(kContentColor);
@@ -2297,7 +2302,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
       SetText(g_installEdit, L"");
       AppendLog(L"App log: " + PathToDisplay(AppLogPath()));
       AppendLog(L"Manifest auto-detected at: " + PathToDisplay(ManifestPath()));
-      AppendLog(L"Archive parts are detected beside this exe: " + PathToDisplay(ArchiveFolder()));
+      AppendLog(L"Archive parts are detected in: " + PathToDisplay(ArchiveFolder()));
       std::wstring manifestMessage;
       auto manifest = LoadPackageManifest(manifestMessage);
       AppendLog(manifestMessage);
@@ -2314,10 +2319,10 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
       Layout(hwnd);
       ShowWizardPage(hwnd, WizardPage::Welcome);
 
-      const auto uiPath = ExeFolder() / "ui" / "index.html";
+      const auto uiPath = UiFolder() / "index.html";
       if (!std::filesystem::exists(uiPath)) {
         MessageBoxW(hwnd,
-                    L"Local UI files were not found. Expected ui\\index.html beside the installer executable.",
+                    L"Local UI files were not found. Expected data\\ui\\index.html beside the installer executable.",
                     L"Installer UI missing",
                     MB_OK | MB_ICONWARNING);
       } else {

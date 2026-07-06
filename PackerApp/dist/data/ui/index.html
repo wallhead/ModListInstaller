@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Nordic Modlist Installer</title>
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <main class="installer-shell">
+      <section class="content">
+        <header class="header">
+          <div>
+            <p class="eyebrow" id="stepLabel">Local package installer</p>
+            <h1>Nordic Modlist Installer</h1>
+          </div>
+          <div class="version" id="versionText">Local package mode</div>
+        </header>
+
+        <section class="panel">
+          <div class="welcome" id="welcomePanel">
+            <h2>Prepare a local modlist package</h2>
+            <p>
+              This installer validates the bundled manifest and archive files, extracts them to a short staging
+              folder, and installs the modlist into the selected final folder.
+            </p>
+          </div>
+
+          <div class="form-grid">
+            <label for="unpackDrive">Unpack Drive</label>
+            <div class="field-row compact">
+              <select id="unpackDrive"></select>
+              <span class="target" id="unpackTarget">Target: choose a drive</span>
+            </div>
+
+            <label for="installFolder">Install Folder</label>
+            <div class="field-row">
+              <input id="installFolder" type="text" autocomplete="off" spellcheck="false" />
+              <button type="button" id="browseInstall">Browse</button>
+            </div>
+          </div>
+
+          <div class="progress-wrap">
+            <div class="progress-line">
+              <span id="statusText">Idle | Ready for local validation</span>
+              <strong id="percentText">0%</strong>
+            </div>
+            <div class="progress-bar" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+              <span id="progressFill"></span>
+            </div>
+          </div>
+
+          <textarea id="logOutput" readonly spellcheck="false"></textarea>
+        </section>
+
+        <footer class="footer">
+          <button type="button" id="openLog">Open Log</button>
+          <span id="footerInfo">Waiting for package scan</span>
+          <div class="nav">
+            <button type="button" id="startButton">Install</button>
+            <button type="button" id="cancelButton">Cancel</button>
+          </div>
+        </footer>
+      </section>
+    </main>
+    <script src="app.js"></script>
+  </body>
+</html>

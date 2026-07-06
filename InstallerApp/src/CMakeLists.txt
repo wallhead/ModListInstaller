@@ -48,5 +48,5 @@ if(WIN32)
   add_custom_command(TARGET modlist-installer-gui POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_directory
       "${CMAKE_CURRENT_SOURCE_DIR}/../ui"
-      "$<TARGET_FILE_DIR:modlist-installer-gui>/ui")
+      "$<TARGET_FILE_DIR:modlist-installer-gui>/data/ui")
 endif()

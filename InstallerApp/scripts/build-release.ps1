@@ -15,10 +15,13 @@ try {
   New-Item -ItemType Directory -Path ".\dist\data\downloads" -Force | Out-Null
   New-Item -ItemType Directory -Path ".\dist\data\logs" -Force | Out-Null
   New-Item -ItemType Directory -Path ".\dist\data\tools\7zip" -Force | Out-Null
+  if (Test-Path ".\dist\data\ui") {
+    Remove-Item ".\dist\data\ui" -Recurse -Force
+  }
   if (Test-Path ".\dist\ui") {
     Remove-Item ".\dist\ui" -Recurse -Force
   }
-  Copy-Item ".\ui" ".\dist\ui" -Recurse -Force
+  Copy-Item ".\ui" ".\dist\data\ui" -Recurse -Force
   Copy-Item ".\build\windows\x64\release\modlist-installer-gui.exe" ".\dist\modlist-installer.exe" -Force
 
   if (Test-Path ".\dist\tools") {

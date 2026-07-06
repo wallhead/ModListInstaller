@@ -26,7 +26,7 @@ The GUI executable is built as:
 InstallerApp\build\windows\x64\release\modlist-installer-gui.exe
 ```
 
-Copy it into `dist`, put `manifest.json` in `dist\data\package`, and keep all archive parts beside the exe. The GUI does not use torrent files.
+Copy it into `dist`, put `manifest.json` in `dist\data\package`, keep archive parts in `dist\data\downloads`, and keep UI files in `dist\data\ui`. The GUI does not use torrent files.
 
 The `Install` button runs the install pipeline on a background thread:
 
@@ -36,7 +36,7 @@ The `Install` button runs the install pipeline on a background thread:
 - verify archive file sizes and SHA256 hashes from the manifest
 - show validation progress, speed, ETA, and elapsed time
 - auto-select sequential HDD validation or parallel SSD validation
-- look for the archive named by the manifest beside the exe
+- look for the archive named by the manifest in `data\downloads`
 - check unpack free space again before extraction
 - show live unpack percentage, speed, and ETA in the progress bar and status line
 - show live install percentage, speed, ETA, and elapsed time in the status line
@@ -63,20 +63,20 @@ The runtime layout is:
 ```text
 InstallerApp\dist\
   modlist-installer.exe
-  YourPack.7z.001
-  YourPack.7z.002
   data\
     package\
       manifest.json
     logs\
     downloads\
+      YourPack.7z.001
+      YourPack.7z.002
     tools\
       7zip\
-  ui\
-    index.html
-    style.css
-    app.js
-    assets\
+    ui\
+      index.html
+      style.css
+      app.js
+      assets\
 ```
 
 Do not commit generated logs.
@@ -98,10 +98,11 @@ Edit the source stylesheet:
 InstallerApp\ui\style.css
 ```
 
-For a quick local test without rebuilding the exe, copy the UI folder into `dist`:
+For a quick local test without rebuilding the exe, copy the UI folder into `dist\data\ui`:
 
 ```powershell
-Copy-Item -Recurse -Force .\ui .\dist\
+Remove-Item -Recurse -Force .\dist\data\ui -ErrorAction SilentlyContinue
+Copy-Item -Recurse -Force .\ui .\dist\data\ui
 ```
 
 Then restart `dist\modlist-installer.exe`.
@@ -112,7 +113,7 @@ For release builds, use:
 .\scripts\build-release.ps1
 ```
 
-The release script copies `ui` into `dist\ui`. Treat edits in `dist\ui` as temporary because the next release build overwrites them.
+The release script copies `ui` into `dist\data\ui`. Treat edits in `dist\data\ui` as temporary because the next release build overwrites them.
 
 ## Build With CMake
 
@@ -129,11 +130,17 @@ The GUI package layout is:
 ```text
 MyPack/
   modlist-installer.exe
-  MyPack.7z.001
-  MyPack.7z.002
   data/
     package/
       manifest.json
+    downloads/
+      MyPack.7z.001
+      MyPack.7z.002
+    ui/
+      index.html
+      style.css
+      app.js
+      assets/
 ```
 
 Run from that folder:
@@ -142,4 +149,4 @@ Run from that folder:
 modlist-installer.exe
 ```
 
-The GUI requires `data\package\manifest.json`, uses its archive filename, uses its file sizes for space checks, and verifies SHA256 before extraction. If the manifest is missing, invalid, or the hashes fail, install stops and shows a validation failure message.
+The GUI requires `data\package\manifest.json`, loads UI from `data\ui`, uses archive files from `data\downloads`, uses manifest file sizes for space checks, and verifies SHA256 before extraction. If the manifest is missing, invalid, or the hashes fail, install stops and shows a validation failure message.

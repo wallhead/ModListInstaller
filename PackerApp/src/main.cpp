@@ -440,8 +440,24 @@ std::wstring SevenZipVolumeSize(const std::wstring& value) {
   return value;
 }
 
+std::filesystem::path DataFolder(const PackerConfig& config) {
+  return config.releaseFolder / "data";
+}
+
+std::filesystem::path DownloadsFolder(const PackerConfig& config) {
+  return DataFolder(config) / "downloads";
+}
+
+std::filesystem::path PackageFolder(const PackerConfig& config) {
+  return DataFolder(config) / "package";
+}
+
+std::filesystem::path UiFolder(const PackerConfig& config) {
+  return DataFolder(config) / "ui";
+}
+
 std::filesystem::path ArchivePath(const PackerConfig& config) {
-  return config.releaseFolder / (config.archiveName + SelectArchiveExtension(config));
+  return DownloadsFolder(config) / (config.archiveName + SelectArchiveExtension(config));
 }
 
 bool IsSafeArchiveName(const std::wstring& name) {
@@ -814,11 +830,11 @@ std::optional<ArchiveSet> SelectArchiveSet(HWND hwnd, const PackerConfig& config
     ArchiveSet set;
     set.baseName = config.archiveName + SelectArchiveExtension(config);
     set.archiveName = config.archiveName;
-    set.files = FindArchivePartsForBase(config.releaseFolder, set.baseName);
+    set.files = FindArchivePartsForBase(DownloadsFolder(config), set.baseName);
     return set;
   }
 
-  auto sets = FindArchiveSets(config.releaseFolder);
+  auto sets = FindArchiveSets(DownloadsFolder(config));
   if (sets.empty()) {
     return std::nullopt;
   }
@@ -850,13 +866,13 @@ std::optional<ArchiveSet> SelectArchiveSet(HWND hwnd, const PackerConfig& config
 bool WriteManifest(HWND hwnd, const PackerConfig& config) {
   const auto archiveSet = SelectArchiveSet(hwnd, config);
   if (!archiveSet.has_value()) {
-    PostLog(hwnd, L"No archive parts found in release folder.");
+    PostLog(hwnd, L"No archive parts found in data\\downloads.");
     return false;
   }
 
   const auto& files = archiveSet->files;
   if (files.empty()) {
-    PostLog(hwnd, L"No archive parts found in release folder.");
+    PostLog(hwnd, L"No archive parts found in data\\downloads.");
     return false;
   }
 
@@ -870,7 +886,8 @@ bool WriteManifest(HWND hwnd, const PackerConfig& config) {
   }
 
   PostLog(hwnd, L"Generating manifest for " + std::to_wstring(files.size()) + L" archive file(s).");
-  const size_t workerCount = SelectHashWorkerCount(config.releaseFolder, files.size());
+  const auto downloadsFolder = DownloadsFolder(config);
+  const size_t workerCount = SelectHashWorkerCount(downloadsFolder, files.size());
   PostLog(hwnd, workerCount == 1
                     ? L"Manifest hashing workers: 1 (sequential HDD-friendly read)"
                     : L"Manifest hashing workers: " + std::to_wstring(workerCount) + L" (SSD parallel read)");
@@ -907,7 +924,7 @@ bool WriteManifest(HWND hwnd, const PackerConfig& config) {
 
       PostLog(hwnd, L"Hashing archive file: " + files[index].filename().wstring());
       if (!HashArchiveFile(hwnd,
-                           config.releaseFolder,
+                           downloadsFolder,
                            files[index],
                            config.chunkSize,
                            manifests[index],
@@ -939,7 +956,7 @@ bool WriteManifest(HWND hwnd, const PackerConfig& config) {
   }
 
   std::error_code ec;
-  const auto packageFolder = config.releaseFolder / "data" / "package";
+  const auto packageFolder = PackageFolder(config);
   std::filesystem::create_directories(packageFolder, ec);
   if (ec) {
     PostLog(hwnd, L"Unable to create package folder: " + Widen(ec.message()));
@@ -1120,28 +1137,40 @@ int RunProcess(HWND hwnd, const std::wstring& command, const std::wstring& label
   return static_cast<int>(exitCode);
 }
 
-void CopyInstallerIfRequested(HWND hwnd, const PackerConfig& config) {
-  if (!config.copyInstaller) {
-    return;
-  }
-  const auto installerDist = ModuleFolder().parent_path().parent_path() / "InstallerApp" / "dist";
-  const auto source = installerDist / "modlist-installer.exe";
-  const auto target = config.releaseFolder / "modlist-installer.exe";
+void PrepareInstallerSetup(HWND hwnd, const PackerConfig& config) {
   std::error_code ec;
-  if (std::filesystem::exists(source, ec)) {
+  for (const auto& folder : {PackageFolder(config),
+                            DownloadsFolder(config),
+                            DataFolder(config) / "logs",
+                            DataFolder(config) / "tools" / "7zip"}) {
+    ec.clear();
+    std::filesystem::create_directories(folder, ec);
+    if (ec) {
+      PostLog(hwnd, L"Runtime folder warning: " + folder.wstring() + L" - " + Widen(ec.message()));
+    }
+  }
+
+  const auto packerFolder = ModuleFolder();
+  const auto source = packerFolder / "modlist-installer.exe";
+  const auto target = config.releaseFolder / "modlist-installer.exe";
+  if (config.copyInstaller && std::filesystem::exists(source, ec)) {
     std::filesystem::copy_file(source, target, std::filesystem::copy_options::overwrite_existing, ec);
     if (ec) {
       PostLog(hwnd, L"Installer copy warning: " + Widen(ec.message()));
     } else {
       PostLog(hwnd, L"Installer copied: " + target.wstring());
     }
-  } else {
-    PostLog(hwnd, L"Installer copy warning: installer exe was not found next to the repo.");
+  } else if (config.copyInstaller) {
+    PostLog(hwnd, L"Installer copy warning: modlist-installer.exe was not found beside modlist-packer.exe.");
   }
 
-  const auto sourceUi = installerDist / "ui";
-  const auto targetUi = config.releaseFolder / "ui";
-  if (std::filesystem::exists(sourceUi, ec) && std::filesystem::is_directory(sourceUi, ec)) {
+  auto sourceUi = packerFolder / "data" / "ui";
+  if (!std::filesystem::exists(sourceUi, ec)) {
+    sourceUi = packerFolder / "ui";
+    ec.clear();
+  }
+  const auto targetUi = UiFolder(config);
+  if (config.copyInstaller && std::filesystem::exists(sourceUi, ec) && std::filesystem::is_directory(sourceUi, ec)) {
     std::filesystem::remove_all(targetUi, ec);
     ec.clear();
     std::filesystem::copy(sourceUi, targetUi, std::filesystem::copy_options::recursive, ec);
@@ -1150,19 +1179,8 @@ void CopyInstallerIfRequested(HWND hwnd, const PackerConfig& config) {
     } else {
       PostLog(hwnd, L"Installer UI copied: " + targetUi.wstring());
     }
-  } else {
-    PostLog(hwnd, L"Installer UI copy warning: ui folder was not found next to the installer exe.");
-  }
-
-  for (const auto& folder : {config.releaseFolder / "data" / "package",
-                            config.releaseFolder / "data" / "downloads",
-                            config.releaseFolder / "data" / "logs",
-                            config.releaseFolder / "data" / "tools" / "7zip"}) {
-    ec.clear();
-    std::filesystem::create_directories(folder, ec);
-    if (ec) {
-      PostLog(hwnd, L"Runtime folder warning: " + folder.wstring() + L" - " + Widen(ec.message()));
-    }
+  } else if (config.copyInstaller) {
+    PostLog(hwnd, L"Installer UI copy warning: data\\ui folder was not found next to the installer exe.");
   }
 }
 
@@ -1182,7 +1200,7 @@ PackerConfig ReadConfig(bool archiveFirst) {
   config.parameters = GetText(g_parametersEdit);
   config.pathMode = ComboText(g_pathModeCombo);
   config.chunkSize = ParseSizeText(ComboText(g_chunkCombo), 64ull * 1024ull * 1024ull);
-  config.copyInstaller = SendMessageW(g_copyInstallerCheck, BM_GETCHECK, 0, 0) == BST_CHECKED;
+  config.copyInstaller = true;
   config.testArchive = SendMessageW(g_testArchiveCheck, BM_GETCHECK, 0, 0) == BST_CHECKED;
   config.archiveFirst = archiveFirst;
   return config;
@@ -1197,6 +1215,11 @@ bool ValidateConfig(HWND hwnd, const PackerConfig& config) {
   std::filesystem::create_directories(config.releaseFolder, ec);
   if (ec) {
     PostLog(hwnd, L"Unable to create release folder: " + Widen(ec.message()));
+    return false;
+  }
+  std::filesystem::create_directories(DownloadsFolder(config), ec);
+  if (ec) {
+    PostLog(hwnd, L"Unable to create downloads folder: " + Widen(ec.message()));
     return false;
   }
   if (config.archiveName.empty()) {
@@ -1243,9 +1266,12 @@ void Worker(HWND hwnd, PackerConfig config) {
     return;
   }
 
+  PrepareInstallerSetup(hwnd, config);
+
   bool ok = true;
   if (config.archiveFirst) {
     PostLog(hwnd, L"Creating archive...");
+    PostLog(hwnd, L"Archive output folder: " + DownloadsFolder(config).wstring());
     PostLog(hwnd, L"7-Zip command: " + BuildSevenZipCommand(config));
     const uint64_t sourceBytes = EstimateFolderBytes(config.sourceFolder);
     if (sourceBytes > 0) {
@@ -1263,7 +1289,7 @@ void Worker(HWND hwnd, PackerConfig config) {
       PostLog(hwnd, L"Testing archive...");
       PostStatus(hwnd, L"Testing archive");
       uint64_t archiveBytes = 0;
-      for (const auto& file : FindArchivePartsForBase(config.releaseFolder, config.archiveName + SelectArchiveExtension(config))) {
+      for (const auto& file : FindArchivePartsForBase(DownloadsFolder(config), config.archiveName + SelectArchiveExtension(config))) {
         std::error_code ec;
         archiveBytes += std::filesystem::file_size(file, ec);
         if (ec) {
@@ -1281,7 +1307,6 @@ void Worker(HWND hwnd, PackerConfig config) {
   }
 
   if (ok && !g_cancelRequested) {
-    CopyInstallerIfRequested(hwnd, config);
     ok = WriteManifest(hwnd, config);
   }
 
@@ -1353,7 +1378,7 @@ void SetDefaults(HWND hwnd) {
   for (const wchar_t* item : {L"32m", L"64m", L"128m", L"256m", L"512m", L"1g"}) {
     AddComboItem(g_dictionaryCombo, item);
   }
-  SelectCombo(g_dictionaryCombo, 0);
+  SelectCombo(g_dictionaryCombo, 1);
 
   for (const wchar_t* item : {L"32", L"64", L"128", L"273"}) {
     AddComboItem(g_wordCombo, item);
@@ -1363,7 +1388,7 @@ void SetDefaults(HWND hwnd) {
   for (const wchar_t* item : {L"Solid", L"Non-solid", L"1g", L"4g", L"8g"}) {
     AddComboItem(g_solidCombo, item);
   }
-  SelectCombo(g_solidCombo, 4);
+  SelectCombo(g_solidCombo, 2);
 
   for (const wchar_t* item : {L"none", L"2g", L"4092M - FAT", L"4g", L"8g", L"16g"}) {
     AddComboItem(g_volumeCombo, item);
@@ -1373,7 +1398,7 @@ void SetDefaults(HWND hwnd) {
   for (const wchar_t* item : {L"on", L"2", L"4", L"8", L"16", L"20"}) {
     AddComboItem(g_threadsCombo, item);
   }
-  SelectCombo(g_threadsCombo, 5);
+  SelectCombo(g_threadsCombo, 2);
 
   for (const wchar_t* item : {L"16m", L"64m", L"128m", L"256m"}) {
     AddComboItem(g_chunkCombo, item);
@@ -1386,6 +1411,7 @@ void SetDefaults(HWND hwnd) {
 
   SetText(g_archiveNameEdit, L"MyPack");
   SendMessageW(g_copyInstallerCheck, BM_SETCHECK, BST_CHECKED, 0);
+  EnableWindow(g_copyInstallerCheck, FALSE);
   SendMessageW(g_testArchiveCheck, BM_SETCHECK, BST_CHECKED, 0);
   EnableWindow(GetDlgItem(hwnd, kStopButton), FALSE);
 }

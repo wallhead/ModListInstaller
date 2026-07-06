@@ -101,7 +101,7 @@ target("modlist-installer-gui")
         add_ldflags("/SUBSYSTEM:WINDOWS", {tools = "link"})
     end
     after_build(function (target)
-        os.cp("ui", target:targetdir())
+        os.cp("ui", path.join(target:targetdir(), "data", "ui"))
     end)
 target_end()
 
