@@ -13,6 +13,16 @@ PackerApp/dist/modlist-packer.exe
 
 `modlist-packer.exe` is portable from `PackerApp/dist`: keep `modlist-installer.exe` beside it and `data/ui` beside both. The packer copies that local installer bundle into each release folder.
 
+## Release Package
+
+Ready-to-use versioned release archives are written to:
+
+```text
+Release/ModlistInstaller-v0.1.zip
+```
+
+Extract the zip and run `modlist-packer.exe`. The archive contains the portable packer, the installer exe beside it, and `data/ui` ready for release-folder creation.
+
 ## Installer Runtime Layout
 
 ```text
