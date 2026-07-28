@@ -48,7 +48,7 @@ The `Install` button runs the install pipeline on a background thread:
 
 The GUI is organized as a single WebView2-powered installer screen with unpack drive, final install folder, progress, and log output.
 
-The unpack drive selector asks only for a drive letter. The app derives the unpack target as `<drive>:\Sky`, for example `X:\Sky`.
+The unpack drive selector asks only for a drive letter. The app derives the unpack target as `<drive>:\Unpacked`, for example `X:\Unpacked`.
 
 ## Ready Binary
 

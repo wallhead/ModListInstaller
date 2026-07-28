@@ -35,8 +35,8 @@
     return Math.max(0, Math.min(100, Math.round(numeric)));
   }
 
-  function setStep(stepName) {
-    dom.stepLabel.textContent = stepName ? `Current phase: ${stepName}` : "Local package installer";
+  function setStep() {
+    dom.stepLabel.textContent = "Local package installer";
     if (dom.startButton) {
       dom.startButton.hidden = false;
     }
@@ -46,7 +46,7 @@
     if (fieldName === "installFolder") {
       dom.installFolder.value = value || "";
     } else if (fieldName === "unpackTarget") {
-      dom.unpackTarget.textContent = value || "Target: choose a drive";
+      dom.unpackTarget.textContent = value || "Выберите диск";
     } else if (fieldName === "unpackDrive") {
       dom.unpackDrive.value = value || "";
     }
@@ -89,7 +89,7 @@
   }
 
   function showError(title, message) {
-    addLog(`${title || "Error"}: ${message || ""}`);
+    addLog(`${title || "Ошибка"}: ${message || ""}`);
   }
 
   function applyState(state) {
@@ -104,7 +104,7 @@
         return option;
       }));
     }
-    setStep(state.step || "Welcome");
+    setStep(state.step || "Добро пожаловать");
     setPath("installFolder", state.installFolder);
     setPath("unpackDrive", state.unpackDrive);
     setPath("unpackTarget", state.unpackTarget);

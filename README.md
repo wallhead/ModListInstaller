@@ -18,7 +18,7 @@ PackerApp/dist/modlist-packer.exe
 Ready-to-use versioned release archives are written to:
 
 ```text
-Release/ModlistInstaller-v0.1.zip
+Release/ModlistInstaller-v0.2.zip
 ```
 
 Extract the zip and run `modlist-packer.exe`. The archive contains the portable packer, the installer exe beside it, and `data/ui` ready for release-folder creation.
@@ -54,7 +54,7 @@ The installer looks for `data\package\manifest.json` beside the exe and archive 
 - Single-screen installer UI with unpack drive, final install folder, progress, status, and log output.
 - Manifest SHA256 verification before extraction.
 - Archive discovery in `data\downloads`, using the archive filename from `data\package\manifest.json`.
-- Unpack drive selection automatically resolves to `<drive>:\Sky`.
+- Unpack drive selection automatically resolves to `<drive>:\Unpacked`.
 - Live validation, extraction, and install progress with status text.
 - Same-drive installs use move/cut semantics automatically when possible.
 - Embedded 7-Zip extraction to `data\tools\7zip`.

@@ -1,5 +1,5 @@
 set_project("ModlistInstaller")
-set_version("0.1")
+set_version("0.2")
 
 add_rules("mode.debug", "mode.release")
 set_languages("c++20")
@@ -97,6 +97,7 @@ target("modlist-installer-gui")
     add_webview2_sdk()
     if is_plat("windows") then
         add_files("resources/app.rc")
+        add_cxxflags("/utf-8", {tools = "cl"})
         add_syslinks("user32", "gdi32", "comdlg32", "shell32", "ole32", "oleaut32", "comctl32", "shlwapi", "advapi32")
         add_ldflags("/SUBSYSTEM:WINDOWS", {tools = "link"})
     end

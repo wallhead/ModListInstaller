@@ -37,6 +37,8 @@
 
 namespace {
 
+constexpr const wchar_t* kUnpackFolderName = L"Unpacked";
+
 constexpr int kDownloadEdit = 1003;
 constexpr int kDownloadBrowse = 1004;
 constexpr int kInstallEdit = 1005;
@@ -84,7 +86,7 @@ HWND g_nextButton = nullptr;
 HWND g_hotButton = nullptr;
 std::unique_ptr<modlist::WebViewHost> g_webView;
 std::vector<std::wstring> g_uiLogLines;
-std::wstring g_statusText = L"Idle | Ready for local validation";
+std::wstring g_statusText = L"Ожидание | Ожидание проверки";
 int g_progressPercent = 0;
 bool g_webUiVisible = false;
 WizardPage g_page = WizardPage::Welcome;
@@ -442,7 +444,7 @@ std::filesystem::path SelectedUnpackFolder() {
   if (!drive.ends_with(L"\\")) {
     drive += L"\\";
   }
-  return std::filesystem::path(drive) / "Sky";
+  return std::filesystem::path(drive) / kUnpackFolderName;
 }
 
 void UpdateUnpackTargetLabel() {
@@ -451,11 +453,11 @@ void UpdateUnpackTargetLabel() {
   }
   const auto folder = SelectedUnpackFolder();
   if (folder.empty()) {
-    SetText(g_unpackTargetLabel, L"Target: choose a drive");
-    SendUiPath(L"unpackTarget", L"Target: choose a drive");
+    SetText(g_unpackTargetLabel, L"Выберите диск");
+    SendUiPath(L"unpackTarget", L"Выберите диск");
   } else {
-    SetText(g_unpackTargetLabel, L"Target: " + folder.wstring());
-    SendUiPath(L"unpackTarget", L"Target: " + folder.wstring());
+    SetText(g_unpackTargetLabel, folder.wstring());
+    SendUiPath(L"unpackTarget", folder.wstring());
   }
 }
 
@@ -722,27 +724,20 @@ void HideNativeControls(HWND hwnd) {
 }
 
 std::wstring WizardPageTitle(WizardPage page) {
-  switch (page) {
-    case WizardPage::Welcome:
-      return L"Step 1 of 3 - Welcome";
-    case WizardPage::Folders:
-      return L"Step 2 of 3 - Folders";
-    case WizardPage::Activity:
-      return L"Step 3 of 3 - Validation and install";
-  }
-  return L"Modlist Installer";
+  (void)page;
+  return L"";
 }
 
 std::wstring UiStepForPage(WizardPage page) {
   switch (page) {
     case WizardPage::Welcome:
-      return L"Welcome";
+      return L"Добро пожаловать";
     case WizardPage::Folders:
-      return L"Install Path";
+      return L"Путь установки";
     case WizardPage::Activity:
-      return g_workerRunning.load() ? L"Install" : L"Verify Files";
+      return g_workerRunning.load() ? L"Установка" : L"Проверка файлов";
   }
-  return L"Welcome";
+  return L"Добро пожаловать";
 }
 
 std::vector<std::wstring> AvailableDrives() {
@@ -825,7 +820,7 @@ void SendUiState() {
   const bool running = g_workerRunning.load();
   const auto unpackFolder = SelectedUnpackFolder();
   const std::wstring unpackTarget =
-      unpackFolder.empty() ? L"Target: choose a drive" : L"Target: " + unpackFolder.wstring();
+      unpackFolder.empty() ? L"Выберите диск" : unpackFolder.wstring();
   HWND parent = g_progress != nullptr ? GetParent(g_progress) : nullptr;
 
   std::wostringstream logs;
@@ -848,7 +843,7 @@ void SendUiState() {
       << L"\"progress\":" << g_progressPercent << L","
       << L"\"status\":" << JsonString(g_statusText) << L","
       << L"\"logs\":" << logs.str() << L","
-      << L"\"version\":\"Modlist Installer v0.1\","
+      << L"\"version\":\"Modlist Installer v0.2\","
       << L"\"options\":{},"
       << L"\"buttons\":{"
       << L"\"back\":false,"
@@ -939,18 +934,18 @@ std::optional<modlist::Manifest> LoadPackageManifest(std::wstring& message) {
   std::error_code ec;
   const auto path = ManifestPath();
   if (!std::filesystem::exists(path, ec) || ec) {
-    message = L"No packer manifest found at: " + PathToDisplay(path);
+    message = L"Файл проверки не обнаружен";
     return std::nullopt;
   }
 
   modlist::ManifestLoader loader;
   auto manifest = loader.LoadFromFile(path);
   if (!manifest.ok()) {
-    message = L"Manifest error: " + Widen(manifest.error());
+    message = L"Файл проверки: " + Widen(manifest.error());
     return std::nullopt;
   }
 
-  message = L"Manifest loaded: " + PathToDisplay(path);
+  message = L"Файл проверки загружен: " + PathToDisplay(path);
   return std::move(manifest.value());
 }
 
@@ -971,7 +966,7 @@ std::optional<std::filesystem::path> ArchivePartFromManifest(const modlist::Mani
 
 bool VerifyPackageManifest(HWND hwnd, const modlist::Manifest& manifest) {
   PostStatus(hwnd, L"Verifying manifest SHA-256");
-  PostLog(hwnd, L"Verifying manifest SHA-256 for " + std::to_wstring(manifest.files.size()) + L" archive file(s)...");
+  PostLog(hwnd, L"Проверка SHA-256 для " + std::to_wstring(manifest.files.size()) + L" архива(ов)...");
 
   const uintmax_t totalBytes = ManifestRequiredBytes(manifest);
   std::atomic<uintmax_t> doneBytes{0};
@@ -1006,11 +1001,11 @@ bool VerifyPackageManifest(HWND hwnd, const modlist::Manifest& manifest) {
     }
     PostProgress(hwnd, (percent * 35) / 100);
     PostStatus(hwnd,
-               L"Validating " + std::to_wstring(percent) + L"% | " +
+               L"Проверка " + std::to_wstring(percent) + L"% | " +
                    FormatBytes(done) + L" / " + FormatBytes(totalBytes) +
                    L" | " + FormatBytesPerSecond(speed) +
-                   L" | ETA " + FormatEta(eta) +
-                   L" | Elapsed " + FormatEta(static_cast<int>(elapsed)));
+                   L" | Осталось: " + FormatEta(eta) +
+                   L" | Прошло " + FormatEta(static_cast<int>(elapsed)));
   };
 
   const size_t workerCount = SelectHashWorkerCount(ArchiveFolder(), manifest.files.size());
@@ -1032,26 +1027,26 @@ bool VerifyPackageManifest(HWND hwnd, const modlist::Manifest& manifest) {
       }
 
       if (!modlist::IsSafeManifestRelativePath(expected.path)) {
-        reportFailure(L"Manifest verification failed for " + PathToDisplay(expected.path) + L": unsafe path");
+        reportFailure(L"Ошибка проверки для " + PathToDisplay(expected.path) + L": небезопасный путь");
         return;
       }
 
       const auto fullPath = ArchiveFolder() / expected.path;
       std::error_code ec;
       if (!std::filesystem::exists(fullPath, ec) || !std::filesystem::is_regular_file(fullPath, ec)) {
-        reportFailure(L"Manifest verification failed for " + PathToDisplay(expected.path) + L": missing file");
+        reportFailure(L"Ошибка проверки для " + PathToDisplay(expected.path) + L": не хватает файла");
         return;
       }
       const auto actualSize = std::filesystem::file_size(fullPath, ec);
       if (ec || actualSize != expected.size) {
-        reportFailure(L"Manifest verification failed for " + PathToDisplay(expected.path) + L": file size mismatch");
+        reportFailure(L"Ошибка проверки для " + PathToDisplay(expected.path) + L": не совпадает размер");
         return;
       }
 
-      PostLog(hwnd, L"Checking " + PathToDisplay(expected.path));
+      PostLog(hwnd, L"Проверка " + PathToDisplay(expected.path));
       std::ifstream input(fullPath, std::ios::binary);
       if (!input) {
-        reportFailure(L"Manifest verification failed for " + PathToDisplay(expected.path) + L": unable to open file");
+        reportFailure(L"Ошибка проверки для " + PathToDisplay(expected.path) + L": невозможно открыть файл");
         return;
       }
 
@@ -1072,7 +1067,7 @@ bool VerifyPackageManifest(HWND hwnd, const modlist::Manifest& manifest) {
 
       const auto actualHash = HexDigest(sha.Final());
       if (actualHash != expected.sha256) {
-        reportFailure(L"Manifest verification failed for " + PathToDisplay(expected.path) + L": SHA256 mismatch");
+        reportFailure(L"Ошибка проверки для " + PathToDisplay(expected.path) + L": не совпадает SHA256");
         return;
       }
     }
@@ -1090,7 +1085,7 @@ bool VerifyPackageManifest(HWND hwnd, const modlist::Manifest& manifest) {
   }
 
   if (g_stopRequested.load()) {
-    PostLog(hwnd, L"Manifest verification stopped.");
+    PostLog(hwnd, L"Проверка остановлена");
     return false;
   }
   if (failed.load()) {
@@ -1098,7 +1093,7 @@ bool VerifyPackageManifest(HWND hwnd, const modlist::Manifest& manifest) {
   }
 
   PostProgress(hwnd, 35);
-  PostLog(hwnd, L"Manifest verification completed.");
+  PostLog(hwnd, L"Проверка выполнена.");
   return true;
 }
 
@@ -1169,13 +1164,13 @@ uintmax_t EstimateRequiredBytes(const modlist::PackageDiscovery& package) {
   if (manifest.has_value()) {
     const uintmax_t manifestBytes = ManifestRequiredBytes(*manifest);
     AppendLog(manifestMessage);
-    AppendLog(L"Manifest archive size: " + FormatBytes(manifestBytes));
+    AppendLog(L"Размер архива по файлу проверки: " + FormatBytes(manifestBytes));
     return manifestBytes;
   }
 
   const uintmax_t archiveBytes = EstimateNearbyArchiveBytes(ArchiveFolder());
   if (archiveBytes > 0) {
-    AppendLog(L"Using nearby archive size estimate: " + FormatBytes(archiveBytes));
+    AppendLog(L"Расчётный размер найденного архива: " + FormatBytes(archiveBytes));
   }
   return archiveBytes;
 }
@@ -1277,29 +1272,29 @@ size_t SelectHashWorkerCount(const std::filesystem::path& folder, size_t fileCou
 
 std::wstring FormatEta(int seconds) {
   if (seconds < 0) {
-    return L"unknown";
+    return L"неизвестно";
   }
   const int hours = seconds / 3600;
   const int minutes = (seconds % 3600) / 60;
   const int secs = seconds % 60;
   std::wostringstream out;
   if (hours > 0) {
-    out << hours << L"h " << minutes << L"m";
+    out << hours << L"ч " << minutes << L"м";
   } else if (minutes > 0) {
-    out << minutes << L"m " << secs << L"s";
+    out << minutes << L"м " << secs << L"с";
   } else {
-    out << secs << L"s";
+    out << secs << L"с";
   }
   return out.str();
 }
 
 bool HasEnoughSpace(const std::filesystem::path& folder, uintmax_t requiredBytes, const std::wstring& label) {
   if (requiredBytes == 0) {
-    AppendLog(label + L" required space: unknown until package files are available.");
+    AppendLog(label + L": необходимое место неизвестно, пока файлы сборки недоступны.");
     return true;
   }
   const uintmax_t free = FreeBytes(folder);
-  AppendLog(label + L" free space: " + FormatBytes(free) + L"; minimum required: " + FormatBytes(requiredBytes));
+  AppendLog(label + L": свободно " + FormatBytes(free) + L"; минимум требуется " + FormatBytes(requiredBytes));
   return free >= requiredBytes;
 }
 
@@ -1397,10 +1392,10 @@ std::wstring FormatExtractionStatus(const std::wstring& label,
     out << L" | " << FormatBytesPerSecond(bytesPerSecond);
   }
   if (etaSeconds >= 0) {
-    out << L" | ETA " << FormatEta(etaSeconds);
+    out << L" | Осталось: " << FormatEta(etaSeconds);
   }
   if (elapsedSeconds >= 0) {
-    out << L" | Elapsed " << FormatEta(elapsedSeconds);
+    out << L" | Прошло " << FormatEta(elapsedSeconds);
   }
   return out.str();
 }
@@ -1412,7 +1407,7 @@ bool RunExtractionStep(HWND hwnd,
                        int progressBase,
                        int progressSpan,
                        uintmax_t estimatedBytes) {
-  PostLog(hwnd, L"Extracting: " + PathToDisplay(extraction.archiveFirstPart));
+  PostLog(hwnd, L"Распаковка: " + PathToDisplay(extraction.archiveFirstPart));
   PostProgress(hwnd, progressBase);
   PostStatus(hwnd, FormatExtractionStatus(statusLabel, 0, 0, -1, 0));
   int lastPercent = -1;
@@ -1444,7 +1439,7 @@ bool RunExtractionStep(HWND hwnd,
       PostLog(hwnd, L"Full 7-Zip output saved to: " + PathToDisplay(result.outputLogPath));
     }
     if (!result.output.empty()) {
-      PostLog(hwnd, L"7-Zip error details:");
+      PostLog(hwnd, L"Ошибка 7-Zip, детали:");
       PostLog(hwnd, TailForLog(result.output, 2000));
     } else {
       PostLog(hwnd, L"7-Zip produced no captured output. Check the saved log path above.");
@@ -1487,7 +1482,7 @@ bool ExtractArchiveChain(HWND hwnd,
       firstBytes = 0;
     }
   }
-  if (!RunExtractionStep(hwnd, extractor, extraction, L"Unpacking", progressBase, firstSpan, firstBytes)) {
+  if (!RunExtractionStep(hwnd, extractor, extraction, L"Распаковано", progressBase, firstSpan, firstBytes)) {
     return false;
   }
 
@@ -1578,7 +1573,7 @@ void UpdateInstallProgress(InstallProgress& progress, uintmax_t bytes, bool forc
   }
 
   std::wostringstream status;
-  status << L"Installing " << percent << L"%";
+  status << L"Установка " << percent << L"%";
   if (progress.totalBytes > 0) {
     status << L" | " << FormatBytes(progress.doneBytes) << L" / " << FormatBytes(progress.totalBytes);
   }
@@ -1586,9 +1581,9 @@ void UpdateInstallProgress(InstallProgress& progress, uintmax_t bytes, bool forc
     status << L" | " << FormatBytesPerSecond(speed);
   }
   if (eta >= 0) {
-    status << L" | ETA " << FormatEta(eta);
+    status << L" | Осталось: " << FormatEta(eta);
   }
-  status << L" | Elapsed " << FormatEta(static_cast<int>(elapsed));
+  status << L" | Прошло " << FormatEta(static_cast<int>(elapsed));
 
   PostProgress(progress.hwnd, 95 + (percent * 5) / 100);
   PostStatus(progress.hwnd, status.str());
@@ -1598,13 +1593,13 @@ bool MoveWholeEntry(const std::filesystem::path& source,
                     const std::filesystem::path& target,
                     std::wstring& error) {
   if (g_stopRequested.load()) {
-    error = L"Install stopped by user.";
+    error = L"Установка остановлена пользователем";
     return false;
   }
   std::error_code ec;
   std::filesystem::create_directories(target.parent_path(), ec);
   if (ec) {
-    error = L"Unable to create install folder: " + Widen(ec.message());
+    error = L"Невозможно создать папку установки: " + Widen(ec.message());
     return false;
   }
 
@@ -1613,7 +1608,7 @@ bool MoveWholeEntry(const std::filesystem::path& source,
     flags |= MOVEFILE_REPLACE_EXISTING;
   }
   if (!MoveFileExW(source.wstring().c_str(), target.wstring().c_str(), flags)) {
-    error = L"Unable to move " + PathToDisplay(source) + L" to " + PathToDisplay(target) +
+    error = L"Невозможно скопировать " + PathToDisplay(source) + L" в " + PathToDisplay(target) +
             L" (Windows error " + std::to_wstring(GetLastError()) + L").";
     return false;
   }
@@ -1628,25 +1623,25 @@ bool CopyFileWithProgress(const std::filesystem::path& source,
   std::error_code ec;
   std::filesystem::create_directories(target.parent_path(), ec);
   if (ec) {
-    error = L"Unable to create install folder: " + Widen(ec.message());
+    error = L"Невозможно создать папку установки: " + Widen(ec.message());
     return false;
   }
 
   std::ifstream input(source, std::ios::binary);
   if (!input) {
-    error = L"Unable to read unpacked file: " + PathToDisplay(source);
+    error = L"Невозможно прочитать распакованный файл: " + PathToDisplay(source);
     return false;
   }
   std::ofstream output(target, std::ios::binary | std::ios::trunc);
   if (!output) {
-    error = L"Unable to write install file: " + PathToDisplay(target);
+    error = L"Невозможно записать файл: " + PathToDisplay(target);
     return false;
   }
 
   std::vector<char> buffer(kBufferSize);
   while (input) {
     if (g_stopRequested.load()) {
-      error = L"Install stopped by user.";
+      error = L"Установка остановлена пользователем";
       return false;
     }
     input.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
@@ -1656,18 +1651,18 @@ bool CopyFileWithProgress(const std::filesystem::path& source,
     }
     output.write(buffer.data(), read);
     if (!output) {
-      error = L"Unable to write install file: " + PathToDisplay(target);
+      error = L"Невозможно записать файл: " + PathToDisplay(target);
       return false;
     }
     UpdateInstallProgress(progress, static_cast<uintmax_t>(read));
   }
   if (!input.eof()) {
-    error = L"Unable to copy unpacked file: " + PathToDisplay(source);
+    error = L"Невозможно скопировать установочный файл: " + PathToDisplay(source);
     return false;
   }
   output.close();
   if (!output) {
-    error = L"Unable to finish writing install file: " + PathToDisplay(target);
+    error = L"Невозможно завершить запись файла: " + PathToDisplay(target);
     return false;
   }
   const auto sourceTime = std::filesystem::last_write_time(source, ec);
@@ -1684,7 +1679,7 @@ bool InstallEntry(HWND hwnd,
                   InstallProgress& progress,
                   std::wstring& error) {
   if (g_stopRequested.load()) {
-    error = L"Install stopped by user.";
+    error = L"Установка остановлена пользователем";
     return false;
   }
   std::error_code ec;
@@ -1700,16 +1695,16 @@ bool InstallEntry(HWND hwnd,
   if (std::filesystem::is_directory(source, ec) && !ec) {
     std::filesystem::create_directories(target, ec);
     if (ec) {
-      error = L"Unable to create install folder: " + Widen(ec.message());
+      error = L"Невозможно создать папку установки: " + Widen(ec.message());
       return false;
     }
     for (const auto& entry : std::filesystem::directory_iterator(source, ec)) {
       if (g_stopRequested.load()) {
-        error = L"Install stopped by user.";
+        error = L"Установка остановлена пользователем";
         return false;
       }
       if (ec) {
-        error = L"Unable to read unpacked folder: " + Widen(ec.message());
+        error = L"Невозможно прочитать распакованную папку: " + Widen(ec.message());
         return false;
       }
       if (!InstallEntry(hwnd, entry.path(), target / entry.path().filename(), sameDrive, progress, error)) {
@@ -1718,7 +1713,7 @@ bool InstallEntry(HWND hwnd,
     }
     std::filesystem::remove(source, ec);
     if (ec) {
-      error = L"Unable to remove installed source folder: " + Widen(ec.message());
+      error = L"Невозможно удалить источник установки: " + Widen(ec.message());
       return false;
     }
     return true;
@@ -1738,7 +1733,7 @@ bool InstallEntry(HWND hwnd,
   }
   std::filesystem::remove(source, ec);
   if (ec) {
-    error = L"Unable to remove copied unpacked file: " + Widen(ec.message());
+    error = L"Невозможно удалить скопированные, распакованные файлы: " + Widen(ec.message());
     return false;
   }
   return true;
@@ -1746,47 +1741,47 @@ bool InstallEntry(HWND hwnd,
 
 bool InstallExtractedFiles(HWND hwnd, const std::filesystem::path& unpackFolder, const std::filesystem::path& installFolder) {
   PostProgress(hwnd, 95);
-  PostStatus(hwnd, L"Installing 0%");
+  PostStatus(hwnd, L"Установка 0%");
   if (IsSameFolder(unpackFolder, installFolder)) {
-    PostLog(hwnd, L"Install folder is the unpack folder; no move is needed.");
+    PostLog(hwnd, L"Папка установки является папкой распаковки; перемещение не требуется");
     PostProgress(hwnd, 100);
-    PostStatus(hwnd, L"Installing 100%");
+    PostStatus(hwnd, L"Установка 100%");
     return true;
   }
   if (IsChildFolder(installFolder, unpackFolder)) {
-    PostLog(hwnd, L"Install folder cannot be inside the unpack folder.");
+    PostLog(hwnd, L"Папка установки не может располагаться в папке распаковки");
     return false;
   }
 
   std::error_code ec;
   std::filesystem::create_directories(installFolder, ec);
   if (ec) {
-    PostLog(hwnd, L"Unable to create install folder: " + Widen(ec.message()));
+    PostLog(hwnd, L"Невозможно создать папку установки: " + Widen(ec.message()));
     return false;
   }
 
   modlist::PathValidator validator;
   const bool sameDrive = validator.IsSameDrive(unpackFolder, installFolder);
   PostLog(hwnd, sameDrive ? L"Installing with same-drive cut/move; files will not be copied."
-                          : L"Installing across drives; Windows must copy files, then remove unpacked originals.");
+                          : L"Установка между дисками; Windows должна скопировать файлы, затем удалить распакованные файлы");
 
   InstallProgress installProgress;
   installProgress.hwnd = hwnd;
   for (const auto& entry : std::filesystem::directory_iterator(unpackFolder, ec)) {
     if (ec) {
-      PostLog(hwnd, L"Unable to read unpack folder: " + Widen(ec.message()));
+      PostLog(hwnd, L"Невозможно прочитать распакованную папку: " + Widen(ec.message()));
       return false;
     }
     if (entry.path().filename() != ".install_temp") {
       installProgress.totalBytes += EstimateInstallBytes(entry.path());
     }
   }
-  PostLog(hwnd, L"Install payload size: " + FormatBytes(installProgress.totalBytes));
+  PostLog(hwnd, L"Размер сборки: " + FormatBytes(installProgress.totalBytes));
   if (!sameDrive) {
     const uintmax_t installFree = FreeBytes(installFolder);
-    PostLog(hwnd, L"Install free space: " + FormatBytes(installFree) + L"; extracted payload: " + FormatBytes(installProgress.totalBytes));
+    PostLog(hwnd, L"Свободное место: " + FormatBytes(installFree) + L"; распакованная сборка: " + FormatBytes(installProgress.totalBytes));
     if (installProgress.totalBytes > 0 && installFree < installProgress.totalBytes) {
-      PostLog(hwnd, L"Not enough free space in the install folder for extracted files.");
+      PostLog(hwnd, L"Не хватает места, чтобы установить распакованные файлы");
       return false;
     }
   }
@@ -1795,17 +1790,17 @@ bool InstallExtractedFiles(HWND hwnd, const std::filesystem::path& unpackFolder,
   std::wstring error;
   for (const auto& entry : std::filesystem::directory_iterator(unpackFolder, ec)) {
     if (g_stopRequested.load()) {
-      PostLog(hwnd, L"Install stopped by user.");
+      PostLog(hwnd, L"Установка остановлена пользователем");
       return false;
     }
     if (ec) {
-      PostLog(hwnd, L"Unable to read unpack folder: " + Widen(ec.message()));
+      PostLog(hwnd, L"Невозможно прочитать распакованную папку: " + Widen(ec.message()));
       return false;
     }
     if (entry.path().filename() == ".install_temp") {
       std::filesystem::remove_all(entry.path(), ec);
       if (ec) {
-        PostLog(hwnd, L"Unable to remove extraction temp folder: " + Widen(ec.message()));
+        PostLog(hwnd, L"Невозможно удалить временную папку: " + Widen(ec.message()));
         return false;
       }
       continue;
@@ -1818,8 +1813,8 @@ bool InstallExtractedFiles(HWND hwnd, const std::filesystem::path& unpackFolder,
   }
 
   PostProgress(hwnd, 100);
-  PostStatus(hwnd, L"Installing 100%");
-  PostLog(hwnd, L"Install step completed.");
+  PostStatus(hwnd, L"Установка 100%");
+  PostLog(hwnd, L"Установка выполнена");
   return true;
 }
 
@@ -1829,7 +1824,7 @@ void RunInstallWorker(HWND hwnd,
                       std::filesystem::path installFolder) {
   g_workerRunning = true;
   PostProgress(hwnd, 0);
-  PostLog(hwnd, L"Starting manifest validation...");
+  PostLog(hwnd, L"Начало проверки...");
 
   std::optional<modlist::Manifest> manifest;
   {
@@ -1838,7 +1833,7 @@ void RunInstallWorker(HWND hwnd,
     PostLog(hwnd, manifestMessage);
   }
   if (!manifest.has_value()) {
-    PostLog(hwnd, L"data\\package\\manifest.json is required.");
+    PostLog(hwnd, L"Необходим файл data\\package\\manifest.json.");
     PostValidationFailed(hwnd);
     FinishWorker(hwnd);
     return;
@@ -1848,26 +1843,27 @@ void RunInstallWorker(HWND hwnd,
     return;
   }
 
-  PostLog(hwnd, L"Looking for archive file to unpack...");
+  PostLog(hwnd, L"Поиск архива для распаковки...");
   auto firstArchivePart = package.firstArchivePart;
   firstArchivePart = ArchivePartFromManifest(*manifest);
   if (!firstArchivePart.has_value()) {
     firstArchivePart = FindFirstArchivePart(ArchiveFolder());
   }
   if (!firstArchivePart.has_value()) {
-    PostLog(hwnd, L"No archive file found in data\\downloads. Cannot extract automatically.");
+    PostLog(hwnd, L"Архив не найден/не скачан. Ошибка распаковки.");
     FinishWorker(hwnd);
     return;
   }
 
-  PostLog(hwnd, L"Selected install folder: " + PathToDisplay(installFolder));
+  PostLog(hwnd, L"Выбранная папка установки: " + PathToDisplay(installFolder));
 
   const uintmax_t archiveBytes = EstimateNearbyArchiveBytes(firstArchivePart->parent_path());
   if (archiveBytes > 0) {
     const uintmax_t unpackFree = FreeBytes(unpackFolder);
-    PostLog(hwnd, L"Unpack free space: " + FormatBytes(unpackFree) + L"; archive size minimum: " + FormatBytes(archiveBytes));
+    PostLog(hwnd, L"Свободное место для распаковки: " + FormatBytes(unpackFree) +
+                      L"; минимальный размер архива: " + FormatBytes(archiveBytes));
     if (unpackFree < archiveBytes) {
-      PostLog(hwnd, L"Not enough free space in the unpack folder for extraction.");
+      PostLog(hwnd, L"Не хватает места для распаковки архива");
       FinishWorker(hwnd);
       return;
     }
@@ -1876,7 +1872,7 @@ void RunInstallWorker(HWND hwnd,
   modlist::SevenZipExtractor extractor;
   auto sevenZip = extractor.LocateExecutable(ExeFolder());
   if (!sevenZip.ok()) {
-    PostLog(hwnd, L"7-Zip error: " + Widen(sevenZip.error()));
+    PostLog(hwnd, L"Ошибка 7-Zip: " + Widen(sevenZip.error()));
     FinishWorker(hwnd);
     return;
   }
@@ -1907,7 +1903,7 @@ bool ValidateFolders(uintmax_t knownRequiredBytes = 0) {
     }
     ok = ok && result.ok;
   } else {
-    AppendLog(L"Unpack drive: not selected yet.");
+    AppendLog(L"Диск для распаковки не выбран.");
     ok = false;
   }
 
@@ -1919,14 +1915,14 @@ bool ValidateFolders(uintmax_t knownRequiredBytes = 0) {
     }
     ok = ok && result.ok;
   } else {
-    AppendLog(L"Install folder: not selected yet.");
+    AppendLog(L"Папка установки не выбрана.");
     ok = false;
   }
 
-  if (!unpackFolder.empty() && !HasEnoughSpace(unpackFolder, knownRequiredBytes, L"Unpack folder")) {
+  if (!unpackFolder.empty() && !HasEnoughSpace(unpackFolder, knownRequiredBytes, L"Папка распаковки")) {
     ok = false;
   }
-  if (!installText.empty() && !HasEnoughSpace(std::filesystem::path(installText), knownRequiredBytes, L"Install folder")) {
+  if (!installText.empty() && !HasEnoughSpace(std::filesystem::path(installText), knownRequiredBytes, L"Папка установки")) {
     ok = false;
   }
 
@@ -1936,17 +1932,17 @@ bool ValidateFolders(uintmax_t knownRequiredBytes = 0) {
 void ValidatePackage() {
   SendMessageW(g_progress, PBM_SETPOS, 0, 0);
   SendUiProgress(0, g_statusText);
-  AppendLog(L"Validating package...");
+  AppendLog(L"Проверка архива");
   auto package = ReadPackageFromUi();
   if (!package.ok()) {
-    AppendLog(L"Package error: " + Widen(package.error()));
+    AppendLog(L"Ошибка сборки: " + Widen(package.error()));
     return;
   }
 
   if (package.value().firstArchivePart.has_value()) {
-    AppendLog(L"Archive first part: " + PathToDisplay(*package.value().firstArchivePart));
+    AppendLog(L"Первая часть архива: " + PathToDisplay(*package.value().firstArchivePart));
   } else {
-    AppendLog(L"No archive file found in data\\downloads.");
+    AppendLog(L"Архив не найден/не скачан. Ошибка распаковки.");
   }
 
   std::wstring manifestMessage;
@@ -1957,7 +1953,7 @@ void ValidatePackage() {
     AppendLog(L"Manifest archive entry: " + PathToDisplay(manifest->extract.firstArchivePart));
     if (!VerifyPackageManifest(GetParent(g_progress), *manifest)) {
       SendMessageW(g_progress, PBM_SETPOS, 0, 0);
-      SendUiProgress(0, L"Validation failed");
+      SendUiProgress(0, L"Ошибка проверки");
       return;
     }
   }
@@ -1978,38 +1974,38 @@ void ValidatePackage() {
 
 void SetControlsRunning(HWND hwnd, bool running) {
   (void)running;
-  SetWindowTextW(GetDlgItem(hwnd, kPauseButton), L"Pause");
+  SetWindowTextW(GetDlgItem(hwnd, kPauseButton), L"Пауза");
   ShowWizardPage(hwnd, g_page);
 }
 
 void TogglePause(HWND hwnd) {
   (void)hwnd;
-  AppendLog(L"Pause is not available during manifest validation.");
+  AppendLog(L"Пауза недоступна во время проверки.");
 }
 
 void StopInstall() {
   if (!g_workerRunning) {
-    AppendLog(L"No active operation to stop.");
+    AppendLog(L"Нет активных операций для остановки.");
     return;
   }
   g_stopRequested = true;
-  AppendLog(L"Stopping. Existing package files are left untouched.");
+  AppendLog(L"Остановка. Существующие файлы сборки останутся без изменений.");
 }
 
 void StartInstall(HWND hwnd) {
   if (g_workerRunning) {
-    AppendLog(L"Installer is already running.");
+    AppendLog(L"Установщик уже запущен.");
     return;
   }
-  AppendLog(L"Starting installer flow...");
+  AppendLog(L"Начало установки...");
   auto package = ReadPackageFromUi();
   if (!package.ok()) {
-    AppendLog(L"Package error: " + Widen(package.error()));
+    AppendLog(L"Ошибка сборки: " + Widen(package.error()));
     return;
   }
   const uintmax_t knownRequiredBytes = EstimateRequiredBytes(package.value());
   if (!ValidateFolders(knownRequiredBytes)) {
-    AppendLog(L"Fix the folder warnings/errors before starting.");
+    AppendLog(L"Исправьте ошибки перед началом.");
     return;
   }
 
@@ -2025,14 +2021,15 @@ void StartInstall(HWND hwnd) {
 void RunUnpackWorker(HWND hwnd, std::filesystem::path archiveFirstPart, std::filesystem::path unpackFolder) {
   g_workerRunning = true;
   PostProgress(hwnd, 0);
-  PostLog(hwnd, L"Unpacking archive: " + PathToDisplay(archiveFirstPart));
+  PostLog(hwnd, L"Распаковка архива: " + PathToDisplay(archiveFirstPart));
 
   const uintmax_t archiveBytes = EstimateNearbyArchiveBytes(archiveFirstPart.parent_path());
   if (archiveBytes > 0) {
     const uintmax_t unpackFree = FreeBytes(unpackFolder);
-    PostLog(hwnd, L"Unpack free space: " + FormatBytes(unpackFree) + L"; archive size minimum: " + FormatBytes(archiveBytes));
+    PostLog(hwnd, L"Свободное место для распаковки: " + FormatBytes(unpackFree) +
+                      L"; минимальный размер архива: " + FormatBytes(archiveBytes));
     if (unpackFree < archiveBytes) {
-      PostLog(hwnd, L"Not enough free space in the unpack folder for extraction.");
+      PostLog(hwnd, L"Не хватает места для распаковки архива");
       g_workerRunning = false;
       PostMessageW(hwnd, kWorkerFinishedMessage, 0, 0);
       return;
@@ -2042,7 +2039,7 @@ void RunUnpackWorker(HWND hwnd, std::filesystem::path archiveFirstPart, std::fil
   modlist::SevenZipExtractor extractor;
   auto sevenZip = extractor.LocateExecutable(ExeFolder());
   if (!sevenZip.ok()) {
-    PostLog(hwnd, L"7-Zip error: " + Widen(sevenZip.error()));
+    PostLog(hwnd, L"Ошибка 7-Zip: " + Widen(sevenZip.error()));
     g_workerRunning = false;
     PostMessageW(hwnd, kWorkerFinishedMessage, 0, 0);
     return;
@@ -2056,14 +2053,14 @@ void RunUnpackWorker(HWND hwnd, std::filesystem::path archiveFirstPart, std::fil
 
 void UnpackOnly(HWND hwnd) {
   if (g_workerRunning) {
-    AppendLog(L"Installer is already running.");
+    AppendLog(L"Установщик уже запущен.");
     return;
   }
 
   const auto unpackFolder = SelectedUnpackFolder();
   const auto installFolder = std::filesystem::path(GetText(g_installEdit));
   if (unpackFolder.empty() || installFolder.empty()) {
-    AppendLog(L"Select unpack drive and install folder before unpacking.");
+    AppendLog(L"Выберите диск для распаковки и папку для установки перед распаковкой.");
     return;
   }
 
@@ -2091,7 +2088,7 @@ void UnpackOnly(HWND hwnd) {
     }
   }
   if (!archive.has_value()) {
-    AppendLog(L"No archive file found in data\\downloads.");
+    AppendLog(L"Архив не найден/не скачан. Ошибка распаковки.");
     return;
   }
 
@@ -2149,7 +2146,7 @@ void SelectUnpackDrive(const std::wstring& drive) {
       return;
     }
   }
-  SendUiError(L"Invalid drive", L"The selected unpack drive is not available.");
+  SendUiError(L"Диск недоступен", L"Выбранный диск для распаковки недоступен");
 }
 
 void OpenLogFile() {
@@ -2185,7 +2182,7 @@ void HandleUiCommand(HWND hwnd, const std::wstring& rawJson) {
     const auto name = JsonFieldString(parsed.value(), "name");
     const auto value = JsonFieldString(parsed.value(), "value");
     if (!name.has_value() || !value.has_value() || !IsReasonableUiPath(*value)) {
-      SendUiError(L"Path rejected", L"The path update was malformed.");
+      SendUiError(L"В пути отказано", L"The path update was malformed.");
       return;
     }
     if (*name == L"downloadFolder") {
@@ -2197,7 +2194,7 @@ void HandleUiCommand(HWND hwnd, const std::wstring& rawJson) {
     } else if (*name == L"unpackDrive") {
       SelectUnpackDrive(*value);
     } else {
-      SendUiError(L"Path rejected", L"Unknown path field.");
+      SendUiError(L"В пути отказано", L"Unknown path field.");
     }
     SendUiState();
   } else if (*command == L"setOption") {
@@ -2245,27 +2242,27 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
 
       g_stepLabel = CreateLabel(hwnd, L"", 16, 18, 720, 24);
       g_welcomeTitle = CreateLabel(hwnd, L"Modlist Installer", 16, 92, 720, 38);
-      g_welcomeBody = CreateLabel(hwnd, L"Welcome text will be added later.", 16, 146, 720, 90);
+      g_welcomeBody = CreateLabel(hwnd, L"", 16, 146, 720, 90);
       g_downloadLabel = CreateLabel(hwnd, L"Package", 16, 112, 100, 20);
       g_unpackDriveLabel = CreateLabel(hwnd, L"Unpack drive", 16, 136, 100, 20);
-      g_unpackTargetLabel = CreateLabel(hwnd, L"Target: choose a drive", 160, 136, 420, 20);
-      g_installLabel = CreateLabel(hwnd, L"Install", 16, 178, 100, 20);
+      g_unpackTargetLabel = CreateLabel(hwnd, L"Выберите диск", 160, 136, 420, 20);
+      g_installLabel = CreateLabel(hwnd, L"Установка", 16, 178, 100, 20);
       g_downloadEdit = CreateEdit(hwnd, kDownloadEdit, 120, 22, 420, 25);
       g_unpackDriveCombo = CreateCombo(hwnd, kUnpackDriveCombo, 120, 132, 120, 180);
       g_installEdit = CreateEdit(hwnd, kInstallEdit, 120, 57, 420, 25);
-      CreateButton(hwnd, kDownloadBrowse, L"Browse", 550, 22, 88, 25);
-      CreateButton(hwnd, kInstallBrowse, L"Browse", 550, 57, 88, 25);
-      CreateButton(hwnd, kValidateButton, L"Validate", 120, 96, 120, 30);
-      CreateButton(hwnd, kStartButton, L"Install", 252, 96, 120, 30);
-      CreateButton(hwnd, kUnpackButton, L"Unpack", 384, 96, 120, 30);
-      CreateButton(hwnd, kPauseButton, L"Pause", 516, 96, 120, 30);
-      CreateButton(hwnd, kStopButton, L"Stop", 648, 96, 92, 30);
-      g_previousButton = CreateButton(hwnd, kPreviousButton, L"Previous", 632, 450, 100, 30);
-      g_nextButton = CreateButton(hwnd, kNextButton, L"Next", 744, 450, 100, 30);
+      CreateButton(hwnd, kDownloadBrowse, L"Обзор", 550, 22, 88, 25);
+      CreateButton(hwnd, kInstallBrowse, L"Обзор", 550, 57, 88, 25);
+      CreateButton(hwnd, kValidateButton, L"Проверка", 120, 96, 120, 30);
+      CreateButton(hwnd, kStartButton, L"Установка", 252, 96, 120, 30);
+      CreateButton(hwnd, kUnpackButton, L"Распаковка", 384, 96, 120, 30);
+      CreateButton(hwnd, kPauseButton, L"Пауза", 516, 96, 120, 30);
+      CreateButton(hwnd, kStopButton, L"Стоп", 648, 96, 92, 30);
+      g_previousButton = CreateButton(hwnd, kPreviousButton, L"Предыдущий", 632, 450, 100, 30);
+      g_nextButton = CreateButton(hwnd, kNextButton, L"Дальше", 744, 450, 100, 30);
       g_progress = CreateWindowExW(0, PROGRESS_CLASSW, L"", WS_CHILD | WS_VISIBLE,
                                    16, 142, 622, 20, hwnd,
                                    reinterpret_cast<HMENU>(static_cast<INT_PTR>(kProgress)), g_instance, nullptr);
-      g_statusLabel = CreateWindowExW(0, L"STATIC", L"Idle | Ready for local validation",
+      g_statusLabel = CreateWindowExW(0, L"STATIC", L"Ожидание | Ожидание проверки",
                                       WS_CHILD | WS_VISIBLE,
                                       16, 170, 622, 22, hwnd,
                                       reinterpret_cast<HMENU>(static_cast<INT_PTR>(kStatusLabel)), g_instance, nullptr);
@@ -2315,15 +2312,15 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
           AppendLog(L"Package auto-detect: " + Widen(package.error()));
         }
       }
-      AppendLog(L"Choose an unpack drive; the unpack folder will be created as <drive>:\\Sky.");
+      AppendLog(L"Выберите диск для распаковки; папка будет создана как <drive>:\\Unpacked.");
       Layout(hwnd);
       ShowWizardPage(hwnd, WizardPage::Welcome);
 
       const auto uiPath = UiFolder() / "index.html";
       if (!std::filesystem::exists(uiPath)) {
         MessageBoxW(hwnd,
-                    L"Local UI files were not found. Expected data\\ui\\index.html beside the installer executable.",
-                    L"Installer UI missing",
+                    L"Файлы интерфейса не найдены. Ожидается data\\ui\\index.html рядом с установщиком.",
+                    L"Интерфейс установщика не найден",
                     MB_OK | MB_ICONWARNING);
       } else {
         g_webView = std::make_unique<modlist::WebViewHost>();
@@ -2340,9 +2337,9 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
             },
             [hwnd](HRESULT) {
               MessageBoxW(hwnd,
-                          L"Microsoft Edge WebView2 Runtime is required to show the CSS installer UI. "
-                          L"The native fallback controls will remain available.",
-                          L"WebView2 Runtime required",
+                          L"Для отображения интерфейса установщика требуется Microsoft Edge WebView2 Runtime. "
+                          L"Будет доступен запасной стандартный интерфейс.",
+                          L"Требуется WebView2 Runtime",
                           MB_OK | MB_ICONERROR);
             });
       }
@@ -2454,8 +2451,8 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
       return 0;
     }
     case kValidationFailedMessage:
-      SendUiError(L"Validation failed", L"Package validation failed. Rebuild the package.");
-      MessageBoxW(hwnd, L"Package validation failed. Rebuild the package.", L"Validation failed", MB_OK | MB_ICONERROR);
+      SendUiError(L"Ошибка проверки", L"Проверка завершилась ошибкой. Проверьте файлы.");
+      MessageBoxW(hwnd, L"Проверка завершилась ошибкой. Проверьте файлы.", L"Ошибка проверки", MB_OK | MB_ICONERROR);
       return 0;
     case kWorkerFinishedMessage:
       SetControlsRunning(hwnd, false);
@@ -2468,8 +2465,8 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
       if (g_workerRunning) {
         g_closeAfterWorker = true;
         StopInstall();
-        SetWindowTextW(hwnd, L"Modlist Installer - stopping...");
-        AppendLog(L"Waiting for validation to stop before closing.");
+        SetWindowTextW(hwnd, L"Modlist Installer - остановка...");
+        AppendLog(L"Ожидание остановки проверки перед закрытием.");
         return 0;
       }
       DestroyWindow(hwnd);

@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="en">
+<html lang="ru">
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
@@ -19,30 +19,28 @@
 
         <section class="panel">
           <div class="welcome" id="welcomePanel">
-            <h2>Prepare a local modlist package</h2>
             <p>
-              This installer validates the bundled manifest and archive files, extracts them to a short staging
-              folder, and installs the modlist into the selected final folder.
+              Установщик проверяет, распаковывает и устанавливает файлы сборки в указанную папку.
             </p>
           </div>
 
           <div class="form-grid">
-            <label for="unpackDrive">Unpack Drive</label>
+            <label for="unpackDrive">Диск для распаковки</label>
             <div class="field-row compact">
               <select id="unpackDrive"></select>
-              <span class="target" id="unpackTarget">Target: choose a drive</span>
+              <span class="target" id="unpackTarget">Выберите диск</span>
             </div>
 
-            <label for="installFolder">Install Folder</label>
+            <label for="installFolder">Папка установки</label>
             <div class="field-row">
               <input id="installFolder" type="text" autocomplete="off" spellcheck="false" />
-              <button type="button" id="browseInstall">Browse</button>
+              <button type="button" id="browseInstall">Обзор</button>
             </div>
           </div>
 
           <div class="progress-wrap">
             <div class="progress-line">
-              <span id="statusText">Idle | Ready for local validation</span>
+              <span id="statusText">Ожидание | Ожидание проверки</span>
               <strong id="percentText">0%</strong>
             </div>
             <div class="progress-bar" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
@@ -54,11 +52,11 @@
         </section>
 
         <footer class="footer">
-          <button type="button" id="openLog">Open Log</button>
-          <span id="footerInfo">Waiting for package scan</span>
+          <button type="button" id="openLog">Открыть лог</button>
+          <span id="footerInfo">Ожидание сканирования архива</span>
           <div class="nav">
-            <button type="button" id="startButton">Install</button>
-            <button type="button" id="cancelButton">Cancel</button>
+            <button type="button" id="startButton">Установить</button>
+            <button type="button" id="cancelButton">Закрыть</button>
           </div>
         </footer>
       </section>
