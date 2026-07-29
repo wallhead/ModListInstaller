@@ -474,6 +474,39 @@ bool IsSafeArchiveName(const std::wstring& name) {
   return !path.is_absolute() && path.filename().wstring() == name;
 }
 
+std::wstring NormalizedPathText(const std::filesystem::path& path) {
+  std::error_code ec;
+  auto normalized = std::filesystem::weakly_canonical(path, ec);
+  if (ec) {
+    ec.clear();
+    normalized = std::filesystem::absolute(path, ec).lexically_normal();
+  }
+  if (ec) {
+    normalized = path.lexically_normal();
+  }
+  auto text = normalized.wstring();
+  for (auto& ch : text) {
+    ch = static_cast<wchar_t>(std::towlower(ch));
+  }
+  while (!text.empty() && (text.back() == L'\\' || text.back() == L'/')) {
+    text.pop_back();
+  }
+  return text;
+}
+
+bool IsSameOrChildPath(const std::filesystem::path& candidate, const std::filesystem::path& parent) {
+  const auto candidateText = NormalizedPathText(candidate);
+  const auto parentText = NormalizedPathText(parent);
+  return candidateText == parentText ||
+         (candidateText.size() > parentText.size() &&
+          candidateText.starts_with(parentText) &&
+          (candidateText[parentText.size()] == L'\\' || candidateText[parentText.size()] == L'/'));
+}
+
+bool PathsOverlap(const std::filesystem::path& left, const std::filesystem::path& right) {
+  return IsSameOrChildPath(left, right) || IsSameOrChildPath(right, left);
+}
+
 bool IsNumericVolumeSuffix(const std::wstring& suffix) {
   return !suffix.empty() &&
          std::all_of(suffix.begin(), suffix.end(), [](wchar_t ch) {
@@ -774,14 +807,47 @@ std::vector<std::filesystem::path> FindArchivePartsForBase(const std::filesystem
       continue;
     }
     const auto name = entry.path().filename().wstring();
-    const auto volumePrefix = base + L".";
-    if (name == base ||
-        (name.starts_with(volumePrefix) && IsNumericVolumeSuffix(name.substr(volumePrefix.size())))) {
+    const auto lowerName = Lower(name);
+    const auto lowerBase = Lower(base);
+    const auto volumePrefix = lowerBase + L".";
+    if (lowerName == lowerBase ||
+        (lowerName.starts_with(volumePrefix) && IsNumericVolumeSuffix(lowerName.substr(volumePrefix.size())))) {
       files.push_back(entry.path());
     }
   }
   std::sort(files.begin(), files.end());
   return files;
+}
+
+bool RemovePreviousPackageOutputs(HWND hwnd, const PackerConfig& config) {
+  std::error_code ec;
+  for (const auto* extension : {L".7z", L".zip"}) {
+    const auto base = config.archiveName + extension;
+    for (const auto& file : FindArchivePartsForBase(DownloadsFolder(config), base)) {
+      std::filesystem::remove(file, ec);
+      if (ec) {
+        PostLog(hwnd, L"Unable to remove previous archive part: " + file.wstring() + L" - " + Widen(ec.message()));
+        return false;
+      }
+      PostLog(hwnd, L"Removed previous archive part: " + file.wstring());
+    }
+  }
+
+  const auto manifestPath = PackageFolder(config) / "manifest.json";
+  const bool manifestExists = std::filesystem::exists(manifestPath, ec);
+  if (ec) {
+    PostLog(hwnd, L"Unable to inspect previous manifest: " + Widen(ec.message()));
+    return false;
+  }
+  if (manifestExists) {
+    std::filesystem::remove(manifestPath, ec);
+    if (ec) {
+      PostLog(hwnd, L"Unable to remove previous manifest: " + Widen(ec.message()));
+      return false;
+    }
+    PostLog(hwnd, L"Removed previous manifest: " + manifestPath.wstring());
+  }
+  return true;
 }
 
 std::vector<ArchiveSet> FindArchiveSets(const std::filesystem::path& folder) {
@@ -863,7 +929,7 @@ std::optional<ArchiveSet> SelectArchiveSet(HWND hwnd, const PackerConfig& config
   return std::nullopt;
 }
 
-bool WriteManifest(HWND hwnd, const PackerConfig& config) {
+bool WriteManifest(HWND hwnd, const PackerConfig& config, uint64_t unpackedSize) {
   const auto archiveSet = SelectArchiveSet(hwnd, config);
   if (!archiveSet.has_value()) {
     PostLog(hwnd, L"No archive parts found in data\\downloads.");
@@ -973,6 +1039,9 @@ bool WriteManifest(HWND hwnd, const PackerConfig& config) {
   output << "{\n";
   output << "  \"schema\": \"modlist-manifest-chunks-v1\",\n";
   output << "  \"archive_name\": \"" << JsonEscape(Narrow(archiveSet->archiveName)) << "\",\n";
+  if (unpackedSize > 0) {
+    output << "  \"unpacked_size\": " << unpackedSize << ",\n";
+  }
   output << "  \"hash\": {\n";
   output << "    \"algorithm\": \"sha256\",\n";
   output << "    \"chunk_size\": " << config.chunkSize << "\n";
@@ -1137,7 +1206,7 @@ int RunProcess(HWND hwnd, const std::wstring& command, const std::wstring& label
   return static_cast<int>(exitCode);
 }
 
-void PrepareInstallerSetup(HWND hwnd, const PackerConfig& config) {
+bool PrepareInstallerSetup(HWND hwnd, const PackerConfig& config) {
   std::error_code ec;
   for (const auto& folder : {PackageFolder(config),
                             DownloadsFolder(config),
@@ -1146,7 +1215,8 @@ void PrepareInstallerSetup(HWND hwnd, const PackerConfig& config) {
     ec.clear();
     std::filesystem::create_directories(folder, ec);
     if (ec) {
-      PostLog(hwnd, L"Runtime folder warning: " + folder.wstring() + L" - " + Widen(ec.message()));
+      PostLog(hwnd, L"Unable to create runtime folder: " + folder.wstring() + L" - " + Widen(ec.message()));
+      return false;
     }
   }
 
@@ -1156,12 +1226,14 @@ void PrepareInstallerSetup(HWND hwnd, const PackerConfig& config) {
   if (config.copyInstaller && std::filesystem::exists(source, ec)) {
     std::filesystem::copy_file(source, target, std::filesystem::copy_options::overwrite_existing, ec);
     if (ec) {
-      PostLog(hwnd, L"Installer copy warning: " + Widen(ec.message()));
+      PostLog(hwnd, L"Unable to copy installer: " + Widen(ec.message()));
+      return false;
     } else {
       PostLog(hwnd, L"Installer copied: " + target.wstring());
     }
   } else if (config.copyInstaller) {
-    PostLog(hwnd, L"Installer copy warning: modlist-installer.exe was not found beside modlist-packer.exe.");
+    PostLog(hwnd, L"Unable to prepare setup: modlist-installer.exe was not found beside modlist-packer.exe.");
+    return false;
   }
 
   auto sourceUi = packerFolder / "data" / "ui";
@@ -1172,16 +1244,22 @@ void PrepareInstallerSetup(HWND hwnd, const PackerConfig& config) {
   const auto targetUi = UiFolder(config);
   if (config.copyInstaller && std::filesystem::exists(sourceUi, ec) && std::filesystem::is_directory(sourceUi, ec)) {
     std::filesystem::remove_all(targetUi, ec);
-    ec.clear();
+    if (ec) {
+      PostLog(hwnd, L"Unable to replace installer UI: " + Widen(ec.message()));
+      return false;
+    }
     std::filesystem::copy(sourceUi, targetUi, std::filesystem::copy_options::recursive, ec);
     if (ec) {
-      PostLog(hwnd, L"Installer UI copy warning: " + Widen(ec.message()));
+      PostLog(hwnd, L"Unable to copy installer UI: " + Widen(ec.message()));
+      return false;
     } else {
       PostLog(hwnd, L"Installer UI copied: " + targetUi.wstring());
     }
   } else if (config.copyInstaller) {
-    PostLog(hwnd, L"Installer UI copy warning: data\\ui folder was not found next to the installer exe.");
+    PostLog(hwnd, L"Unable to prepare setup: data\\ui was not found beside modlist-packer.exe.");
+    return false;
   }
+  return true;
 }
 
 PackerConfig ReadConfig(bool archiveFirst) {
@@ -1212,16 +1290,6 @@ bool ValidateConfig(HWND hwnd, const PackerConfig& config) {
     PostLog(hwnd, L"Release folder is required.");
     return false;
   }
-  std::filesystem::create_directories(config.releaseFolder, ec);
-  if (ec) {
-    PostLog(hwnd, L"Unable to create release folder: " + Widen(ec.message()));
-    return false;
-  }
-  std::filesystem::create_directories(DownloadsFolder(config), ec);
-  if (ec) {
-    PostLog(hwnd, L"Unable to create downloads folder: " + Widen(ec.message()));
-    return false;
-  }
   if (config.archiveName.empty()) {
     PostLog(hwnd, L"Archive name is required.");
     return false;
@@ -1235,6 +1303,20 @@ bool ValidateConfig(HWND hwnd, const PackerConfig& config) {
       PostLog(hwnd, L"Source folder is required.");
       return false;
     }
+    if (PathsOverlap(config.sourceFolder, config.releaseFolder)) {
+      PostLog(hwnd, L"Source and release folders must not be the same or contain one another.");
+      return false;
+    }
+  }
+  std::filesystem::create_directories(config.releaseFolder, ec);
+  if (ec) {
+    PostLog(hwnd, L"Unable to create release folder: " + Widen(ec.message()));
+    return false;
+  }
+  std::filesystem::create_directories(DownloadsFolder(config), ec);
+  if (ec) {
+    PostLog(hwnd, L"Unable to create downloads folder: " + Widen(ec.message()));
+    return false;
   }
   return true;
 }
@@ -1266,19 +1348,30 @@ void Worker(HWND hwnd, PackerConfig config) {
     return;
   }
 
-  PrepareInstallerSetup(hwnd, config);
+  if (config.archiveFirst && !RemovePreviousPackageOutputs(hwnd, config)) {
+    g_workerRunning = false;
+    PostMessageW(hwnd, kWorkerFinishedMessage, 0, 0);
+    return;
+  }
+
+  if (!PrepareInstallerSetup(hwnd, config)) {
+    g_workerRunning = false;
+    PostMessageW(hwnd, kWorkerFinishedMessage, 0, 0);
+    return;
+  }
 
   bool ok = true;
+  uint64_t unpackedSize = 0;
   if (config.archiveFirst) {
     PostLog(hwnd, L"Creating archive...");
     PostLog(hwnd, L"Archive output folder: " + DownloadsFolder(config).wstring());
     PostLog(hwnd, L"7-Zip command: " + BuildSevenZipCommand(config));
-    const uint64_t sourceBytes = EstimateFolderBytes(config.sourceFolder);
-    if (sourceBytes > 0) {
-      PostLog(hwnd, L"Packing input size estimate (uncompressed source): " + FormatBytes(sourceBytes));
+    unpackedSize = EstimateFolderBytes(config.sourceFolder);
+    if (unpackedSize > 0) {
+      PostLog(hwnd, L"Packing input size estimate (uncompressed source): " + FormatBytes(unpackedSize));
     }
     PostStatus(hwnd, L"Packing input");
-    const int exitCode = RunProcess(hwnd, BuildSevenZipCommand(config), L"Packing input", sourceBytes);
+    const int exitCode = RunProcess(hwnd, BuildSevenZipCommand(config), L"Packing input", unpackedSize);
     if (exitCode != 0) {
       PostLog(hwnd, L"7-Zip failed with exit code " + std::to_wstring(exitCode));
       ok = false;
@@ -1307,7 +1400,7 @@ void Worker(HWND hwnd, PackerConfig config) {
   }
 
   if (ok && !g_cancelRequested) {
-    ok = WriteManifest(hwnd, config);
+    ok = WriteManifest(hwnd, config, unpackedSize);
   }
 
   if (g_cancelRequested) {

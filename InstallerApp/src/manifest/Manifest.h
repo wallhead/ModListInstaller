@@ -59,6 +59,7 @@ struct Manifest {
   TorrentFeatures torrentFeatures;
   InstallSettings install;
   std::vector<ManifestFile> files;
+  uint64_t unpackedSize{0};
   ExtractSettings extract;
 };
 

@@ -2,7 +2,16 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cwctype>
 #include <fstream>
+#include <limits>
+#include <optional>
+#include <vector>
+
+#ifdef _WIN32
+#define NOMINMAX
+#include <Windows.h>
+#endif
 
 namespace modlist {
 
@@ -14,6 +23,41 @@ std::string Upper(std::string value) {
   });
   return value;
 }
+
+#ifdef _WIN32
+std::wstring UpperWide(std::wstring value) {
+  std::transform(value.begin(), value.end(), value.begin(), [](wchar_t ch) {
+    return static_cast<wchar_t>(std::towupper(ch));
+  });
+  return value;
+}
+
+std::optional<std::wstring> VolumeIdentity(const std::filesystem::path& path) {
+  std::error_code ec;
+  auto absolute = std::filesystem::absolute(path, ec);
+  if (ec) {
+    return std::nullopt;
+  }
+
+  while (!std::filesystem::exists(absolute, ec)) {
+    if (ec || absolute == absolute.root_path()) {
+      return std::nullopt;
+    }
+    absolute = absolute.parent_path();
+  }
+
+  std::vector<wchar_t> volumePath(32768, L'\0');
+  if (!GetVolumePathNameW(absolute.c_str(), volumePath.data(), static_cast<DWORD>(volumePath.size()))) {
+    return std::nullopt;
+  }
+
+  std::vector<wchar_t> volumeName(32768, L'\0');
+  if (GetVolumeNameForVolumeMountPointW(volumePath.data(), volumeName.data(), static_cast<DWORD>(volumeName.size()))) {
+    return UpperWide(volumeName.data());
+  }
+  return UpperWide(volumePath.data());
+}
+#endif
 
 bool StartsWithUsersFolder(const std::filesystem::path& path) {
   const std::string text = Upper(path.lexically_normal().string());
@@ -50,6 +94,25 @@ bool CanWriteProbe(const std::filesystem::path& folder) {
 }
 
 }  // namespace
+
+uintmax_t ExtractionSpaceRequirement(uintmax_t unpackedBytes) {
+  if (unpackedBytes == 0) {
+    return 0;
+  }
+  constexpr uintmax_t kMinimumOverhead = 512ull * 1024ull * 1024ull;
+  const uintmax_t overhead = std::max(kMinimumOverhead, unpackedBytes / 20);
+  if (unpackedBytes > std::numeric_limits<uintmax_t>::max() - overhead) {
+    return std::numeric_limits<uintmax_t>::max();
+  }
+  return unpackedBytes + overhead;
+}
+
+InstallSpacePlan PlanInstallSpace(uintmax_t unpackedBytes, bool sameVolume) {
+  InstallSpacePlan plan;
+  plan.unpackRequiredBytes = ExtractionSpaceRequirement(unpackedBytes);
+  plan.installRequiredBytes = sameVolume ? 0 : unpackedBytes;
+  return plan;
+}
 
 PathValidator::PathValidator(size_t maxRecommendedInstallPathLength)
     : maxRecommendedInstallPathLength_(maxRecommendedInstallPathLength) {}
@@ -89,6 +152,13 @@ PathValidationResult PathValidator::ValidateInstallFolder(const std::filesystem:
 }
 
 bool PathValidator::IsSameDrive(const std::filesystem::path& a, const std::filesystem::path& b) const {
+#ifdef _WIN32
+  const auto aVolume = VolumeIdentity(a);
+  const auto bVolume = VolumeIdentity(b);
+  if (aVolume.has_value() && bVolume.has_value()) {
+    return *aVolume == *bVolume;
+  }
+#endif
   return Upper(a.lexically_normal().root_name().string()) == Upper(b.lexically_normal().root_name().string());
 }
 

@@ -18,7 +18,7 @@ PackerApp/dist/modlist-packer.exe
 Ready-to-use versioned release archives are written to:
 
 ```text
-Release/ModlistInstaller-v0.2.zip
+Release/ModlistInstaller-v0.2.1.zip
 ```
 
 Extract the zip and run `modlist-packer.exe`. The archive contains the portable packer, the installer exe beside it, and `data/ui` ready for release-folder creation.
@@ -55,6 +55,9 @@ The installer looks for `data\package\manifest.json` beside the exe and archive 
 - Manifest SHA256 verification before extraction.
 - Archive discovery in `data\downloads`, using the archive filename from `data\package\manifest.json`.
 - Unpack drive selection automatically resolves to `<drive>:\Unpacked`.
+- Unpacked payload size recorded in new manifests for accurate free-space checks.
+- Same-volume installs reserve extraction space once; cross-volume installs also check the destination for the full payload.
+- Existing non-empty unpack and install folders are rejected to prevent stale files from being merged into a new installation.
 - Live validation, extraction, and install progress with status text.
 - Same-drive installs use move/cut semantics automatically when possible.
 - Embedded 7-Zip extraction to `data\tools\7zip`.
@@ -69,6 +72,8 @@ The installer looks for `data\package\manifest.json` beside the exe and archive 
 5. Run `modlist-installer.exe`.
 6. Select an unpack drive and final install folder.
 7. Press `Install`.
+
+Both the derived `<drive>:\Unpacked` folder and the selected install folder must be empty. The packer removes older outputs for the selected archive name before building, and rejects source and release folders that overlap.
 
 ## Build
 

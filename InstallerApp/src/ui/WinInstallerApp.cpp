@@ -843,7 +843,7 @@ void SendUiState() {
       << L"\"progress\":" << g_progressPercent << L","
       << L"\"status\":" << JsonString(g_statusText) << L","
       << L"\"logs\":" << logs.str() << L","
-      << L"\"version\":\"Modlist Installer v0.2\","
+      << L"\"version\":\"Modlist Installer v0.2.1\","
       << L"\"options\":{},"
       << L"\"buttons\":{"
       << L"\"back\":false,"
@@ -1157,22 +1157,43 @@ uintmax_t EstimateNearbyArchiveBytes(const std::filesystem::path& folder) {
   return total;
 }
 
-uintmax_t EstimateRequiredBytes(const modlist::PackageDiscovery& package) {
+struct SpaceRequirements {
+  uintmax_t archiveBytes{0};
+  uintmax_t unpackedBytes{0};
+  bool unpackedSizeKnown{false};
+};
+
+SpaceRequirements SpaceRequirementsFromManifest(const modlist::Manifest& manifest) {
+  SpaceRequirements requirements;
+  requirements.archiveBytes = ManifestRequiredBytes(manifest);
+  requirements.unpackedBytes = manifest.unpackedSize > 0 ? manifest.unpackedSize : requirements.archiveBytes;
+  requirements.unpackedSizeKnown = manifest.unpackedSize > 0;
+  return requirements;
+}
+
+SpaceRequirements EstimateSpaceRequirements(const modlist::PackageDiscovery& package) {
   (void)package;
   std::wstring manifestMessage;
   auto manifest = LoadPackageManifest(manifestMessage);
   if (manifest.has_value()) {
-    const uintmax_t manifestBytes = ManifestRequiredBytes(*manifest);
+    const auto requirements = SpaceRequirementsFromManifest(*manifest);
     AppendLog(manifestMessage);
-    AppendLog(L"Размер архива по файлу проверки: " + FormatBytes(manifestBytes));
-    return manifestBytes;
+    AppendLog(L"Размер архива по файлу проверки: " + FormatBytes(requirements.archiveBytes));
+    if (requirements.unpackedSizeKnown) {
+      AppendLog(L"Размер распакованной сборки: " + FormatBytes(requirements.unpackedBytes));
+    } else {
+      AppendLog(L"Размер распакованной сборки отсутствует в старом manifest; используется размер архива.");
+    }
+    return requirements;
   }
 
-  const uintmax_t archiveBytes = EstimateNearbyArchiveBytes(ArchiveFolder());
-  if (archiveBytes > 0) {
-    AppendLog(L"Расчётный размер найденного архива: " + FormatBytes(archiveBytes));
+  SpaceRequirements requirements;
+  requirements.archiveBytes = EstimateNearbyArchiveBytes(ArchiveFolder());
+  requirements.unpackedBytes = requirements.archiveBytes;
+  if (requirements.archiveBytes > 0) {
+    AppendLog(L"Расчётный размер найденного архива: " + FormatBytes(requirements.archiveBytes));
   }
-  return archiveBytes;
+  return requirements;
 }
 
 uintmax_t FreeBytes(const std::filesystem::path& folder) {
@@ -1296,6 +1317,26 @@ bool HasEnoughSpace(const std::filesystem::path& folder, uintmax_t requiredBytes
   const uintmax_t free = FreeBytes(folder);
   AppendLog(label + L": свободно " + FormatBytes(free) + L"; минимум требуется " + FormatBytes(requiredBytes));
   return free >= requiredBytes;
+}
+
+std::optional<std::wstring> FolderMustBeEmptyError(const std::filesystem::path& folder,
+                                                   const std::wstring& label) {
+  std::error_code ec;
+  if (!std::filesystem::exists(folder, ec)) {
+    return ec ? std::optional<std::wstring>(label + L": невозможно проверить папку - " + Widen(ec.message()))
+              : std::nullopt;
+  }
+  if (!std::filesystem::is_directory(folder, ec) || ec) {
+    return label + L": путь не является папкой.";
+  }
+  const bool empty = std::filesystem::is_empty(folder, ec);
+  if (ec) {
+    return label + L": невозможно проверить содержимое - " + Widen(ec.message());
+  }
+  if (!empty) {
+    return label + L" должна быть пустой. Удалите файлы от предыдущей или незавершённой установки.";
+  }
+  return std::nullopt;
 }
 
 void ShowWizardPage(HWND hwnd, WizardPage page) {
@@ -1524,28 +1565,75 @@ struct InstallProgress {
   std::chrono::steady_clock::time_point startedAt{std::chrono::steady_clock::now()};
 };
 
-uintmax_t EstimateInstallBytes(const std::filesystem::path& path) {
+bool ReadDirectoryEntries(const std::filesystem::path& folder,
+                          std::vector<std::filesystem::path>& entries,
+                          std::wstring& error) {
   std::error_code ec;
-  if (!std::filesystem::exists(path, ec) || ec) {
-    return 0;
+  auto iterator = std::filesystem::directory_iterator(folder, ec);
+  const auto end = std::filesystem::directory_iterator();
+  if (ec) {
+    error = L"Невозможно прочитать распакованную папку: " + Widen(ec.message());
+    return false;
   }
-  if (std::filesystem::is_regular_file(path, ec) && !ec) {
-    return std::filesystem::file_size(path, ec);
+  while (iterator != end) {
+    entries.push_back(iterator->path());
+    iterator.increment(ec);
+    if (ec) {
+      error = L"Невозможно прочитать распакованную папку: " + Widen(ec.message());
+      return false;
+    }
   }
-  if (!std::filesystem::is_directory(path, ec) || ec) {
+  return true;
+}
+
+std::optional<uintmax_t> EstimateInstallBytes(const std::filesystem::path& path,
+                                              std::wstring& error) {
+  std::error_code ec;
+  if (!std::filesystem::exists(path, ec)) {
+    error = ec ? L"Невозможно прочитать распакованный файл: " + Widen(ec.message())
+               : L"Невозможно прочитать распакованный файл: " + PathToDisplay(path);
+    return std::nullopt;
+  }
+  if (std::filesystem::is_regular_file(path, ec)) {
+    const auto size = std::filesystem::file_size(path, ec);
+    if (ec) {
+      error = L"Невозможно прочитать распакованный файл: " + PathToDisplay(path);
+      return std::nullopt;
+    }
+    return size;
+  }
+  if (ec || !std::filesystem::is_directory(path, ec)) {
+    if (ec) {
+      error = L"Невозможно прочитать распакованный файл: " + PathToDisplay(path);
+      return std::nullopt;
+    }
     return 0;
   }
 
   uintmax_t total = 0;
-  for (const auto& entry : std::filesystem::recursive_directory_iterator(path, std::filesystem::directory_options::skip_permission_denied, ec)) {
-    if (ec) {
-      break;
-    }
-    if (entry.is_regular_file(ec) && !ec) {
-      total += entry.file_size(ec);
+  auto iterator = std::filesystem::recursive_directory_iterator(path, ec);
+  const auto end = std::filesystem::recursive_directory_iterator();
+  if (ec) {
+    error = L"Невозможно прочитать распакованную папку: " + Widen(ec.message());
+    return std::nullopt;
+  }
+  while (iterator != end) {
+    const auto entry = *iterator;
+    if (entry.is_regular_file(ec)) {
+      const auto size = entry.file_size(ec);
       if (ec) {
-        ec.clear();
+        error = L"Невозможно прочитать распакованный файл: " + PathToDisplay(entry.path());
+        return std::nullopt;
       }
+      total += size;
+    } else if (ec) {
+      error = L"Невозможно прочитать распакованный файл: " + PathToDisplay(entry.path());
+      return std::nullopt;
+    }
+    iterator.increment(ec);
+    if (ec) {
+      error = L"Невозможно прочитать распакованную папку: " + Widen(ec.message());
+      return std::nullopt;
     }
   }
   return total;
@@ -1608,7 +1696,7 @@ bool MoveWholeEntry(const std::filesystem::path& source,
     flags |= MOVEFILE_REPLACE_EXISTING;
   }
   if (!MoveFileExW(source.wstring().c_str(), target.wstring().c_str(), flags)) {
-    error = L"Невозможно скопировать " + PathToDisplay(source) + L" в " + PathToDisplay(target) +
+    error = L"Невозможно переместить " + PathToDisplay(source) + L" в " + PathToDisplay(target) +
             L" (Windows error " + std::to_wstring(GetLastError()) + L").";
     return false;
   }
@@ -1684,11 +1772,14 @@ bool InstallEntry(HWND hwnd,
   }
   std::error_code ec;
   if (sameDrive && !std::filesystem::exists(target, ec)) {
-    const uintmax_t movedBytes = EstimateInstallBytes(source);
+    const auto movedBytes = EstimateInstallBytes(source, error);
+    if (!movedBytes.has_value()) {
+      return false;
+    }
     if (!MoveWholeEntry(source, target, error)) {
       return false;
     }
-    UpdateInstallProgress(progress, movedBytes, true);
+    UpdateInstallProgress(progress, *movedBytes, true);
     return true;
   }
 
@@ -1698,16 +1789,16 @@ bool InstallEntry(HWND hwnd,
       error = L"Невозможно создать папку установки: " + Widen(ec.message());
       return false;
     }
-    for (const auto& entry : std::filesystem::directory_iterator(source, ec)) {
+    std::vector<std::filesystem::path> entries;
+    if (!ReadDirectoryEntries(source, entries, error)) {
+      return false;
+    }
+    for (const auto& entry : entries) {
       if (g_stopRequested.load()) {
         error = L"Установка остановлена пользователем";
         return false;
       }
-      if (ec) {
-        error = L"Невозможно прочитать распакованную папку: " + Widen(ec.message());
-        return false;
-      }
-      if (!InstallEntry(hwnd, entry.path(), target / entry.path().filename(), sameDrive, progress, error)) {
+      if (!InstallEntry(hwnd, entry, target / entry.filename(), sameDrive, progress, error)) {
         return false;
       }
     }
@@ -1720,11 +1811,14 @@ bool InstallEntry(HWND hwnd,
   }
 
   if (sameDrive) {
-    const uintmax_t movedBytes = EstimateInstallBytes(source);
+    const auto movedBytes = EstimateInstallBytes(source, error);
+    if (!movedBytes.has_value()) {
+      return false;
+    }
     if (!MoveWholeEntry(source, target, error)) {
       return false;
     }
-    UpdateInstallProgress(progress, movedBytes, true);
+    UpdateInstallProgress(progress, *movedBytes, true);
     return true;
   }
 
@@ -1752,6 +1846,11 @@ bool InstallExtractedFiles(HWND hwnd, const std::filesystem::path& unpackFolder,
     PostLog(hwnd, L"Папка установки не может располагаться в папке распаковки");
     return false;
   }
+  if (const auto emptyError = FolderMustBeEmptyError(installFolder, L"Папка установки");
+      emptyError.has_value()) {
+    PostLog(hwnd, *emptyError);
+    return false;
+  }
 
   std::error_code ec;
   std::filesystem::create_directories(installFolder, ec);
@@ -1767,13 +1866,20 @@ bool InstallExtractedFiles(HWND hwnd, const std::filesystem::path& unpackFolder,
 
   InstallProgress installProgress;
   installProgress.hwnd = hwnd;
-  for (const auto& entry : std::filesystem::directory_iterator(unpackFolder, ec)) {
-    if (ec) {
-      PostLog(hwnd, L"Невозможно прочитать распакованную папку: " + Widen(ec.message()));
-      return false;
-    }
-    if (entry.path().filename() != ".install_temp") {
-      installProgress.totalBytes += EstimateInstallBytes(entry.path());
+  std::wstring error;
+  std::vector<std::filesystem::path> entries;
+  if (!ReadDirectoryEntries(unpackFolder, entries, error)) {
+    PostLog(hwnd, error);
+    return false;
+  }
+  for (const auto& entry : entries) {
+    if (entry.filename() != ".install_temp") {
+      const auto entryBytes = EstimateInstallBytes(entry, error);
+      if (!entryBytes.has_value()) {
+        PostLog(hwnd, error);
+        return false;
+      }
+      installProgress.totalBytes += *entryBytes;
     }
   }
   PostLog(hwnd, L"Размер сборки: " + FormatBytes(installProgress.totalBytes));
@@ -1787,28 +1893,23 @@ bool InstallExtractedFiles(HWND hwnd, const std::filesystem::path& unpackFolder,
   }
   UpdateInstallProgress(installProgress, 0, true);
 
-  std::wstring error;
-  for (const auto& entry : std::filesystem::directory_iterator(unpackFolder, ec)) {
+  for (const auto& entry : entries) {
     if (g_stopRequested.load()) {
       PostLog(hwnd, L"Установка остановлена пользователем");
       return false;
     }
-    if (ec) {
-      PostLog(hwnd, L"Невозможно прочитать распакованную папку: " + Widen(ec.message()));
-      return false;
-    }
-    if (entry.path().filename() == ".install_temp") {
-      std::filesystem::remove_all(entry.path(), ec);
+    if (entry.filename() == ".install_temp") {
+      std::filesystem::remove_all(entry, ec);
       if (ec) {
         PostLog(hwnd, L"Невозможно удалить временную папку: " + Widen(ec.message()));
         return false;
       }
-      continue;
-    }
-    const auto target = installFolder / entry.path().filename();
-    if (!InstallEntry(hwnd, entry.path(), target, sameDrive, installProgress, error)) {
-      PostLog(hwnd, error);
-      return false;
+    } else {
+      const auto target = installFolder / entry.filename();
+      if (!InstallEntry(hwnd, entry, target, sameDrive, installProgress, error)) {
+        PostLog(hwnd, error);
+        return false;
+      }
     }
   }
 
@@ -1857,16 +1958,46 @@ void RunInstallWorker(HWND hwnd,
 
   PostLog(hwnd, L"Выбранная папка установки: " + PathToDisplay(installFolder));
 
-  const uintmax_t archiveBytes = EstimateNearbyArchiveBytes(firstArchivePart->parent_path());
-  if (archiveBytes > 0) {
+  if (const auto emptyError = FolderMustBeEmptyError(unpackFolder, L"Папка распаковки");
+      emptyError.has_value()) {
+    PostLog(hwnd, *emptyError);
+    FinishWorker(hwnd);
+    return;
+  }
+  if (!IsSameFolder(unpackFolder, installFolder)) {
+    if (const auto emptyError = FolderMustBeEmptyError(installFolder, L"Папка установки");
+        emptyError.has_value()) {
+      PostLog(hwnd, *emptyError);
+      FinishWorker(hwnd);
+      return;
+    }
+  }
+
+  modlist::PathValidator pathValidator;
+  const bool sameVolume = pathValidator.IsSameDrive(unpackFolder, installFolder);
+  const auto requirements = SpaceRequirementsFromManifest(*manifest);
+  const auto plan = modlist::PlanInstallSpace(requirements.unpackedBytes, sameVolume);
+  if (plan.unpackRequiredBytes > 0) {
     const uintmax_t unpackFree = FreeBytes(unpackFolder);
     PostLog(hwnd, L"Свободное место для распаковки: " + FormatBytes(unpackFree) +
-                      L"; минимальный размер архива: " + FormatBytes(archiveBytes));
-    if (unpackFree < archiveBytes) {
+                      L"; требуется с запасом: " + FormatBytes(plan.unpackRequiredBytes));
+    if (unpackFree < plan.unpackRequiredBytes) {
       PostLog(hwnd, L"Не хватает места для распаковки архива");
       FinishWorker(hwnd);
       return;
     }
+  }
+  if (plan.installRequiredBytes > 0) {
+    const uintmax_t installFree = FreeBytes(installFolder);
+    PostLog(hwnd, L"Свободное место для установки: " + FormatBytes(installFree) +
+                      L"; требуется: " + FormatBytes(plan.installRequiredBytes));
+    if (installFree < plan.installRequiredBytes) {
+      PostLog(hwnd, L"Не хватает места для установки распакованных файлов");
+      FinishWorker(hwnd);
+      return;
+    }
+  } else if (requirements.unpackedBytes > 0) {
+    PostLog(hwnd, L"Распаковка и установка находятся на одном томе; вторая полная копия не требуется.");
   }
 
   modlist::SevenZipExtractor extractor;
@@ -1889,41 +2020,64 @@ void RunInstallWorker(HWND hwnd,
   FinishWorker(hwnd);
 }
 
-bool ValidateFolders(uintmax_t knownRequiredBytes = 0) {
+bool ValidateFolders(const SpaceRequirements& requirements = {}) {
   modlist::PathValidator validator;
   bool ok = true;
 
   const auto installText = GetText(g_installEdit);
+  const auto installFolder = std::filesystem::path(installText);
   const auto unpackFolder = SelectedUnpackFolder();
   if (!unpackFolder.empty()) {
-    const auto result = validator.ValidateInstallFolder(unpackFolder, knownRequiredBytes);
+    const auto result = validator.ValidateInstallFolder(unpackFolder);
     AppendLog(L"Unpack folder: " + PathToDisplay(unpackFolder) + L" - " + Widen(result.message));
     if (result.warning) {
       AppendLog(L"Warning: " + Widen(result.message));
     }
     ok = ok && result.ok;
+    if (result.ok) {
+      if (const auto emptyError = FolderMustBeEmptyError(unpackFolder, L"Папка распаковки");
+          emptyError.has_value()) {
+        AppendLog(*emptyError);
+        ok = false;
+      }
+    }
   } else {
     AppendLog(L"Диск для распаковки не выбран.");
     ok = false;
   }
 
   if (!installText.empty()) {
-    const auto result = validator.ValidateInstallFolder(std::filesystem::path(installText), knownRequiredBytes);
+    const auto result = validator.ValidateInstallFolder(installFolder);
     AppendLog(L"Install folder: " + Widen(result.message));
     if (result.warning) {
       AppendLog(L"Warning: " + Widen(result.message));
     }
     ok = ok && result.ok;
+    if (result.ok && (unpackFolder.empty() || !IsSameFolder(unpackFolder, installFolder))) {
+      if (const auto emptyError = FolderMustBeEmptyError(installFolder, L"Папка установки");
+          emptyError.has_value()) {
+        AppendLog(*emptyError);
+        ok = false;
+      }
+    }
   } else {
     AppendLog(L"Папка установки не выбрана.");
     ok = false;
   }
 
-  if (!unpackFolder.empty() && !HasEnoughSpace(unpackFolder, knownRequiredBytes, L"Папка распаковки")) {
-    ok = false;
-  }
-  if (!installText.empty() && !HasEnoughSpace(std::filesystem::path(installText), knownRequiredBytes, L"Папка установки")) {
-    ok = false;
+  if (!unpackFolder.empty() && !installText.empty()) {
+    const bool sameVolume = validator.IsSameDrive(unpackFolder, installFolder);
+    const auto plan = modlist::PlanInstallSpace(requirements.unpackedBytes, sameVolume);
+    if (!HasEnoughSpace(unpackFolder, plan.unpackRequiredBytes, L"Папка распаковки")) {
+      ok = false;
+    }
+    if (plan.installRequiredBytes > 0) {
+      if (!HasEnoughSpace(installFolder, plan.installRequiredBytes, L"Папка установки")) {
+        ok = false;
+      }
+    } else if (requirements.unpackedBytes > 0) {
+      AppendLog(L"Папки находятся на одном томе: установка будет перемещением и не требует второй полной копии.");
+    }
   }
 
   return ok;
@@ -1951,6 +2105,9 @@ void ValidatePackage() {
   if (manifest.has_value()) {
     AppendLog(L"Manifest files: " + std::to_wstring(manifest->files.size()));
     AppendLog(L"Manifest archive entry: " + PathToDisplay(manifest->extract.firstArchivePart));
+    if (manifest->unpackedSize > 0) {
+      AppendLog(L"Размер распакованной сборки: " + FormatBytes(manifest->unpackedSize));
+    }
     if (!VerifyPackageManifest(GetParent(g_progress), *manifest)) {
       SendMessageW(g_progress, PBM_SETPOS, 0, 0);
       SendUiProgress(0, L"Ошибка проверки");
@@ -1958,8 +2115,8 @@ void ValidatePackage() {
     }
   }
 
-  const uintmax_t knownRequiredBytes = EstimateRequiredBytes(package.value());
-  ValidateFolders(knownRequiredBytes);
+  const auto requirements = EstimateSpaceRequirements(package.value());
+  ValidateFolders(requirements);
 
   modlist::SevenZipExtractor extractor;
   auto sevenZip = extractor.LocateExecutable(ExeFolder());
@@ -2003,8 +2160,8 @@ void StartInstall(HWND hwnd) {
     AppendLog(L"Ошибка сборки: " + Widen(package.error()));
     return;
   }
-  const uintmax_t knownRequiredBytes = EstimateRequiredBytes(package.value());
-  if (!ValidateFolders(knownRequiredBytes)) {
+  const auto requirements = EstimateSpaceRequirements(package.value());
+  if (!ValidateFolders(requirements)) {
     AppendLog(L"Исправьте ошибки перед началом.");
     return;
   }
@@ -2023,12 +2180,21 @@ void RunUnpackWorker(HWND hwnd, std::filesystem::path archiveFirstPart, std::fil
   PostProgress(hwnd, 0);
   PostLog(hwnd, L"Распаковка архива: " + PathToDisplay(archiveFirstPart));
 
+  if (const auto emptyError = FolderMustBeEmptyError(unpackFolder, L"Папка распаковки");
+      emptyError.has_value()) {
+    PostLog(hwnd, *emptyError);
+    g_workerRunning = false;
+    PostMessageW(hwnd, kWorkerFinishedMessage, 0, 0);
+    return;
+  }
+
   const uintmax_t archiveBytes = EstimateNearbyArchiveBytes(archiveFirstPart.parent_path());
   if (archiveBytes > 0) {
+    const uintmax_t requiredBytes = modlist::ExtractionSpaceRequirement(archiveBytes);
     const uintmax_t unpackFree = FreeBytes(unpackFolder);
     PostLog(hwnd, L"Свободное место для распаковки: " + FormatBytes(unpackFree) +
-                      L"; минимальный размер архива: " + FormatBytes(archiveBytes));
-    if (unpackFree < archiveBytes) {
+                      L"; требуется с запасом: " + FormatBytes(requiredBytes));
+    if (unpackFree < requiredBytes) {
       PostLog(hwnd, L"Не хватает места для распаковки архива");
       g_workerRunning = false;
       PostMessageW(hwnd, kWorkerFinishedMessage, 0, 0);
@@ -2306,6 +2472,9 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
       if (manifest.has_value()) {
         AppendLog(L"Manifest archive size: " + FormatBytes(ManifestRequiredBytes(*manifest)));
         AppendLog(L"Manifest archive entry: " + PathToDisplay(manifest->extract.firstArchivePart));
+        if (manifest->unpackedSize > 0) {
+          AppendLog(L"Unpacked payload size: " + FormatBytes(manifest->unpackedSize));
+        }
       } else {
         auto package = ReadPackageFromUi();
         if (!package.ok()) {
@@ -2451,8 +2620,8 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
       return 0;
     }
     case kValidationFailedMessage:
-      SendUiError(L"Ошибка проверки", L"Проверка завершилась ошибкой. Проверьте файлы.");
-      MessageBoxW(hwnd, L"Проверка завершилась ошибкой. Проверьте файлы.", L"Ошибка проверки", MB_OK | MB_ICONERROR);
+      SendUiError(L"Ошибка проверки", L"Проверка завершилась ошибкой. Перехешируйте торрент файлы.");
+      MessageBoxW(hwnd, L"Проверка завершилась ошибкой. Перехешируйте торрент файлы.", L"Ошибка проверки", MB_OK | MB_ICONERROR);
       return 0;
     case kWorkerFinishedMessage:
       SetControlsRunning(hwnd, false);

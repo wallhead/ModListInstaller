@@ -15,6 +15,14 @@ struct PathValidationResult {
   uintmax_t freeBytes{0};
 };
 
+struct InstallSpacePlan {
+  uintmax_t unpackRequiredBytes{0};
+  uintmax_t installRequiredBytes{0};
+};
+
+uintmax_t ExtractionSpaceRequirement(uintmax_t unpackedBytes);
+InstallSpacePlan PlanInstallSpace(uintmax_t unpackedBytes, bool sameVolume);
+
 class IPathValidator {
 public:
   virtual ~IPathValidator() = default;

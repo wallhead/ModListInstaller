@@ -126,6 +126,13 @@ Result<Manifest> ParsePackerManifest(const JsonValue& root) {
     manifest.files.push_back(std::move(file.value()));
   }
 
+  if (const JsonValue* unpackedSize = root.Find("unpacked_size"); unpackedSize != nullptr) {
+    if (!unpackedSize->IsNumber() || unpackedSize->AsNumber() < 0) {
+      return Result<Manifest>::Error("Manifest field 'unpacked_size' must be a non-negative number");
+    }
+    manifest.unpackedSize = static_cast<uint64_t>(unpackedSize->AsNumber());
+  }
+
   manifest.extract.firstArchivePart = SelectFirstArchivePart(manifest.files);
   if (manifest.extract.firstArchivePart.empty() || !IsSafeManifestRelativePath(manifest.extract.firstArchivePart)) {
     return Result<Manifest>::Error("Unable to infer a safe archive file from packer manifest");
@@ -255,6 +262,13 @@ Result<Manifest> ManifestLoader::LoadFromString(const std::string& jsonText) con
       return Result<Manifest>::Error(file.error());
     }
     manifest.files.push_back(std::move(file.value()));
+  }
+
+  if (const JsonValue* unpackedSize = root.Find("unpacked_size"); unpackedSize != nullptr) {
+    if (!unpackedSize->IsNumber() || unpackedSize->AsNumber() < 0) {
+      return Result<Manifest>::Error("Manifest field 'unpacked_size' must be a non-negative number");
+    }
+    manifest.unpackedSize = static_cast<uint64_t>(unpackedSize->AsNumber());
   }
 
   const JsonValue* extract = root.Find("extract");

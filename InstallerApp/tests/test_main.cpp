@@ -55,6 +55,7 @@ std::string PackerManifestJson(const std::string& hash) {
   return std::string(R"({
     "schema": "modlist-manifest-chunks-v1",
     "archive_name": "MyPack",
+    "unpacked_size": 7,
     "hash": {
       "algorithm": "sha256",
       "chunk_size": 67108864
@@ -93,6 +94,7 @@ void TestPackerManifestLoader() {
   Expect(manifest.value().files.size() == 1, "Packer manifest file count mismatch");
   Expect(manifest.value().files[0].path == "MyPack.7z.001", "Packer manifest file path mismatch");
   Expect(manifest.value().extract.firstArchivePart == "MyPack.7z.001", "Packer manifest archive mismatch");
+  Expect(manifest.value().unpackedSize == 7, "Packer manifest unpacked size mismatch");
 }
 
 void TestManifestRejectsTraversal() {
@@ -186,6 +188,36 @@ void TestPackageDiscoveryWithoutTorrent() {
   Expect(package.value().firstArchivePart.has_value(), "Package discovery should still find archive");
 }
 
+void TestInstallSpacePlanning() {
+  constexpr uintmax_t gib = 1024ull * 1024ull * 1024ull;
+  const auto unknown = PlanInstallSpace(0, true);
+  Expect(unknown.unpackRequiredBytes == 0 && unknown.installRequiredBytes == 0,
+         "Unknown payload size should remain unknown");
+
+  const auto sameVolume = PlanInstallSpace(10 * gib, true);
+  Expect(sameVolume.unpackRequiredBytes == 10 * gib + 512ull * 1024ull * 1024ull,
+         "Same-volume unpack requirement should include extraction overhead");
+  Expect(sameVolume.installRequiredBytes == 0,
+         "Same-volume install should not require a second payload copy");
+
+  const auto crossVolume = PlanInstallSpace(20 * gib, false);
+  Expect(crossVolume.unpackRequiredBytes == 21 * gib,
+         "Large unpack requirement should include five percent overhead");
+  Expect(crossVolume.installRequiredBytes == 20 * gib,
+         "Cross-volume install should require one payload copy");
+}
+
+void TestSameVolumeDetection() {
+  const auto root = std::filesystem::temp_directory_path() / "modlist_installer_volume_tests";
+  const auto left = root / "left";
+  const auto right = root / "right";
+  std::filesystem::create_directories(left);
+  std::filesystem::create_directories(right);
+
+  PathValidator validator;
+  Expect(validator.IsSameDrive(left, right), "Folders on the same Windows volume should match");
+}
+
 }  // namespace
 
 int main() {
@@ -200,6 +232,8 @@ int main() {
     TestExtractorCommand();
     TestPackageDiscovery();
     TestPackageDiscoveryWithoutTorrent();
+    TestInstallSpacePlanning();
+    TestSameVolumeDetection();
   } catch (const std::exception& ex) {
     std::cerr << "Test failed: " << ex.what() << "\n";
     return 1;

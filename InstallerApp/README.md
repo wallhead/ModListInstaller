@@ -32,12 +32,12 @@ The `Install` button runs the install pipeline on a background thread:
 
 - load `data\package\manifest.json`
 - validate unpack and install folders
-- check manifest archive size against free space
+- check the manifest's unpacked payload size plus extraction overhead against free space
 - verify archive file sizes and SHA256 hashes from the manifest
 - show validation progress, speed, ETA, and elapsed time
 - auto-select sequential HDD validation or parallel SSD validation
 - look for the archive named by the manifest in `data\downloads`
-- check unpack free space again before extraction
+- check unpack free space again before extraction; same-volume installs do not reserve a second full copy
 - show live unpack percentage, speed, and ETA in the progress bar and status line
 - show live install percentage, speed, ETA, and elapsed time in the status line
 - install from the unpack folder into the final install folder, using same-drive move/cut semantics instead of copying when both folders are on the same drive
@@ -49,6 +49,8 @@ The `Install` button runs the install pipeline on a background thread:
 The GUI is organized as a single WebView2-powered installer screen with unpack drive, final install folder, progress, and log output.
 
 The unpack drive selector asks only for a drive letter. The app derives the unpack target as `<drive>:\Unpacked`, for example `X:\Unpacked`.
+
+The unpack and install folders must be empty before installation begins. On different volumes, the installer also requires enough destination space for the full unpacked payload. Manifests without `unpacked_size` remain supported and use the archive size as an approximate compatibility fallback.
 
 ## Ready Binary
 
@@ -149,4 +151,4 @@ Run from that folder:
 modlist-installer.exe
 ```
 
-The GUI requires `data\package\manifest.json`, loads UI from `data\ui`, uses archive files from `data\downloads`, uses manifest file sizes for space checks, and verifies SHA256 before extraction. If the manifest is missing, invalid, or the hashes fail, install stops and shows a validation failure message.
+The GUI requires `data\package\manifest.json`, loads UI from `data\ui`, uses archive files from `data\downloads`, uses the manifest's `unpacked_size` for space checks, and verifies SHA256 before extraction. If the manifest is missing, invalid, or the hashes fail, install stops and shows a validation failure message.

@@ -36,6 +36,7 @@ The manifest stores:
 - full-file SHA-256
 - per-chunk SHA-256
 - chunk size
+- total unpacked payload size
 
 The default chunk size is 64 MiB.
 
@@ -50,6 +51,8 @@ The default compression profile is tuned to avoid surprise high RAM use:
 - threads `4`
 
 `Build Package` writes archive parts into `data\downloads`, writes the manifest into `data\package`, and refreshes the installer exe plus `data\ui`.
+
+Before a build, the packer removes older archive parts for the selected archive name and the previous manifest. Source and release folders cannot be the same folder or contain one another, preventing the release output from being archived recursively.
 
 `Manifest Only` scans `data\downloads` for archive outputs only. It includes the exact archive file or numeric split volumes such as `MyPack.7z.001`, ignores side files like `.tmp` and logs, and writes `archive_name` from the real detected archive name. If more than one archive set is present, enter the wanted archive name first.
 
