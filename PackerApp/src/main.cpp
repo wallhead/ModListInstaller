@@ -401,28 +401,54 @@ uint64_t ParseSizeText(const std::wstring& text, uint64_t fallback) {
   }
 }
 
-uint64_t EstimateFolderBytes(const std::filesystem::path& folder) {
+uint64_t EstimateFolderBytes(HWND hwnd, const std::filesystem::path& folder) {
   std::error_code ec;
   if (!std::filesystem::exists(folder, ec) || !std::filesystem::is_directory(folder, ec)) {
     return 0;
   }
 
   uint64_t total = 0;
-  for (const auto& entry : std::filesystem::recursive_directory_iterator(
-           folder, std::filesystem::directory_options::skip_permission_denied, ec)) {
+  uint64_t fileCount = 0;
+  const auto startedAt = std::chrono::steady_clock::now();
+  auto lastStatusAt = startedAt - std::chrono::seconds(1);
+  PostProgress(hwnd, 0);
+  PostStatus(hwnd, L"Scanning source files | 0 files | 0 B | Elapsed 0s");
+
+  auto iterator = std::filesystem::recursive_directory_iterator(
+      folder, std::filesystem::directory_options::skip_permission_denied, ec);
+  const auto end = std::filesystem::recursive_directory_iterator();
+  while (!g_cancelRequested && iterator != end) {
+    const auto entry = *iterator;
+    if (entry.is_regular_file(ec) && !ec) {
+      const auto size = entry.file_size(ec);
+      if (!ec) {
+        total += size;
+        ++fileCount;
+      }
+    }
     if (ec) {
       ec.clear();
-      continue;
     }
-    if (!entry.is_regular_file(ec) || ec) {
-      ec.clear();
-      continue;
-    }
-    total += entry.file_size(ec);
+    iterator.increment(ec);
     if (ec) {
       ec.clear();
+    }
+
+    const auto now = std::chrono::steady_clock::now();
+    if (now - lastStatusAt >= std::chrono::seconds(1)) {
+      const auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - startedAt).count();
+      PostStatus(hwnd, L"Scanning source files | " + std::to_wstring(fileCount) +
+                           L" files | " + FormatBytes(total) +
+                           L" | Elapsed " + FormatDuration(elapsed));
+      lastStatusAt = now;
     }
   }
+
+  const auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+      std::chrono::steady_clock::now() - startedAt).count();
+  PostStatus(hwnd, L"Source scan complete | " + std::to_wstring(fileCount) +
+                       L" files | " + FormatBytes(total) +
+                       L" | Elapsed " + FormatDuration(elapsed));
   return total;
 }
 
@@ -819,11 +845,38 @@ std::vector<std::filesystem::path> FindArchivePartsForBase(const std::filesystem
   return files;
 }
 
+std::vector<std::filesystem::path> FindArchiveOutputsAndTemps(const std::filesystem::path& folder,
+                                                              const std::wstring& base) {
+  auto files = FindArchivePartsForBase(folder, base);
+  std::error_code ec;
+  const auto lowerBase = Lower(base);
+  const auto tempPrefix = lowerBase + L".";
+  for (const auto& entry : std::filesystem::directory_iterator(folder, ec)) {
+    if (ec) {
+      break;
+    }
+    if (!entry.is_regular_file(ec) || ec) {
+      ec.clear();
+      continue;
+    }
+    const auto lowerName = Lower(entry.path().filename().wstring());
+    const bool selectedArchiveTemp =
+        lowerName == lowerBase + L".tmp" ||
+        (lowerName.starts_with(tempPrefix) && lowerName.ends_with(L".tmp"));
+    if (selectedArchiveTemp &&
+        std::find(files.begin(), files.end(), entry.path()) == files.end()) {
+      files.push_back(entry.path());
+    }
+  }
+  std::sort(files.begin(), files.end());
+  return files;
+}
+
 bool RemovePreviousPackageOutputs(HWND hwnd, const PackerConfig& config) {
   std::error_code ec;
   for (const auto* extension : {L".7z", L".zip"}) {
     const auto base = config.archiveName + extension;
-    for (const auto& file : FindArchivePartsForBase(DownloadsFolder(config), base)) {
+    for (const auto& file : FindArchiveOutputsAndTemps(DownloadsFolder(config), base)) {
       std::filesystem::remove(file, ec);
       if (ec) {
         PostLog(hwnd, L"Unable to remove previous archive part: " + file.wstring() + L" - " + Widen(ec.message()));
@@ -1168,6 +1221,7 @@ int RunProcess(HWND hwnd, const std::wstring& command, const std::wstring& label
   std::string tail;
   int lastPercent = -1;
   const auto startedAt = std::chrono::steady_clock::now();
+  auto lastHeartbeatAt = startedAt;
   UpdateProcessProgressStatus(hwnd, label, 0, estimatedBytes, startedAt);
 
   while (true) {
@@ -1187,10 +1241,21 @@ int RunProcess(HWND hwnd, const std::wstring& command, const std::wstring& label
       available = 0;
     }
 
+    const auto now = std::chrono::steady_clock::now();
+    if (now - lastHeartbeatAt >= std::chrono::seconds(1)) {
+      UpdateProcessProgressStatus(hwnd, label, std::max(0, lastPercent), estimatedBytes, startedAt);
+      lastHeartbeatAt = now;
+    }
+
     const DWORD wait = WaitForSingleObject(process.hProcess, 100);
     if (wait == WAIT_OBJECT_0) {
-      DWORD bytesRead = 0;
-      while (ReadFile(readPipe, buffer, sizeof(buffer), &bytesRead, nullptr) && bytesRead > 0) {
+      DWORD remaining = 0;
+      while (PeekNamedPipe(readPipe, nullptr, 0, nullptr, &remaining, nullptr) && remaining > 0) {
+        DWORD bytesRead = 0;
+        const DWORD toRead = std::min<DWORD>(remaining, sizeof(buffer));
+        if (!ReadFile(readPipe, buffer, toRead, &bytesRead, nullptr) || bytesRead == 0) {
+          break;
+        }
         ConsumeProcessOutput(hwnd, buffer, bytesRead, tail, lastPercent, label, estimatedBytes, startedAt);
       }
       break;
@@ -1366,21 +1431,23 @@ void Worker(HWND hwnd, PackerConfig config) {
     PostLog(hwnd, L"Creating archive...");
     PostLog(hwnd, L"Archive output folder: " + DownloadsFolder(config).wstring());
     PostLog(hwnd, L"7-Zip command: " + BuildSevenZipCommand(config));
-    unpackedSize = EstimateFolderBytes(config.sourceFolder);
+    unpackedSize = EstimateFolderBytes(hwnd, config.sourceFolder);
     if (unpackedSize > 0) {
       PostLog(hwnd, L"Packing input size estimate (uncompressed source): " + FormatBytes(unpackedSize));
     }
-    PostStatus(hwnd, L"Packing input");
-    const int exitCode = RunProcess(hwnd, BuildSevenZipCommand(config), L"Packing input", unpackedSize);
-    if (exitCode != 0) {
-      PostLog(hwnd, L"7-Zip failed with exit code " + std::to_wstring(exitCode));
-      ok = false;
-    } else {
-      PostLog(hwnd, L"Archive creation completed.");
+    if (!g_cancelRequested) {
+      PostStatus(hwnd, L"Starting 7-Zip...");
+      const int exitCode = RunProcess(hwnd, BuildSevenZipCommand(config), L"Packing archive", unpackedSize);
+      if (exitCode != 0) {
+        PostLog(hwnd, L"7-Zip failed with exit code " + std::to_wstring(exitCode));
+        ok = false;
+      } else {
+        PostLog(hwnd, L"Archive creation completed.");
+      }
     }
     if (ok && config.testArchive && !g_cancelRequested) {
       PostLog(hwnd, L"Testing archive...");
-      PostStatus(hwnd, L"Testing archive");
+      PostStatus(hwnd, L"Starting archive test...");
       uint64_t archiveBytes = 0;
       for (const auto& file : FindArchivePartsForBase(DownloadsFolder(config), config.archiveName + SelectArchiveExtension(config))) {
         std::error_code ec;

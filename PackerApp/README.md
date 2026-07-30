@@ -52,7 +52,9 @@ The default compression profile is tuned to avoid surprise high RAM use:
 
 `Build Package` writes archive parts into `data\downloads`, writes the manifest into `data\package`, and refreshes the installer exe plus `data\ui`.
 
-Before a build, the packer removes older archive parts for the selected archive name and the previous manifest. Source and release folders cannot be the same folder or contain one another, preventing the release output from being archived recursively.
+Before a build, the packer removes older archive parts, interrupted `.tmp` files for the selected archive name, and the previous manifest. Source and release folders cannot be the same folder or contain one another, preventing the release output from being archived recursively.
+
+The status line reports source scan file count, accumulated size, and elapsed time. During 7-Zip packing and testing, elapsed time continues updating every second even when the integer archive percentage has not changed.
 
 `Manifest Only` scans `data\downloads` for archive outputs only. It includes the exact archive file or numeric split volumes such as `MyPack.7z.001`, ignores side files like `.tmp` and logs, and writes `archive_name` from the real detected archive name. If more than one archive set is present, enter the wanted archive name first.
 

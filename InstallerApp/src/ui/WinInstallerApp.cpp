@@ -843,7 +843,7 @@ void SendUiState() {
       << L"\"progress\":" << g_progressPercent << L","
       << L"\"status\":" << JsonString(g_statusText) << L","
       << L"\"logs\":" << logs.str() << L","
-      << L"\"version\":\"Modlist Installer v0.2.1\","
+      << L"\"version\":\"Modlist Installer v0.2.2\","
       << L"\"options\":{},"
       << L"\"buttons\":{"
       << L"\"back\":false,"
