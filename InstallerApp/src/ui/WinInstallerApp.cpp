@@ -86,6 +86,7 @@ HWND g_nextButton = nullptr;
 HWND g_hotButton = nullptr;
 std::unique_ptr<modlist::WebViewHost> g_webView;
 std::vector<std::wstring> g_uiLogLines;
+std::wstring g_archiveFolderName;
 std::wstring g_statusText = L"Ожидание | Ожидание проверки";
 int g_progressPercent = 0;
 bool g_webUiVisible = false;
@@ -766,6 +767,15 @@ std::wstring JsonArray(const std::vector<std::wstring>& values) {
   return out.str();
 }
 
+std::filesystem::path FinalInstallFolder(const std::filesystem::path& selectedRoot) {
+  if (selectedRoot.empty() || g_archiveFolderName.empty()) {
+    return {};
+  }
+  auto result = modlist::ResolveArchiveInstallFolder(
+      selectedRoot, Narrow(g_archiveFolderName));
+  return result.ok() ? result.value() : std::filesystem::path{};
+}
+
 bool IsWindowEnabledSafe(HWND hwnd) {
   return hwnd != nullptr && IsWindowEnabled(hwnd) != FALSE;
 }
@@ -821,6 +831,8 @@ void SendUiState() {
   const auto unpackFolder = SelectedUnpackFolder();
   const std::wstring unpackTarget =
       unpackFolder.empty() ? L"Выберите диск" : unpackFolder.wstring();
+  const auto finalInstallFolder =
+      FinalInstallFolder(std::filesystem::path(GetText(g_installEdit)));
   HWND parent = g_progress != nullptr ? GetParent(g_progress) : nullptr;
 
   std::wostringstream logs;
@@ -837,13 +849,14 @@ void SendUiState() {
   out << L"{\"type\":\"state\",\"state\":{"
       << L"\"step\":" << JsonString(UiStepForPage(g_page)) << L","
       << L"\"installFolder\":" << JsonString(GetText(g_installEdit)) << L","
+      << L"\"finalInstallFolder\":" << JsonString(finalInstallFolder.wstring()) << L","
       << L"\"unpackDrive\":" << JsonString(ComboText(g_unpackDriveCombo)) << L","
       << L"\"unpackTarget\":" << JsonString(unpackTarget) << L","
       << L"\"drives\":" << JsonArray(AvailableDrives()) << L","
       << L"\"progress\":" << g_progressPercent << L","
       << L"\"status\":" << JsonString(g_statusText) << L","
       << L"\"logs\":" << logs.str() << L","
-      << L"\"version\":\"Modlist Installer v0.2.3\","
+      << L"\"version\":\"Modlist Installer v0.2.4\","
       << L"\"options\":{},"
       << L"\"buttons\":{"
       << L"\"back\":false,"
@@ -1930,6 +1943,12 @@ bool InstallExtractedFiles(HWND hwnd, const std::filesystem::path& unpackFolder,
     }
   }
 
+  std::filesystem::remove(unpackFolder, ec);
+  if (ec) {
+    PostLog(hwnd, L"Установка выполнена, но невозможно удалить папку распаковки: " +
+                      Widen(ec.message()));
+  }
+
   PostProgress(hwnd, 100);
   PostStatus(hwnd, L"Установка 100%");
   PostLog(hwnd, L"Установка выполнена");
@@ -2044,7 +2063,8 @@ bool ValidateFolders(const SpaceRequirements& requirements = {}) {
   bool ok = true;
 
   const auto installText = GetText(g_installEdit);
-  const auto installFolder = std::filesystem::path(installText);
+  const auto selectedInstallRoot = std::filesystem::path(installText);
+  const auto installFolder = FinalInstallFolder(selectedInstallRoot);
   const auto unpackFolder = SelectedUnpackFolder();
   if (!unpackFolder.empty()) {
     const auto result = validator.ValidateInstallFolder(unpackFolder);
@@ -2065,13 +2085,18 @@ bool ValidateFolders(const SpaceRequirements& requirements = {}) {
     ok = false;
   }
 
-  if (!installText.empty()) {
+  if (!installText.empty() && !installFolder.empty()) {
     const auto result = validator.ValidateInstallFolder(installFolder);
-    AppendLog(L"Install folder: " + Widen(result.message));
+    AppendLog(L"Итоговая папка установки: " + PathToDisplay(installFolder) +
+              L" - " + Widen(result.message));
     if (result.warning) {
       AppendLog(L"Warning: " + Widen(result.message));
     }
     ok = ok && result.ok;
+    if (!unpackFolder.empty() && IsChildFolder(installFolder, unpackFolder)) {
+      AppendLog(L"Папка установки не может располагаться в папке распаковки");
+      ok = false;
+    }
     if (result.ok && (unpackFolder.empty() || !IsSameFolder(unpackFolder, installFolder))) {
       if (const auto emptyError = FolderMustBeEmptyError(installFolder, L"Папка установки");
           emptyError.has_value()) {
@@ -2080,11 +2105,13 @@ bool ValidateFolders(const SpaceRequirements& requirements = {}) {
       }
     }
   } else {
-    AppendLog(L"Папка установки не выбрана.");
+    AppendLog(installText.empty()
+                  ? L"Папка установки не выбрана."
+                  : L"Не удалось определить имя папки сборки из manifest.json.");
     ok = false;
   }
 
-  if (!unpackFolder.empty() && !installText.empty()) {
+  if (!unpackFolder.empty() && !installFolder.empty()) {
     const bool sameVolume = validator.IsSameDrive(unpackFolder, installFolder);
     const auto plan = modlist::PlanInstallSpace(requirements.unpackedBytes, sameVolume);
     if (!HasEnoughSpace(unpackFolder, plan.unpackRequiredBytes, L"Папка распаковки")) {
@@ -2179,6 +2206,15 @@ void StartInstall(HWND hwnd) {
     AppendLog(L"Ошибка сборки: " + Widen(package.error()));
     return;
   }
+  std::wstring manifestMessage;
+  auto manifest = LoadPackageManifest(manifestMessage);
+  if (!manifest.has_value()) {
+    AppendLog(manifestMessage);
+    AppendLog(L"Необходим файл data\\package\\manifest.json.");
+    return;
+  }
+  g_archiveFolderName = Widen(manifest->archiveName);
+  SendUiState();
   const auto requirements = EstimateSpaceRequirements(package.value());
   if (!ValidateFolders(requirements)) {
     AppendLog(L"Исправьте ошибки перед началом.");
@@ -2186,7 +2222,8 @@ void StartInstall(HWND hwnd) {
   }
 
   const auto unpackFolder = SelectedUnpackFolder();
-  const auto installFolder = std::filesystem::path(GetText(g_installEdit));
+  const auto installFolder =
+      FinalInstallFolder(std::filesystem::path(GetText(g_installEdit)));
   g_stopRequested = false;
   g_workerRunning = true;
   SetControlsRunning(hwnd, true);
@@ -2489,8 +2526,10 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
       auto manifest = LoadPackageManifest(manifestMessage);
       AppendLog(manifestMessage);
       if (manifest.has_value()) {
+        g_archiveFolderName = Widen(manifest->archiveName);
         AppendLog(L"Manifest archive size: " + FormatBytes(ManifestRequiredBytes(*manifest)));
         AppendLog(L"Manifest archive entry: " + PathToDisplay(manifest->extract.firstArchivePart));
+        AppendLog(L"Папка сборки: " + g_archiveFolderName);
         if (manifest->unpackedSize > 0) {
           AppendLog(L"Unpacked payload size: " + FormatBytes(manifest->unpackedSize));
         }

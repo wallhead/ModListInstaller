@@ -84,6 +84,7 @@ void TestManifestLoader() {
   Expect(manifest.ok(), manifest.error().c_str());
   Expect(manifest.value().files.size() == 1, "Manifest file count mismatch");
   Expect(manifest.value().extract.firstArchivePart == "modpack.7z.001", "Manifest extract archive mismatch");
+  Expect(manifest.value().archiveName == "modpack", "Legacy manifest archive name should be inferred");
 }
 
 void TestPackerManifestLoader() {
@@ -94,7 +95,36 @@ void TestPackerManifestLoader() {
   Expect(manifest.value().files.size() == 1, "Packer manifest file count mismatch");
   Expect(manifest.value().files[0].path == "MyPack.7z.001", "Packer manifest file path mismatch");
   Expect(manifest.value().extract.firstArchivePart == "MyPack.7z.001", "Packer manifest archive mismatch");
+  Expect(manifest.value().archiveName == "MyPack", "Packer manifest archive name mismatch");
   Expect(manifest.value().unpackedSize == 7, "Packer manifest unpacked size mismatch");
+}
+
+void TestManifestRejectsUnsafeArchiveName() {
+  ManifestLoader loader;
+  std::string json = PackerManifestJson(Sha256::HexDigest("abc"));
+  const auto pos = json.find("\"MyPack\"");
+  json.replace(pos, std::string("\"MyPack\"").size(), "\"..\\\\evil\"");
+  auto manifest = loader.LoadFromString(json);
+  Expect(!manifest.ok(), "Unsafe archive folder name should fail");
+}
+
+void TestPackerManifestInfersArchiveName() {
+  ManifestLoader loader;
+  std::string json = PackerManifestJson(Sha256::HexDigest("abc"));
+  const auto field = json.find("    \"archive_name\": \"MyPack\",\n");
+  json.erase(field, std::string("    \"archive_name\": \"MyPack\",\n").size());
+  auto manifest = loader.LoadFromString(json);
+  Expect(manifest.ok(), manifest.error().c_str());
+  Expect(manifest.value().archiveName == "MyPack",
+         "Older packer manifest archive name should be inferred");
+}
+
+void TestArchiveInstallFolder() {
+  auto folder = ResolveArchiveInstallFolder("D:\\Games", "Sky");
+  Expect(folder.ok(), folder.error().c_str());
+  Expect(folder.value().lexically_normal() ==
+             std::filesystem::path("D:\\Games\\Sky").lexically_normal(),
+         "Archive should install into a named folder below the selected root");
 }
 
 void TestManifestRejectsTraversal() {
@@ -225,6 +255,9 @@ int main() {
     TestSha256();
     TestManifestLoader();
     TestPackerManifestLoader();
+    TestManifestRejectsUnsafeArchiveName();
+    TestPackerManifestInfersArchiveName();
+    TestArchiveInstallFolder();
     TestManifestRejectsTraversal();
     TestJsonUnicodeEscapes();
     TestTrackerParsing();

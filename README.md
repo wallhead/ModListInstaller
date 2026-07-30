@@ -18,7 +18,7 @@ PackerApp/dist/modlist-packer.exe
 Ready-to-use versioned release archives are written to:
 
 ```text
-Release/ModlistInstaller-v0.2.3.zip
+Release/ModlistInstaller-v0.2.4.zip
 ```
 
 Extract the zip and run `modlist-packer.exe`. The archive contains the portable packer, the installer exe beside it, and `data/ui` ready for release-folder creation.
@@ -51,15 +51,16 @@ The installer looks for `data\package\manifest.json` beside the exe and archive 
 - Native C++20 Win32 executable.
 - WebView2-powered local HTML/CSS/JS interface.
 - No Electron, no dev server, no remote UI assets.
-- Single-screen installer UI with unpack drive, final install folder, progress, status, and log output.
+- Single-screen installer UI with unpack drive, install root, final archive-named path, progress, status, and log output.
 - Manifest SHA256 verification before extraction.
 - Archive discovery in `data\downloads`, using the archive filename from `data\package\manifest.json`.
 - Unpack drive selection automatically resolves to `<drive>:\Unpacked`.
 - Unpacked payload size recorded in new manifests for accurate free-space checks.
 - Same-volume installs reserve extraction space once; cross-volume installs also check the destination for the full payload.
-- Existing non-empty unpack and install folders are rejected to prevent stale files from being merged into a new installation.
+- Existing non-empty unpack and final archive-named folders are rejected; the selected install root may contain other folders.
 - Live validation, extraction, and install progress with status text.
 - Same-drive installs use move/cut semantics automatically when possible.
+- Successful installs remove the empty `<drive>:\Unpacked` staging folder.
 - Embedded 7-Zip extraction to `data\tools\7zip`.
 - Full diagnostics under `data\logs`.
 
@@ -70,10 +71,10 @@ The installer looks for `data\package\manifest.json` beside the exe and archive 
 3. Put the manifest at `data\package\manifest.json`.
 4. Put WebView UI files in `data\ui`.
 5. Run `modlist-installer.exe`.
-6. Select an unpack drive and final install folder.
+6. Select an unpack drive and install root. The installer creates `<install root>\<archive_name>`.
 7. Press `Install`.
 
-Both the derived `<drive>:\Unpacked` folder and the selected install folder must be empty. The packer removes older outputs for the selected archive name before building, and rejects source and release folders that overlap.
+The derived `<drive>:\Unpacked` folder and final `<install root>\<archive_name>` folder must be empty. The install root itself may contain other folders. The packer removes older outputs for the selected archive name before building, and rejects source and release folders that overlap.
 
 ## Build
 

@@ -25,6 +25,10 @@
           </div>
 
           <div class="form-grid">
+            <p class="unpack-note">
+              Распаковка должна происходить по короткому пути, после распаковки установщик перенесет все файлы в папку установки
+            </p>
+
             <label for="unpackDrive">Диск для распаковки</label>
             <div class="field-row compact">
               <select id="unpackDrive"></select>
@@ -36,6 +40,9 @@
               <input id="installFolder" type="text" autocomplete="off" spellcheck="false" />
               <button type="button" id="browseInstall">Обзор</button>
             </div>
+
+            <span class="final-label">Итоговый путь</span>
+            <span class="target final-target" id="finalInstallFolder">Выберите папку установки</span>
           </div>
 
           <div class="progress-wrap">

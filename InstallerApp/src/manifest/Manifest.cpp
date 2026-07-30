@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstring>
 #include <fstream>
 #include <sstream>
 
@@ -92,6 +93,38 @@ bool EndsWithInsensitive(std::string value, const std::string& suffix) {
   return value.size() >= suffix.size() && value.compare(value.size() - suffix.size(), suffix.size(), suffix) == 0;
 }
 
+std::string InferArchiveName(const std::filesystem::path& firstArchivePart) {
+  std::string name = firstArchivePart.filename().string();
+  if (EndsWithInsensitive(name, ".001")) {
+    name.resize(name.size() - 4);
+  }
+  if (EndsWithInsensitive(name, ".7z")) {
+    name.resize(name.size() - 3);
+  } else if (EndsWithInsensitive(name, ".zip")) {
+    name.resize(name.size() - 4);
+  }
+  return name;
+}
+
+Result<std::string> ReadArchiveName(const JsonValue& root,
+                                    const std::filesystem::path& firstArchivePart) {
+  std::string name;
+  if (const JsonValue* value = root.Find("archive_name"); value != nullptr) {
+    if (auto required = RequireString(value, "archive_name"); !required.ok()) {
+      return Result<std::string>::Error(required.error());
+    }
+    name = value->AsString();
+  } else {
+    name = InferArchiveName(firstArchivePart);
+  }
+
+  if (!IsSafeArchiveFolderName(name)) {
+    return Result<std::string>::Error(
+        "Manifest field 'archive_name' is not a safe Windows folder name");
+  }
+  return Result<std::string>::Ok(std::move(name));
+}
+
 std::filesystem::path SelectFirstArchivePart(const std::vector<ManifestFile>& files) {
   for (const auto& file : files) {
     const auto path = file.path.generic_string();
@@ -137,6 +170,11 @@ Result<Manifest> ParsePackerManifest(const JsonValue& root) {
   if (manifest.extract.firstArchivePart.empty() || !IsSafeManifestRelativePath(manifest.extract.firstArchivePart)) {
     return Result<Manifest>::Error("Unable to infer a safe archive file from packer manifest");
   }
+  auto archiveName = ReadArchiveName(root, manifest.extract.firstArchivePart);
+  if (!archiveName.ok()) {
+    return Result<Manifest>::Error(archiveName.error());
+  }
+  manifest.archiveName = std::move(archiveName.value());
   manifest.extract.targetSubfolder.clear();
   manifest.extract.cleanupAfterSuccess = false;
   manifest.extract.useSameDiskTemp = true;
@@ -299,6 +337,12 @@ Result<Manifest> ManifestLoader::LoadFromString(const std::string& jsonText) con
     manifest.extract.useSameDiskTemp = value->AsBool(manifest.extract.useSameDiskTemp);
   }
 
+  auto archiveName = ReadArchiveName(root, manifest.extract.firstArchivePart);
+  if (!archiveName.ok()) {
+    return Result<Manifest>::Error(archiveName.error());
+  }
+  manifest.archiveName = std::move(archiveName.value());
+
   return Result<Manifest>::Ok(std::move(manifest));
 }
 
@@ -313,6 +357,49 @@ bool IsSafeManifestRelativePath(const std::filesystem::path& path) {
     }
   }
   return true;
+}
+
+bool IsSafeArchiveFolderName(const std::string& name) {
+  if (name.empty() || name == "." || name == ".." ||
+      name.back() == ' ' || name.back() == '.') {
+    return false;
+  }
+
+  constexpr const char* invalid = "<>:\"/\\|?*";
+  for (const unsigned char ch : name) {
+    if (ch < 0x20 || std::strchr(invalid, static_cast<char>(ch)) != nullptr) {
+      return false;
+    }
+  }
+
+  std::string device = name.substr(0, name.find('.'));
+  std::transform(device.begin(), device.end(), device.begin(), [](unsigned char ch) {
+    return static_cast<char>(std::toupper(ch));
+  });
+  if (device == "CON" || device == "PRN" || device == "AUX" || device == "NUL") {
+    return false;
+  }
+  if (device.size() == 4 &&
+      (device.rfind("COM", 0) == 0 || device.rfind("LPT", 0) == 0) &&
+      device[3] >= '1' && device[3] <= '9') {
+    return false;
+  }
+  return true;
+}
+
+Result<std::filesystem::path> ResolveArchiveInstallFolder(
+    const std::filesystem::path& selectedRoot,
+    const std::string& archiveName) {
+  if (selectedRoot.empty()) {
+    return Result<std::filesystem::path>::Error("Install root folder is empty");
+  }
+  if (!IsSafeArchiveFolderName(archiveName)) {
+    return Result<std::filesystem::path>::Error("Archive folder name is unsafe");
+  }
+  const std::u8string utf8Name(
+      reinterpret_cast<const char8_t*>(archiveName.data()), archiveName.size());
+  return Result<std::filesystem::path>::Ok(
+      selectedRoot / std::filesystem::path(utf8Name));
 }
 
 }  // namespace modlist

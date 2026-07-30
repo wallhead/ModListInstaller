@@ -1,5 +1,5 @@
 set_project("ModlistInstaller")
-set_version("0.2.3")
+set_version("0.2.4")
 
 add_rules("mode.debug", "mode.release")
 set_languages("c++20")
@@ -102,7 +102,9 @@ target("modlist-installer-gui")
         add_ldflags("/SUBSYSTEM:WINDOWS", {tools = "link"})
     end
     after_build(function (target)
-        os.cp("ui", path.join(target:targetdir(), "data", "ui"))
+        local ui_target = path.join(target:targetdir(), "data", "ui")
+        os.rm(ui_target)
+        os.cp("ui", ui_target)
     end)
 target_end()
 

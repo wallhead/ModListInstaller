@@ -8,6 +8,7 @@
     unpackDrive: document.getElementById("unpackDrive"),
     unpackTarget: document.getElementById("unpackTarget"),
     installFolder: document.getElementById("installFolder"),
+    finalInstallFolder: document.getElementById("finalInstallFolder"),
     progressFill: document.getElementById("progressFill"),
     percentText: document.getElementById("percentText"),
     statusText: document.getElementById("statusText"),
@@ -106,6 +107,7 @@
     }
     setStep(state.step || "Добро пожаловать");
     setPath("installFolder", state.installFolder);
+    dom.finalInstallFolder.textContent = state.finalInstallFolder || "Выберите папку установки";
     setPath("unpackDrive", state.unpackDrive);
     setPath("unpackTarget", state.unpackTarget);
     setProgress(state.progress || 0, state.status || "");

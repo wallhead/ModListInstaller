@@ -126,6 +126,22 @@ h2 {
   font-weight: 700;
 }
 
+.unpack-note {
+  grid-column: 1 / -1;
+  max-width: 760px;
+  color: var(--muted);
+}
+
+.final-label {
+  color: var(--muted);
+  font-weight: 600;
+}
+
+.final-target {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
 .field-row {
   display: grid;
   grid-template-columns: minmax(0, 1fr) 88px;

@@ -54,6 +54,7 @@ struct ExtractSettings {
 
 struct Manifest {
   std::string version;
+  std::string archiveName;
   TorrentSource torrent;
   TrackerSettings trackers;
   TorrentFeatures torrentFeatures;
@@ -70,5 +71,9 @@ public:
 };
 
 bool IsSafeManifestRelativePath(const std::filesystem::path& path);
+bool IsSafeArchiveFolderName(const std::string& name);
+Result<std::filesystem::path> ResolveArchiveInstallFolder(
+    const std::filesystem::path& selectedRoot,
+    const std::string& archiveName);
 
 }  // namespace modlist
