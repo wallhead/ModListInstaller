@@ -843,7 +843,7 @@ void SendUiState() {
       << L"\"progress\":" << g_progressPercent << L","
       << L"\"status\":" << JsonString(g_statusText) << L","
       << L"\"logs\":" << logs.str() << L","
-      << L"\"version\":\"Modlist Installer v0.2.2\","
+      << L"\"version\":\"Modlist Installer v0.2.3\","
       << L"\"options\":{},"
       << L"\"buttons\":{"
       << L"\"back\":false,"
@@ -1452,27 +1452,41 @@ bool RunExtractionStep(HWND hwnd,
   PostProgress(hwnd, progressBase);
   PostStatus(hwnd, FormatExtractionStatus(statusLabel, 0, 0, -1, 0));
   int lastPercent = -1;
+  uintmax_t sampledSpeed = 0;
+  int sampledEta = -1;
   const auto startedAt = std::chrono::steady_clock::now();
-  const auto result = extractor.Extract(extraction, [hwnd, statusLabel, progressBase, progressSpan, estimatedBytes, startedAt, &lastPercent](int percent) {
-    if (percent == lastPercent) {
-      return;
-    }
-    lastPercent = percent;
-    const int mapped = progressBase + (percent * progressSpan) / 100;
-    uintmax_t speed = 0;
-    int eta = -1;
-    const auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
-        std::chrono::steady_clock::now() - startedAt).count();
-    if (estimatedBytes > 0 && elapsed > 0 && percent > 0 && percent < 100) {
-      const uintmax_t processed = (estimatedBytes * static_cast<uintmax_t>(percent)) / 100;
-      speed = processed / static_cast<uintmax_t>(elapsed);
-      if (speed > 0 && estimatedBytes > processed) {
-        eta = static_cast<int>((estimatedBytes - processed) / speed);
-      }
-    }
-    PostProgress(hwnd, mapped);
-    PostStatus(hwnd, FormatExtractionStatus(statusLabel, percent, speed, eta, static_cast<int>(elapsed)));
-  });
+  auto etaSampledAt = startedAt;
+  const auto result = extractor.Extract(
+      extraction,
+      [hwnd, statusLabel, progressBase, progressSpan, estimatedBytes, startedAt,
+       &lastPercent, &sampledSpeed, &sampledEta, &etaSampledAt](int percent) {
+        const auto now = std::chrono::steady_clock::now();
+        const auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - startedAt).count();
+        if (percent != lastPercent) {
+          lastPercent = percent;
+          const int mapped = progressBase + (percent * progressSpan) / 100;
+          PostProgress(hwnd, mapped);
+          sampledSpeed = 0;
+          sampledEta = -1;
+          if (estimatedBytes > 0 && elapsed > 0 && percent > 0 && percent < 100) {
+            const uintmax_t processed = (estimatedBytes * static_cast<uintmax_t>(percent)) / 100;
+            sampledSpeed = processed / static_cast<uintmax_t>(elapsed);
+            if (sampledSpeed > 0 && estimatedBytes > processed) {
+              sampledEta = static_cast<int>((estimatedBytes - processed) / sampledSpeed);
+            }
+          }
+          etaSampledAt = now;
+        }
+
+        int displayEta = sampledEta;
+        if (displayEta >= 0) {
+          const auto sinceSample = std::chrono::duration_cast<std::chrono::seconds>(now - etaSampledAt).count();
+          displayEta = std::max(0, displayEta - static_cast<int>(sinceSample));
+        }
+        PostStatus(hwnd, FormatExtractionStatus(
+                             statusLabel, std::max(0, lastPercent), sampledSpeed,
+                             displayEta, static_cast<int>(elapsed)));
+      });
   PostLog(hwnd, Widen(result.message));
   WriteLastSevenZipLog(result.output);
   if (!result.ok) {
@@ -1503,7 +1517,8 @@ bool ExtractArchiveChain(HWND hwnd,
                          std::filesystem::path archiveFirstPart,
                          std::filesystem::path installFolder,
                          int progressBase = 0,
-                         int progressSpan = 100) {
+                         int progressSpan = 100,
+                         uintmax_t estimatedUnpackedBytes = 0) {
   modlist::ExtractionConfig extraction;
   extraction.sevenZipExe = sevenZipExe;
   extraction.archiveFirstPart = std::move(archiveFirstPart);
@@ -1512,18 +1527,20 @@ bool ExtractArchiveChain(HWND hwnd,
   extraction.useSameDiskTemp = true;
 
   const bool splitArchive = IsFirstSplitArchivePart(extraction.archiveFirstPart);
-  const int firstSpan = splitArchive ? progressSpan / 2 : progressSpan;
   std::error_code sizeEc;
-  uintmax_t firstBytes = 0;
-  if (splitArchive) {
-    firstBytes = EstimateNearbyArchiveBytes(extraction.archiveFirstPart.parent_path());
-  } else {
-    firstBytes = std::filesystem::file_size(extraction.archiveFirstPart, sizeEc);
+  if (estimatedUnpackedBytes == 0) {
+    if (splitArchive) {
+      estimatedUnpackedBytes = EstimateNearbyArchiveBytes(extraction.archiveFirstPart.parent_path());
+    } else {
+      estimatedUnpackedBytes = std::filesystem::file_size(extraction.archiveFirstPart, sizeEc);
+    }
     if (sizeEc) {
-      firstBytes = 0;
+      estimatedUnpackedBytes = 0;
     }
   }
-  if (!RunExtractionStep(hwnd, extractor, extraction, L"Распаковано", progressBase, firstSpan, firstBytes)) {
+  if (!RunExtractionStep(
+          hwnd, extractor, extraction, L"Распаковано",
+          progressBase, progressSpan, estimatedUnpackedBytes)) {
     return false;
   }
 
@@ -2008,7 +2025,9 @@ void RunInstallWorker(HWND hwnd,
     return;
   }
 
-  const bool extracted = ExtractArchiveChain(hwnd, extractor, sevenZip.value(), *firstArchivePart, unpackFolder, 35, 60);
+  const bool extracted = ExtractArchiveChain(
+      hwnd, extractor, sevenZip.value(), *firstArchivePart, unpackFolder,
+      35, 60, requirements.unpackedBytes);
   if (!extracted) {
     PostProgress(hwnd, 0);
     FinishWorker(hwnd);

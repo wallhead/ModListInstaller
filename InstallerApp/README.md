@@ -39,6 +39,7 @@ The `Install` button runs the install pipeline on a background thread:
 - look for the archive named by the manifest in `data\downloads`
 - check unpack free space again before extraction; same-volume installs do not reserve a second full copy
 - show live unpack percentage, speed, and ETA in the progress bar and status line
+- refresh unpack elapsed time every second, count ETA down between percentage changes, and map split archives across the full unpack progress range
 - show live install percentage, speed, ETA, and elapsed time in the status line
 - install from the unpack folder into the final install folder, using same-drive move/cut semantics instead of copying when both folders are on the same drive
 - embed 7-Zip inside the installer exe and extract it to `data\tools\7zip` when needed

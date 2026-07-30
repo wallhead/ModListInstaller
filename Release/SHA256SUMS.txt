@@ -1,1 +1,1 @@
-fa81af6b27e1c34d77482a0e631fd101be165ea1f896ecbfaba55bd50b2e5a8c  ModlistInstaller-v0.2.2.zip
+4d638c4917257b86d7e843c0a1092096c7e3cfb02f3d1a5f425f3f6e82f02200  ModlistInstaller-v0.2.3.zip

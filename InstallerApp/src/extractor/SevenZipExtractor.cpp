@@ -320,7 +320,11 @@ int RunProcessAndCapture(const std::wstring& command,
 
   std::string parseTail;
   char buffer[4096];
-  int lastPercent = -1;
+  int lastPercent = 0;
+  auto lastProgressAt = std::chrono::steady_clock::now();
+  if (progressCallback) {
+    progressCallback(lastPercent);
+  }
   bool stopping = false;
   while (true) {
     if (cancelRequested != nullptr && cancelRequested->load() && !stopping) {
@@ -348,15 +352,27 @@ int RunProcessAndCapture(const std::wstring& command,
         if (percent.has_value() && *percent != lastPercent) {
           lastPercent = *percent;
           progressCallback(*percent);
+          lastProgressAt = std::chrono::steady_clock::now();
         }
       }
       available = 0;
     }
 
+    const auto now = std::chrono::steady_clock::now();
+    if (progressCallback && now - lastProgressAt >= std::chrono::seconds(1)) {
+      progressCallback(lastPercent);
+      lastProgressAt = now;
+    }
+
     const DWORD wait = WaitForSingleObject(process.hProcess, 100);
     if (wait == WAIT_OBJECT_0) {
-      DWORD bytesRead = 0;
-      while (ReadFile(readPipe, buffer, sizeof(buffer), &bytesRead, nullptr) && bytesRead > 0) {
+      DWORD remaining = 0;
+      while (PeekNamedPipe(readPipe, nullptr, 0, nullptr, &remaining, nullptr) && remaining > 0) {
+        DWORD bytesRead = 0;
+        const DWORD toRead = std::min<DWORD>(remaining, sizeof(buffer));
+        if (!ReadFile(readPipe, buffer, toRead, &bytesRead, nullptr) || bytesRead == 0) {
+          break;
+        }
         if (log) {
           log.write(buffer, bytesRead);
         }
