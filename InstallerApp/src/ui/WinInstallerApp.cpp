@@ -90,7 +90,7 @@ std::wstring g_archiveFolderName;
 std::wstring g_statusText = L"Ожидание | Ожидание проверки";
 int g_progressPercent = 0;
 bool g_webUiVisible = false;
-WizardPage g_page = WizardPage::Welcome;
+WizardPage g_page = WizardPage::Folders;
 HBRUSH g_contentBrush = nullptr;
 HBRUSH g_headerBrush = nullptr;
 HBRUSH g_panelBrush = nullptr;
@@ -103,6 +103,7 @@ HFONT g_labelFont = nullptr;
 std::atomic_bool g_workerRunning{false};
 std::atomic_bool g_closeAfterWorker{false};
 std::atomic_bool g_stopRequested{false};
+bool g_installCompleted = false;
 
 constexpr COLORREF kRailColor = RGB(23, 28, 31);
 constexpr COLORREF kRailDarkColor = RGB(16, 20, 22);
@@ -856,7 +857,8 @@ void SendUiState() {
       << L"\"progress\":" << g_progressPercent << L","
       << L"\"status\":" << JsonString(g_statusText) << L","
       << L"\"logs\":" << logs.str() << L","
-      << L"\"version\":\"Modlist Installer v0.2.4\","
+      << L"\"version\":\"Modlist Installer v0.2.5 by WallHead\","
+      << L"\"installCompleted\":" << (g_installCompleted ? L"true" : L"false") << L","
       << L"\"options\":{},"
       << L"\"buttons\":{"
       << L"\"back\":false,"
@@ -1430,9 +1432,9 @@ void GoToNextPage(HWND hwnd) {
   }
 }
 
-void FinishWorker(HWND hwnd) {
+void FinishWorker(HWND hwnd, bool installSucceeded = false) {
   g_workerRunning = false;
-  PostMessageW(hwnd, kWorkerFinishedMessage, 0, 0);
+  PostMessageW(hwnd, kWorkerFinishedMessage, installSucceeded ? 1 : 0, 0);
 }
 
 std::wstring FormatExtractionStatus(const std::wstring& label,
@@ -2055,7 +2057,7 @@ void RunInstallWorker(HWND hwnd,
 
   const bool installed = InstallExtractedFiles(hwnd, unpackFolder, installFolder);
   PostProgress(hwnd, installed ? 100 : 0);
-  FinishWorker(hwnd);
+  FinishWorker(hwnd, installed);
 }
 
 bool ValidateFolders(const SpaceRequirements& requirements = {}) {
@@ -2196,6 +2198,10 @@ void StopInstall() {
 }
 
 void StartInstall(HWND hwnd) {
+  if (g_installCompleted) {
+    SendMessageW(hwnd, WM_CLOSE, 0, 0);
+    return;
+  }
   if (g_workerRunning) {
     AppendLog(L"Установщик уже запущен.");
     return;
@@ -2463,7 +2469,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
       g_labelFont = CreateUiFont(9, FW_SEMIBOLD);
 
       g_stepLabel = CreateLabel(hwnd, L"", 16, 18, 720, 24);
-      g_welcomeTitle = CreateLabel(hwnd, L"Modlist Installer", 16, 92, 720, 38);
+      g_welcomeTitle = CreateLabel(hwnd, L"Modlist Installer Beta", 16, 92, 720, 38);
       g_welcomeBody = CreateLabel(hwnd, L"", 16, 146, 720, 90);
       g_downloadLabel = CreateLabel(hwnd, L"Package", 16, 112, 100, 20);
       g_unpackDriveLabel = CreateLabel(hwnd, L"Unpack drive", 16, 136, 100, 20);
@@ -2541,7 +2547,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
       }
       AppendLog(L"Выберите диск для распаковки; папка будет создана как <drive>:\\Unpacked.");
       Layout(hwnd);
-      ShowWizardPage(hwnd, WizardPage::Welcome);
+      ShowWizardPage(hwnd, WizardPage::Folders);
 
       const auto uiPath = UiFolder() / "index.html";
       if (!std::filesystem::exists(uiPath)) {
@@ -2681,18 +2687,27 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
       SendUiError(L"Ошибка проверки", L"Проверка завершилась ошибкой. Перехешируйте торрент файлы.");
       MessageBoxW(hwnd, L"Проверка завершилась ошибкой. Перехешируйте торрент файлы.", L"Ошибка проверки", MB_OK | MB_ICONERROR);
       return 0;
-    case kWorkerFinishedMessage:
+    case kWorkerFinishedMessage: {
       SetControlsRunning(hwnd, false);
+      if (wParam != 0 && !g_closeAfterWorker) {
+        MessageBoxW(hwnd,
+                    L"Установка завершена!",
+                    L"Modlist Installer Beta",
+                    MB_OK | MB_ICONINFORMATION);
+        g_installCompleted = true;
+        SetWindowTextW(GetDlgItem(hwnd, kStartButton), L"Закрыть");
+      }
       SendUiState();
       if (g_closeAfterWorker) {
         DestroyWindow(hwnd);
       }
       return 0;
+    }
     case WM_CLOSE:
       if (g_workerRunning) {
         g_closeAfterWorker = true;
         StopInstall();
-        SetWindowTextW(hwnd, L"Modlist Installer - остановка...");
+        SetWindowTextW(hwnd, L"Modlist Installer Beta - остановка...");
         AppendLog(L"Ожидание остановки проверки перед закрытием.");
         return 0;
       }
@@ -2734,7 +2749,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
   windowClass.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
   RegisterClassW(&windowClass);
 
-  HWND hwnd = CreateWindowExW(0, className, L"Modlist Installer",
+  HWND hwnd = CreateWindowExW(0, className, L"Modlist Installer Beta",
                               WS_OVERLAPPEDWINDOW,
                               CW_USEDEFAULT, CW_USEDEFAULT, 920, 660,
                               nullptr, nullptr, instance, nullptr);

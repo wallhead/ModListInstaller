@@ -114,6 +114,7 @@
     dom.logOutput.value = "";
     (state.logs || []).forEach(addLog);
     dom.versionText.textContent = state.version || "Local package mode";
+    dom.startButton.textContent = state.installCompleted ? "Закрыть" : "Установить";
     setButtonEnabled("back", !!state.buttons?.back);
     setButtonEnabled("next", !!state.buttons?.next);
     setButtonEnabled("start", !!state.buttons?.start);

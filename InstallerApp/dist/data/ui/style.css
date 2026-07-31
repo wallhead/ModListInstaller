@@ -51,7 +51,7 @@ textarea {
 
 .content {
   display: grid;
-  grid-template-rows: 62px minmax(0, 1fr);
+  grid-template-rows: 68px minmax(0, 1fr);
   min-width: 0;
   height: 100%;
 }
@@ -61,7 +61,7 @@ textarea {
   align-items: center;
   justify-content: space-between;
   gap: 18px;
-  padding: 10px 22px;
+  padding: 7px 22px;
   border-bottom: 1px solid var(--line);
   background: linear-gradient(#20282c, #1b2226);
 }
@@ -96,6 +96,11 @@ h2 {
   color: var(--muted);
 }
 
+.version {
+  margin-top: 1px;
+  font-size: 12px;
+}
+
 .panel {
   min-height: 0;
   padding: 16px 22px 72px;
@@ -103,22 +108,12 @@ h2 {
   overflow: auto;
 }
 
-.welcome {
-  max-width: 720px;
-  min-height: 0;
-  color: var(--muted);
-}
-
-.welcome h2 {
-  color: var(--text);
-}
-
 .form-grid {
   display: grid;
   grid-template-columns: 118px minmax(0, 1fr);
   gap: 10px 12px;
   align-items: center;
-  margin-top: 14px;
+  margin-top: 0;
 }
 
 .form-grid > label {
