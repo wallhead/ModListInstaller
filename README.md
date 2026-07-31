@@ -18,7 +18,7 @@ PackerApp/dist/modlist-packer.exe
 Ready-to-use versioned release archives are written to:
 
 ```text
-Release/ModlistInstaller-v0.2.5.zip
+Release/ModlistInstaller-v0.2.6.zip
 ```
 
 Extract the zip and run `modlist-packer.exe`. The archive contains the portable packer, the installer exe beside it, and `data/ui` ready for release-folder creation.
@@ -57,7 +57,7 @@ The installer looks for `data\package\manifest.json` beside the exe and archive 
 - Unpack drive selection automatically resolves to `<drive>:\Unpacked`.
 - Unpacked payload size recorded in new manifests for accurate free-space checks.
 - Same-volume installs reserve extraction space once; cross-volume installs also check the destination for the full payload.
-- Existing non-empty unpack and final archive-named folders are rejected; the selected install root may contain other folders.
+- Existing non-empty unpack folders are rejected. A non-empty final archive-named folder requires explicit confirmation before its contents are permanently removed and installation restarts.
 - Live validation, extraction, and install progress with status text.
 - Same-drive installs use move/cut semantics automatically when possible.
 - Successful installs remove the empty `<drive>:\Unpacked` staging folder.
@@ -74,7 +74,7 @@ The installer looks for `data\package\manifest.json` beside the exe and archive 
 6. Select an unpack drive and install root. The installer creates `<install root>\<archive_name>`.
 7. Press `Install`.
 
-The derived `<drive>:\Unpacked` folder and final `<install root>\<archive_name>` folder must be empty. The install root itself may contain other folders. The packer removes older outputs for the selected archive name before building, and rejects source and release folders that overlap.
+The derived `<drive>:\Unpacked` folder must be empty. If the final `<install root>\<archive_name>` folder is not empty, the installer offers to permanently clear its contents before installing. The install root itself may contain other folders. The packer removes older outputs for the selected archive name before building, and rejects source and release folders that overlap.
 
 ## Build
 

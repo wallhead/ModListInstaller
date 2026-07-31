@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(ModlistInstaller VERSION 0.2.5 LANGUAGES CXX)
+project(ModlistInstaller VERSION 0.2.6 LANGUAGES CXX)
 
 option(MODLIST_USE_LIBTORRENT "Build the libtorrent-rasterbar downloader backend" OFF)
 

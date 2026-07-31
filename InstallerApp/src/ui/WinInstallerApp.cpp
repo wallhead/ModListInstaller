@@ -87,6 +87,7 @@ HWND g_hotButton = nullptr;
 std::unique_ptr<modlist::WebViewHost> g_webView;
 std::vector<std::wstring> g_uiLogLines;
 std::wstring g_archiveFolderName;
+std::filesystem::path g_pendingOverwriteFolder;
 std::wstring g_statusText = L"Ожидание | Ожидание проверки";
 int g_progressPercent = 0;
 bool g_webUiVisible = false;
@@ -204,6 +205,7 @@ void SendUiStep(const std::wstring& stepName);
 void SendUiPath(const std::wstring& fieldName, const std::wstring& path);
 void SendUiOption(const std::wstring& optionName, bool value);
 void SendUiError(const std::wstring& title, const std::wstring& message);
+void SendUiOverwriteConfirm(const std::filesystem::path& folder);
 void SendUiButtonEnabled(const std::wstring& buttonName, bool enabled);
 void SendUiState();
 
@@ -818,6 +820,15 @@ void SendUiError(const std::wstring& title, const std::wstring& message) {
              L",\"message\":" + JsonString(message) + L"}");
 }
 
+void SendUiOverwriteConfirm(const std::filesystem::path& folder) {
+  const auto displayPath = PathToDisplay(folder);
+  const auto message =
+      L"Папка установки уже существует и не пуста:\n" + displayPath +
+      L"\n\nВсе файлы и папки внутри будут безвозвратно удалены. Продолжить?";
+  PostUiJson(L"{\"type\":\"overwriteConfirm\",\"title\":\"Перезаписать установку?\","
+             L"\"message\":" + JsonString(message) + L"}");
+}
+
 void SendUiButtonEnabled(const std::wstring& buttonName, bool enabled) {
   PostUiJson(L"{\"type\":\"button\",\"name\":" + JsonString(buttonName) +
              L",\"enabled\":" + (enabled ? L"true" : L"false") + L"}");
@@ -857,7 +868,7 @@ void SendUiState() {
       << L"\"progress\":" << g_progressPercent << L","
       << L"\"status\":" << JsonString(g_statusText) << L","
       << L"\"logs\":" << logs.str() << L","
-      << L"\"version\":\"Modlist Installer v0.2.5 by WallHead\","
+      << L"\"version\":\"Modlist Installer v0.2.6 by WallHead\","
       << L"\"installCompleted\":" << (g_installCompleted ? L"true" : L"false") << L","
       << L"\"options\":{},"
       << L"\"buttons\":{"
@@ -2060,9 +2071,19 @@ void RunInstallWorker(HWND hwnd,
   FinishWorker(hwnd, installed);
 }
 
-bool ValidateFolders(const SpaceRequirements& requirements = {}) {
+bool ValidateFolders(const SpaceRequirements& requirements = {},
+                     bool allowOverwritePrompt = false) {
   modlist::PathValidator validator;
   bool ok = true;
+  std::vector<std::wstring> errors;
+  std::optional<std::wstring> overwriteError;
+  g_pendingOverwriteFolder.clear();
+
+  auto addError = [&](const std::wstring& message) {
+    AppendLog(message);
+    errors.push_back(message);
+    ok = false;
+  };
 
   const auto installText = GetText(g_installEdit);
   const auto selectedInstallRoot = std::filesystem::path(installText);
@@ -2074,17 +2095,17 @@ bool ValidateFolders(const SpaceRequirements& requirements = {}) {
     if (result.warning) {
       AppendLog(L"Warning: " + Widen(result.message));
     }
-    ok = ok && result.ok;
+    if (!result.ok) {
+      addError(L"Папка распаковки недоступна: " + Widen(result.message));
+    }
     if (result.ok) {
       if (const auto emptyError = FolderMustBeEmptyError(unpackFolder, L"Папка распаковки");
           emptyError.has_value()) {
-        AppendLog(*emptyError);
-        ok = false;
+        addError(*emptyError + L"\n" + PathToDisplay(unpackFolder));
       }
     }
   } else {
-    AppendLog(L"Диск для распаковки не выбран.");
-    ok = false;
+    addError(L"Диск для распаковки не выбран.");
   }
 
   if (!installText.empty() && !installFolder.empty()) {
@@ -2094,38 +2115,73 @@ bool ValidateFolders(const SpaceRequirements& requirements = {}) {
     if (result.warning) {
       AppendLog(L"Warning: " + Widen(result.message));
     }
-    ok = ok && result.ok;
+    if (!result.ok) {
+      addError(L"Папка установки недоступна: " + Widen(result.message));
+    }
     if (!unpackFolder.empty() && IsChildFolder(installFolder, unpackFolder)) {
-      AppendLog(L"Папка установки не может располагаться в папке распаковки");
-      ok = false;
+      addError(L"Папка установки не может располагаться в папке распаковки.");
     }
     if (result.ok && (unpackFolder.empty() || !IsSameFolder(unpackFolder, installFolder))) {
       if (const auto emptyError = FolderMustBeEmptyError(installFolder, L"Папка установки");
           emptyError.has_value()) {
-        AppendLog(*emptyError);
-        ok = false;
+        std::error_code existsEc;
+        std::error_code directoryEc;
+        std::error_code emptyEc;
+        const bool existingNonEmptyDirectory =
+            std::filesystem::exists(installFolder, existsEc) && !existsEc &&
+            std::filesystem::is_directory(installFolder, directoryEc) && !directoryEc &&
+            !std::filesystem::is_empty(installFolder, emptyEc) && !emptyEc;
+        if (allowOverwritePrompt && existingNonEmptyDirectory) {
+          overwriteError = *emptyError + L"\n" + PathToDisplay(installFolder);
+          AppendLog(*overwriteError);
+          g_pendingOverwriteFolder = installFolder;
+          ok = false;
+        } else {
+          addError(*emptyError + L"\n" + PathToDisplay(installFolder));
+        }
       }
     }
   } else {
-    AppendLog(installText.empty()
-                  ? L"Папка установки не выбрана."
-                  : L"Не удалось определить имя папки сборки из manifest.json.");
-    ok = false;
+    addError(installText.empty()
+                 ? L"Папка установки не выбрана."
+                 : L"Не удалось определить имя папки сборки из manifest.json.");
   }
 
   if (!unpackFolder.empty() && !installFolder.empty()) {
     const bool sameVolume = validator.IsSameDrive(unpackFolder, installFolder);
     const auto plan = modlist::PlanInstallSpace(requirements.unpackedBytes, sameVolume);
     if (!HasEnoughSpace(unpackFolder, plan.unpackRequiredBytes, L"Папка распаковки")) {
+      errors.push_back(L"Недостаточно свободного места для распаковки.");
       ok = false;
     }
     if (plan.installRequiredBytes > 0) {
       if (!HasEnoughSpace(installFolder, plan.installRequiredBytes, L"Папка установки")) {
+        errors.push_back(L"Недостаточно свободного места для установки.");
         ok = false;
       }
     } else if (requirements.unpackedBytes > 0) {
       AppendLog(L"Папки находятся на одном томе: установка будет перемещением и не требует второй полной копии.");
     }
+  }
+
+  if (!g_pendingOverwriteFolder.empty()) {
+    if (errors.empty()) {
+      SendUiOverwriteConfirm(g_pendingOverwriteFolder);
+    } else {
+      errors.push_back(*overwriteError);
+      g_pendingOverwriteFolder.clear();
+    }
+  }
+
+  if (!ok && !errors.empty()) {
+    std::wostringstream message;
+    for (size_t i = 0; i < errors.size(); ++i) {
+      if (i > 0) {
+        message << L"\n\n";
+      }
+      message << errors[i];
+    }
+    SendUiError(L"Ошибка пути", message.str());
   }
 
   return ok;
@@ -2222,8 +2278,10 @@ void StartInstall(HWND hwnd) {
   g_archiveFolderName = Widen(manifest->archiveName);
   SendUiState();
   const auto requirements = EstimateSpaceRequirements(package.value());
-  if (!ValidateFolders(requirements)) {
-    AppendLog(L"Исправьте ошибки перед началом.");
+  if (!ValidateFolders(requirements, true)) {
+    if (g_pendingOverwriteFolder.empty()) {
+      AppendLog(L"Исправьте ошибки перед началом.");
+    }
     return;
   }
 
@@ -2235,6 +2293,87 @@ void StartInstall(HWND hwnd) {
   SetControlsRunning(hwnd, true);
   g_closeAfterWorker = false;
   std::thread(RunInstallWorker, hwnd, std::move(package.value()), unpackFolder, installFolder).detach();
+}
+
+void ConfirmPendingOverwrite(HWND hwnd) {
+  if (g_workerRunning) {
+    SendUiError(L"Установщик занят", L"Установщик уже запущен.");
+    return;
+  }
+
+  const auto pendingFolder = g_pendingOverwriteFolder;
+  g_pendingOverwriteFolder.clear();
+  const auto selectedRoot = std::filesystem::path(GetText(g_installEdit));
+  const auto currentFolder = FinalInstallFolder(selectedRoot);
+  const bool safeDestination =
+      !pendingFolder.empty() && !selectedRoot.empty() && !currentFolder.empty() &&
+      IsSameFolder(pendingFolder, currentFolder) &&
+      IsSameFolder(currentFolder.parent_path(), selectedRoot) &&
+      !IsSameFolder(currentFolder, currentFolder.root_path());
+  if (!safeDestination) {
+    AppendLog(L"Перезапись отменена: папка установки изменилась.");
+    SendUiError(L"Перезапись отменена",
+                L"Папка установки изменилась. Нажмите «Установить» и проверьте путь ещё раз.");
+    return;
+  }
+
+  std::error_code existsEc;
+  if (!std::filesystem::exists(currentFolder, existsEc)) {
+    if (existsEc) {
+      SendUiError(L"Ошибка удаления",
+                  L"Невозможно проверить папку установки: " + Widen(existsEc.message()));
+      return;
+    }
+    StartInstall(hwnd);
+    return;
+  }
+
+  std::error_code directoryEc;
+  if (!std::filesystem::is_directory(currentFolder, directoryEc) || directoryEc) {
+    SendUiError(L"Ошибка удаления", L"Путь установки больше не является папкой.");
+    return;
+  }
+
+  AppendLog(L"Пользователь подтвердил перезапись: " + PathToDisplay(currentFolder));
+  std::error_code readEc;
+  std::vector<std::filesystem::path> existingEntries;
+  auto iterator = std::filesystem::directory_iterator(currentFolder, readEc);
+  const auto end = std::filesystem::directory_iterator();
+  while (!readEc && iterator != end) {
+    existingEntries.push_back(iterator->path());
+    iterator.increment(readEc);
+  }
+  if (readEc) {
+    const auto message =
+        L"Невозможно прочитать папку установки:\n" + PathToDisplay(currentFolder) +
+        L"\n\n" + Widen(readEc.message());
+    AppendLog(message);
+    SendUiError(L"Ошибка удаления", message);
+    return;
+  }
+
+  for (const auto& entry : existingEntries) {
+    std::error_code removeEc;
+    std::filesystem::remove_all(entry, removeEc);
+    if (removeEc) {
+      const auto message =
+          L"Невозможно удалить:\n" + PathToDisplay(entry) +
+          L"\n\n" + Widen(removeEc.message());
+      AppendLog(message);
+      SendUiError(L"Ошибка удаления", message);
+      return;
+    }
+  }
+
+  AppendLog(L"Папка установки очищена.");
+  StartInstall(hwnd);
+}
+
+void CancelPendingOverwrite() {
+  if (!g_pendingOverwriteFolder.empty()) {
+    AppendLog(L"Перезапись отменена пользователем.");
+    g_pendingOverwriteFolder.clear();
+  }
 }
 
 void RunUnpackWorker(HWND hwnd, std::filesystem::path archiveFirstPart, std::filesystem::path unpackFolder) {
@@ -2430,6 +2569,10 @@ void HandleUiCommand(HWND hwnd, const std::wstring& rawJson) {
     SendUiState();
   } else if (*command == L"startInstall") {
     StartInstall(hwnd);
+  } else if (*command == L"confirmOverwrite") {
+    ConfirmPendingOverwrite(hwnd);
+  } else if (*command == L"cancelOverwrite") {
+    CancelPendingOverwrite();
   } else if (*command == L"cancelInstall") {
     StopInstall();
     SendUiState();
@@ -2684,20 +2827,32 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
       return 0;
     }
     case kValidationFailedMessage:
-      SendUiError(L"Ошибка проверки", L"Проверка завершилась ошибкой. Перехешируйте торрент файлы.");
-      MessageBoxW(hwnd, L"Проверка завершилась ошибкой. Перехешируйте торрент файлы.", L"Ошибка проверки", MB_OK | MB_ICONERROR);
+      if (g_webView != nullptr && g_webView->IsReady()) {
+        SendUiError(L"Ошибка проверки", L"Проверка завершилась ошибкой. Перехешируйте торрент файлы.");
+      } else {
+        MessageBoxW(hwnd,
+                    L"Проверка завершилась ошибкой. Перехешируйте торрент файлы.",
+                    L"Ошибка проверки",
+                    MB_OK | MB_ICONERROR);
+      }
       return 0;
     case kWorkerFinishedMessage: {
       SetControlsRunning(hwnd, false);
       if (wParam != 0 && !g_closeAfterWorker) {
-        MessageBoxW(hwnd,
-                    L"Установка завершена!",
-                    L"Modlist Installer Beta",
-                    MB_OK | MB_ICONINFORMATION);
         g_installCompleted = true;
         SetWindowTextW(GetDlgItem(hwnd, kStartButton), L"Закрыть");
+        SendUiState();
+        if (g_webView != nullptr && g_webView->IsReady()) {
+          PostUiJson(L"{\"type\":\"installComplete\"}");
+        } else {
+          MessageBoxW(hwnd,
+                      L"Установка завершена!",
+                      L"Modlist Installer Beta",
+                      MB_OK | MB_ICONINFORMATION);
+        }
+      } else {
+        SendUiState();
       }
-      SendUiState();
       if (g_closeAfterWorker) {
         DestroyWindow(hwnd);
       }

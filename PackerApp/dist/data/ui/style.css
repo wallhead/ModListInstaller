@@ -251,13 +251,6 @@ textarea {
   background: linear-gradient(#1d2428, #171d20);
 }
 
-.footer > span {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
 .nav {
   display: flex;
   gap: 8px;
@@ -271,6 +264,50 @@ textarea {
 
 #cancelButton {
   border-color: #755052;
+}
+
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  display: grid;
+  place-items: center;
+  padding: 16px;
+  background: rgba(6, 9, 10, 0.72);
+}
+
+.modal-backdrop[hidden] {
+  display: none;
+}
+
+.message-modal {
+  width: min(360px, 100%);
+  padding: 20px;
+  color: var(--text);
+  background: var(--panel-2);
+  border: 1px solid var(--line-strong);
+  border-radius: 4px;
+  box-shadow: 0 14px 36px rgba(0, 0, 0, 0.55);
+}
+
+.message-modal h2 {
+  margin: 0;
+  font-size: 18px;
+  text-align: center;
+}
+
+.message-modal p {
+  margin: 10px 0 0;
+  color: var(--muted);
+  text-align: center;
+  white-space: pre-wrap;
+}
+
+.modal-actions {
+  display: flex;
+  justify-content: center;
+  gap: 8px;
+  margin-top: 20px;
 }
 
 @media (max-width: 720px) {

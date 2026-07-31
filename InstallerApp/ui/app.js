@@ -4,7 +4,6 @@
   const dom = {
     stepLabel: document.getElementById("stepLabel"),
     versionText: document.getElementById("versionText"),
-    footerInfo: document.getElementById("footerInfo"),
     unpackDrive: document.getElementById("unpackDrive"),
     unpackTarget: document.getElementById("unpackTarget"),
     installFolder: document.getElementById("installFolder"),
@@ -18,8 +17,14 @@
     startButton: document.getElementById("startButton"),
     cancelButton: document.getElementById("cancelButton"),
     browseInstall: document.getElementById("browseInstall"),
-    openLog: document.getElementById("openLog")
+    openLog: document.getElementById("openLog"),
+    messageModal: document.getElementById("messageModal"),
+    messageTitle: document.getElementById("messageTitle"),
+    messageText: document.getElementById("messageText"),
+    messageCancel: document.getElementById("messageCancel"),
+    messageOk: document.getElementById("messageOk")
   };
+  let messageAction = "";
 
   function send(command, payload) {
     const message = Object.assign({ command }, payload || {});
@@ -65,7 +70,6 @@
 
   function setStatus(status) {
     dom.statusText.textContent = status || "";
-    dom.footerInfo.textContent = status || "";
   }
 
   function addLog(message) {
@@ -91,6 +95,18 @@
 
   function showError(title, message) {
     addLog(`${title || "Ошибка"}: ${message || ""}`);
+    showMessageModal(title || "Ошибка", message || "");
+  }
+
+  function showMessageModal(title, message, action) {
+    messageAction = action || "";
+    dom.messageTitle.textContent = title || "";
+    dom.messageText.textContent = message || "";
+    dom.messageText.hidden = !message;
+    dom.messageCancel.hidden = messageAction !== "overwrite";
+    dom.messageOk.textContent = messageAction === "overwrite" ? "Перезаписать" : "OK";
+    dom.messageModal.hidden = false;
+    dom.messageOk.focus();
   }
 
   function applyState(state) {
@@ -140,6 +156,22 @@
   dom.startButton.addEventListener("click", () => send("startInstall"));
   dom.cancelButton.addEventListener("click", () => send("cancelInstall"));
   dom.openLog.addEventListener("click", () => send("openLog"));
+  dom.messageOk.addEventListener("click", () => {
+    const action = messageAction;
+    messageAction = "";
+    dom.messageModal.hidden = true;
+    if (action === "overwrite") {
+      send("confirmOverwrite");
+    }
+  });
+  dom.messageCancel.addEventListener("click", () => {
+    const action = messageAction;
+    messageAction = "";
+    dom.messageModal.hidden = true;
+    if (action === "overwrite") {
+      send("cancelOverwrite");
+    }
+  });
   dom.installFolder.addEventListener("change", () => send("setPath", { name: "installFolder", value: dom.installFolder.value }));
   dom.unpackDrive.addEventListener("change", () => send("setPath", { name: "unpackDrive", value: dom.unpackDrive.value }));
 
@@ -164,8 +196,12 @@
       window.installerUi.setOption(message.name, message.value);
     } else if (message.type === "error") {
       showError(message.title, message.message);
+    } else if (message.type === "overwriteConfirm") {
+      showMessageModal(message.title, message.message, "overwrite");
     } else if (message.type === "button") {
       setButtonEnabled(message.name, message.enabled);
+    } else if (message.type === "installComplete") {
+      showMessageModal("Установка завершена!", "");
     }
   });
 
