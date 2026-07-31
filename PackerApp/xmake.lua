@@ -1,5 +1,5 @@
 set_project("ModlistPacker")
-set_version("0.2.6")
+set_version("0.2.7")
 
 add_rules("mode.debug", "mode.release")
 set_languages("c++20")
@@ -11,7 +11,7 @@ target("modlist-packer")
     if is_plat("windows") then
         add_files("resources/app.rc")
         add_cxxflags("/W4", "/permissive-", {tools = "cl"})
-        add_syslinks("user32", "gdi32", "comdlg32", "shell32", "ole32", "comctl32", "bcrypt")
+        add_syslinks("user32", "gdi32", "comdlg32", "shell32", "ole32", "comctl32", "bcrypt", "psapi")
         add_ldflags("/SUBSYSTEM:WINDOWS", {tools = "link"})
         set_runtimes("MT")
     end

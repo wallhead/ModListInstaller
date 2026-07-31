@@ -18,7 +18,7 @@ PackerApp/dist/modlist-packer.exe
 Ready-to-use versioned release archives are written to:
 
 ```text
-Release/ModlistInstaller-v0.2.6.zip
+Release/ModlistInstaller-v0.2.7.zip
 ```
 
 Extract the zip and run `modlist-packer.exe`. The archive contains the portable packer, the installer exe beside it, and `data/ui` ready for release-folder creation.

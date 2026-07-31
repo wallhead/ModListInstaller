@@ -5,6 +5,7 @@
 #include <shlobj.h>
 #include <winioctl.h>
 #include <bcrypt.h>
+#include <psapi.h>
 
 #include "resource.h"
 
@@ -52,6 +53,7 @@ constexpr int kStatusLabel = 1023;
 constexpr int kParametersEdit = 1024;
 constexpr int kPathModeCombo = 1025;
 constexpr int kTestArchiveCheck = 1026;
+constexpr int kMemoryLimitCombo = 1027;
 
 constexpr UINT kLogMessage = WM_APP + 1;
 constexpr UINT kStatusMessage = WM_APP + 2;
@@ -78,6 +80,7 @@ HWND g_statusLabel = nullptr;
 HWND g_parametersEdit = nullptr;
 HWND g_pathModeCombo = nullptr;
 HWND g_testArchiveCheck = nullptr;
+HWND g_memoryLimitCombo = nullptr;
 std::atomic_bool g_workerRunning{false};
 std::atomic_bool g_cancelRequested{false};
 
@@ -96,6 +99,7 @@ struct PackerConfig {
   std::wstring threads;
   std::wstring parameters;
   std::wstring pathMode;
+  int memoryLimitPercent{80};
   uint64_t chunkSize{64ull * 1024ull * 1024ull};
   bool copyInstaller{true};
   bool testArchive{true};
@@ -275,7 +279,9 @@ std::wstring FormatProgressStatus(const std::wstring& label,
                                   uint64_t totalBytes,
                                   uint64_t bytesPerSecond,
                                   int64_t etaSeconds,
-                                  int64_t elapsedSeconds) {
+                                  int64_t elapsedSeconds,
+                                  uint64_t memoryUsedBytes = 0,
+                                  uint64_t memoryLimitBytes = 0) {
   std::wostringstream out;
   out << label << L" " << percent << L"%";
   if (totalBytes > 0) {
@@ -284,9 +290,37 @@ std::wstring FormatProgressStatus(const std::wstring& label,
   if (bytesPerSecond > 0) {
     out << L" | " << FormatBytesPerSecond(bytesPerSecond);
   }
+  if (memoryUsedBytes > 0) {
+    out << L" | RAM " << FormatBytes(memoryUsedBytes);
+    if (memoryLimitBytes > 0) {
+      out << L" / " << FormatBytes(memoryLimitBytes);
+    }
+  }
   out << L" | ETA " << FormatDuration(etaSeconds)
       << L" | Elapsed " << FormatDuration(elapsedSeconds);
   return out.str();
+}
+
+uint64_t PhysicalMemoryLimitBytes(int percent) {
+  MEMORYSTATUSEX memory{};
+  memory.dwLength = sizeof(memory);
+  if (!GlobalMemoryStatusEx(&memory)) {
+    return 0;
+  }
+  const auto boundedPercent = static_cast<uint64_t>(std::clamp(percent, 1, 100));
+  return (memory.ullTotalPhys / 100) * boundedPercent;
+}
+
+int ParsePercentText(const std::wstring& text, int fallback) {
+  try {
+    size_t parsed = 0;
+    const int value = std::stoi(text, &parsed);
+    if (parsed > 0) {
+      return std::clamp(value, 1, 100);
+    }
+  } catch (const std::exception&) {
+  }
+  return fallback;
 }
 
 std::string Narrow(const std::wstring& text) {
@@ -1129,35 +1163,62 @@ bool WriteManifest(HWND hwnd, const PackerConfig& config, uint64_t unpackedSize)
 
 void UpdateProcessProgressStatus(HWND hwnd,
                                  const std::wstring& label,
-                                 int percent,
+                                 int sevenZipPercent,
                                  uint64_t estimatedBytes,
-                                 std::chrono::steady_clock::time_point startedAt) {
+                                 std::chrono::steady_clock::time_point startedAt,
+                                 HANDLE processHandle,
+                                 uint64_t memoryLimitBytes) {
   const auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
       std::chrono::steady_clock::now() - startedAt).count();
   uint64_t done = 0;
   uint64_t speed = 0;
   int64_t eta = -1;
-  if (estimatedBytes > 0) {
-    done = (estimatedBytes * static_cast<uint64_t>(percent)) / 100;
-    if (elapsed > 0 && done > 0) {
-      speed = done / static_cast<uint64_t>(elapsed);
-      if (speed > 0 && estimatedBytes > done) {
-        eta = static_cast<int64_t>((estimatedBytes - done) / speed);
-      }
+
+  IO_COUNTERS io{};
+  const bool hasIoCounters = processHandle != nullptr && GetProcessIoCounters(processHandle, &io);
+  if (hasIoCounters) {
+    done = estimatedBytes > 0
+        ? std::min<uint64_t>(estimatedBytes, io.ReadTransferCount)
+        : io.ReadTransferCount;
+    if (elapsed > 0 && io.ReadTransferCount > 0) {
+      speed = io.ReadTransferCount / static_cast<uint64_t>(elapsed);
+    }
+    if (estimatedBytes > done && speed > 0) {
+      eta = static_cast<int64_t>((estimatedBytes - done) / speed);
     }
   }
+
+  int percent = std::clamp(sevenZipPercent, 0, 100);
+  if (sevenZipPercent < 0 && estimatedBytes > 0 && done > 0) {
+    percent = static_cast<int>(std::min<long double>(
+        100.0L, (static_cast<long double>(done) * 100.0L) / static_cast<long double>(estimatedBytes)));
+  }
+
+  uint64_t memoryUsedBytes = 0;
+  PROCESS_MEMORY_COUNTERS_EX memory{};
+  if (processHandle != nullptr &&
+      GetProcessMemoryInfo(processHandle,
+                           reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&memory),
+                           sizeof(memory))) {
+    memoryUsedBytes = static_cast<uint64_t>(memory.PrivateUsage);
+  }
+
   PostProgress(hwnd, percent);
-  PostStatus(hwnd, FormatProgressStatus(label, percent, done, estimatedBytes, speed, eta, elapsed));
+  PostStatus(hwnd, FormatProgressStatus(label,
+                                        percent,
+                                        done,
+                                        estimatedBytes,
+                                        speed,
+                                        eta,
+                                        elapsed,
+                                        memoryUsedBytes,
+                                        memoryLimitBytes));
 }
 
-void ConsumeProcessOutput(HWND hwnd,
-                          const char* buffer,
+void ConsumeProcessOutput(const char* buffer,
                           DWORD bytesRead,
                           std::string& tail,
-                          int& lastPercent,
-                          const std::wstring& label,
-                          uint64_t estimatedBytes,
-                          std::chrono::steady_clock::time_point startedAt) {
+                          int& lastPercent) {
   tail.append(buffer, bytesRead);
   if (tail.size() > 4096) {
     tail.erase(0, tail.size() - 4096);
@@ -1174,13 +1235,16 @@ void ConsumeProcessOutput(HWND hwnd,
     return;
   }
   const int percent = std::stoi(tail.substr(begin, percentPos - begin));
-  if (percent >= 0 && percent <= 100 && percent != lastPercent) {
+  if (percent >= 0 && percent <= 100) {
     lastPercent = percent;
-    UpdateProcessProgressStatus(hwnd, label, percent, estimatedBytes, startedAt);
   }
 }
 
-int RunProcess(HWND hwnd, const std::wstring& command, const std::wstring& label, uint64_t estimatedBytes) {
+int RunProcess(HWND hwnd,
+               const std::wstring& command,
+               const std::wstring& label,
+               uint64_t estimatedBytes,
+               int memoryLimitPercent = 0) {
   SECURITY_ATTRIBUTES security{};
   security.nLength = sizeof(security);
   security.bInheritHandle = TRUE;
@@ -1199,6 +1263,40 @@ int RunProcess(HWND hwnd, const std::wstring& command, const std::wstring& label
   startup.hStdError = writePipe;
   startup.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
 
+  HANDLE job = nullptr;
+  uint64_t memoryLimitBytes = 0;
+  if (memoryLimitPercent > 0) {
+    memoryLimitBytes = PhysicalMemoryLimitBytes(memoryLimitPercent);
+    if (memoryLimitBytes == 0) {
+      CloseHandle(writePipe);
+      CloseHandle(readPipe);
+      return static_cast<int>(ERROR_NOT_ENOUGH_MEMORY);
+    }
+    job = CreateJobObjectW(nullptr, nullptr);
+    if (job == nullptr) {
+      const DWORD error = GetLastError();
+      CloseHandle(writePipe);
+      CloseHandle(readPipe);
+      return static_cast<int>(error);
+    }
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};
+    limits.BasicLimitInformation.LimitFlags =
+        JOB_OBJECT_LIMIT_PROCESS_MEMORY | JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    limits.ProcessMemoryLimit = static_cast<SIZE_T>(memoryLimitBytes);
+    if (!SetInformationJobObject(job,
+                                 JobObjectExtendedLimitInformation,
+                                 &limits,
+                                 sizeof(limits))) {
+      const DWORD error = GetLastError();
+      CloseHandle(job);
+      CloseHandle(writePipe);
+      CloseHandle(readPipe);
+      return static_cast<int>(error);
+    }
+    PostLog(hwnd, L"7-Zip RAM limit: " + std::to_wstring(memoryLimitPercent) +
+                      L"% of physical memory (" + FormatBytes(memoryLimitBytes) + L")");
+  }
+
   PROCESS_INFORMATION process{};
   std::wstring mutableCommand = command;
   const BOOL created = CreateProcessW(nullptr,
@@ -1206,15 +1304,40 @@ int RunProcess(HWND hwnd, const std::wstring& command, const std::wstring& label
                                       nullptr,
                                       nullptr,
                                       TRUE,
-                                      CREATE_NO_WINDOW,
+                                      CREATE_NO_WINDOW | CREATE_SUSPENDED,
                                       nullptr,
                                       nullptr,
                                       &startup,
                                       &process);
   CloseHandle(writePipe);
   if (!created) {
+    const DWORD error = GetLastError();
+    if (job != nullptr) {
+      CloseHandle(job);
+    }
     CloseHandle(readPipe);
-    return static_cast<int>(GetLastError());
+    return static_cast<int>(error);
+  }
+
+  if (job != nullptr && !AssignProcessToJobObject(job, process.hProcess)) {
+    const DWORD error = GetLastError();
+    TerminateProcess(process.hProcess, error);
+    CloseHandle(process.hThread);
+    CloseHandle(process.hProcess);
+    CloseHandle(job);
+    CloseHandle(readPipe);
+    return static_cast<int>(error);
+  }
+  if (ResumeThread(process.hThread) == static_cast<DWORD>(-1)) {
+    const DWORD error = GetLastError();
+    TerminateProcess(process.hProcess, error);
+    CloseHandle(process.hThread);
+    CloseHandle(process.hProcess);
+    if (job != nullptr) {
+      CloseHandle(job);
+    }
+    CloseHandle(readPipe);
+    return static_cast<int>(error);
   }
 
   char buffer[4096];
@@ -1222,7 +1345,7 @@ int RunProcess(HWND hwnd, const std::wstring& command, const std::wstring& label
   int lastPercent = -1;
   const auto startedAt = std::chrono::steady_clock::now();
   auto lastHeartbeatAt = startedAt;
-  UpdateProcessProgressStatus(hwnd, label, 0, estimatedBytes, startedAt);
+  UpdateProcessProgressStatus(hwnd, label, lastPercent, estimatedBytes, startedAt, process.hProcess, memoryLimitBytes);
 
   while (true) {
     if (g_cancelRequested.load()) {
@@ -1237,13 +1360,19 @@ int RunProcess(HWND hwnd, const std::wstring& command, const std::wstring& label
       if (!ReadFile(readPipe, buffer, toRead, &bytesRead, nullptr) || bytesRead == 0) {
         break;
       }
-      ConsumeProcessOutput(hwnd, buffer, bytesRead, tail, lastPercent, label, estimatedBytes, startedAt);
+      ConsumeProcessOutput(buffer, bytesRead, tail, lastPercent);
       available = 0;
     }
 
     const auto now = std::chrono::steady_clock::now();
     if (now - lastHeartbeatAt >= std::chrono::seconds(1)) {
-      UpdateProcessProgressStatus(hwnd, label, std::max(0, lastPercent), estimatedBytes, startedAt);
+      UpdateProcessProgressStatus(hwnd,
+                                  label,
+                                  lastPercent,
+                                  estimatedBytes,
+                                  startedAt,
+                                  process.hProcess,
+                                  memoryLimitBytes);
       lastHeartbeatAt = now;
     }
 
@@ -1256,7 +1385,7 @@ int RunProcess(HWND hwnd, const std::wstring& command, const std::wstring& label
         if (!ReadFile(readPipe, buffer, toRead, &bytesRead, nullptr) || bytesRead == 0) {
           break;
         }
-        ConsumeProcessOutput(hwnd, buffer, bytesRead, tail, lastPercent, label, estimatedBytes, startedAt);
+        ConsumeProcessOutput(buffer, bytesRead, tail, lastPercent);
       }
       break;
     }
@@ -1267,6 +1396,9 @@ int RunProcess(HWND hwnd, const std::wstring& command, const std::wstring& label
   GetExitCodeProcess(process.hProcess, &exitCode);
   CloseHandle(process.hThread);
   CloseHandle(process.hProcess);
+  if (job != nullptr) {
+    CloseHandle(job);
+  }
   CloseHandle(readPipe);
   return static_cast<int>(exitCode);
 }
@@ -1340,6 +1472,7 @@ PackerConfig ReadConfig(bool archiveFirst) {
   config.solid = ComboText(g_solidCombo);
   config.volumeSize = ComboText(g_volumeCombo);
   config.threads = ComboText(g_threadsCombo);
+  config.memoryLimitPercent = ParsePercentText(ComboText(g_memoryLimitCombo), 80);
   config.parameters = GetText(g_parametersEdit);
   config.pathMode = ComboText(g_pathModeCombo);
   config.chunkSize = ParseSizeText(ComboText(g_chunkCombo), 64ull * 1024ull * 1024ull);
@@ -1437,7 +1570,11 @@ void Worker(HWND hwnd, PackerConfig config) {
     }
     if (!g_cancelRequested) {
       PostStatus(hwnd, L"Starting 7-Zip...");
-      const int exitCode = RunProcess(hwnd, BuildSevenZipCommand(config), L"Packing archive", unpackedSize);
+      const int exitCode = RunProcess(hwnd,
+                                      BuildSevenZipCommand(config),
+                                      L"Packing archive",
+                                      unpackedSize,
+                                      config.memoryLimitPercent);
       if (exitCode != 0) {
         PostLog(hwnd, L"7-Zip failed with exit code " + std::to_wstring(exitCode));
         ok = false;
@@ -1538,7 +1675,7 @@ void SetDefaults(HWND hwnd) {
   for (const wchar_t* item : {L"32m", L"64m", L"128m", L"256m", L"512m", L"1g"}) {
     AddComboItem(g_dictionaryCombo, item);
   }
-  SelectCombo(g_dictionaryCombo, 1);
+  SelectCombo(g_dictionaryCombo, 0);
 
   for (const wchar_t* item : {L"32", L"64", L"128", L"273"}) {
     AddComboItem(g_wordCombo, item);
@@ -1548,7 +1685,7 @@ void SetDefaults(HWND hwnd) {
   for (const wchar_t* item : {L"Solid", L"Non-solid", L"1g", L"4g", L"8g"}) {
     AddComboItem(g_solidCombo, item);
   }
-  SelectCombo(g_solidCombo, 2);
+  SelectCombo(g_solidCombo, 4);
 
   for (const wchar_t* item : {L"none", L"2g", L"4092M - FAT", L"4g", L"8g", L"16g"}) {
     AddComboItem(g_volumeCombo, item);
@@ -1558,7 +1695,12 @@ void SetDefaults(HWND hwnd) {
   for (const wchar_t* item : {L"on", L"2", L"4", L"8", L"16", L"20"}) {
     AddComboItem(g_threadsCombo, item);
   }
-  SelectCombo(g_threadsCombo, 2);
+  SelectCombo(g_threadsCombo, 5);
+
+  for (const wchar_t* item : {L"50%", L"60%", L"70%", L"80%", L"90%"}) {
+    AddComboItem(g_memoryLimitCombo, item);
+  }
+  SelectCombo(g_memoryLimitCombo, 3);
 
   for (const wchar_t* item : {L"16m", L"64m", L"128m", L"256m"}) {
     AddComboItem(g_chunkCombo, item);
@@ -1619,8 +1761,10 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
 
       CreateLabel(hwnd, L"Number of CPU threads", 24, 296, 140, 20);
       g_threadsCombo = CreateCombo(hwnd, kThreadsCombo, 164, 292, 110, 160);
-      CreateLabel(hwnd, L"Parameters", 300, 296, 150, 20);
-      g_parametersEdit = CreateEdit(hwnd, kParametersEdit, 460, 292, 210, 24);
+      CreateLabel(hwnd, L"RAM limit", 300, 296, 70, 20);
+      g_memoryLimitCombo = CreateCombo(hwnd, kMemoryLimitCombo, 370, 292, 76, 160);
+      CreateLabel(hwnd, L"Parameters", 458, 296, 75, 20);
+      g_parametersEdit = CreateEdit(hwnd, kParametersEdit, 536, 292, 164, 24);
 
       CreateGroupBox(hwnd, L"Manifest / Release", 10, 354, 704, 74);
       CreateLabel(hwnd, L"Manifest chunk size", 24, 380, 130, 20);

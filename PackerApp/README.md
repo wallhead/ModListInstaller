@@ -42,19 +42,23 @@ The default chunk size is 64 MiB.
 
 7-Zip is embedded inside `modlist-packer.exe` and extracted to a per-user cache when archive creation starts. The packer does not ask for an external `7z.exe`.
 
-The default compression profile is tuned to avoid surprise high RAM use:
+The default compression profile matches the recommended release settings:
 
 - level `5`
 - method `LZMA2`
-- dictionary `64m`
-- solid block `1g`
-- threads `4`
+- dictionary `32m`
+- word size `32`
+- solid block `8g`
+- threads `20`
+- split volumes `4092m`
+
+The RAM limit defaults to 80% of physical memory and is enforced on the 7-Zip process with a Windows Job Object. The packing status reports 7-Zip's own percentage together with live process read throughput, ETA, elapsed time, and RAM use.
 
 `Build Package` writes archive parts into `data\downloads`, writes the manifest into `data\package`, and refreshes the installer exe plus `data\ui`.
 
 Before a build, the packer removes older archive parts, interrupted `.tmp` files for the selected archive name, and the previous manifest. Source and release folders cannot be the same folder or contain one another, preventing the release output from being archived recursively.
 
-The status line reports source scan file count, accumulated size, and elapsed time. During 7-Zip packing and testing, elapsed time continues updating every second even when the integer archive percentage has not changed.
+The status line reports source scan file count, accumulated size, and elapsed time. During 7-Zip packing and testing, live process metrics continue updating every second even when the integer archive percentage has not changed.
 
 `Manifest Only` scans `data\downloads` for archive outputs only. It includes the exact archive file or numeric split volumes such as `MyPack.7z.001`, ignores side files like `.tmp` and logs, and writes `archive_name` from the real detected archive name. If more than one archive set is present, enter the wanted archive name first.
 

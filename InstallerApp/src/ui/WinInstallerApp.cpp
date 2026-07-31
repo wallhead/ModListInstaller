@@ -868,7 +868,7 @@ void SendUiState() {
       << L"\"progress\":" << g_progressPercent << L","
       << L"\"status\":" << JsonString(g_statusText) << L","
       << L"\"logs\":" << logs.str() << L","
-      << L"\"version\":\"Modlist Installer v0.2.6 by WallHead\","
+      << L"\"version\":\"Modlist Installer v0.2.7 by WallHead\","
       << L"\"installCompleted\":" << (g_installCompleted ? L"true" : L"false") << L","
       << L"\"options\":{},"
       << L"\"buttons\":{"
