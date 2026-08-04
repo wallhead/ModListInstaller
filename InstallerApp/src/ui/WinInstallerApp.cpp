@@ -7,6 +7,7 @@
 #include "paths/PathValidator.h"
 #include "resource.h"
 #include "ui/NativeInstallerView.h"
+#include "ui/NativeStrings.h"
 #include "verifier/Sha256.h"
 
 #include <windows.h>
@@ -32,6 +33,7 @@
 #include <optional>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -89,6 +91,7 @@ HWND g_nextButton = nullptr;
 HWND g_hotButton = nullptr;
 HWND g_mainWindow = nullptr;
 modlist::NativeInstallerView g_nativeView;
+modlist::NativeStrings g_strings;
 std::wstring g_archiveFolderName;
 struct PendingFolderCleanup {
   std::filesystem::path unpackFolder;
@@ -115,6 +118,10 @@ std::atomic_bool g_workerRunning{false};
 std::atomic_bool g_closeAfterWorker{false};
 std::atomic_bool g_stopRequested{false};
 bool g_installCompleted = false;
+
+std::wstring UiText(std::string_view key, std::wstring_view fallback) {
+  return g_strings.Get(key, fallback);
+}
 
 constexpr COLORREF kRailColor = RGB(23, 28, 31);
 constexpr COLORREF kRailDarkColor = RGB(16, 20, 22);
@@ -466,16 +473,18 @@ void UpdateUnpackTargetLabel() {
   }
   const auto folder = SelectedUnpackFolder();
   if (folder.empty()) {
-    SetText(g_unpackTargetLabel, L"Выберите диск");
-    SendUiPath(L"unpackTarget", L"Выберите диск");
+    const auto emptyText = UiText("unpack_target_empty", L"Выберите диск");
+    SetText(g_unpackTargetLabel, emptyText);
+    SendUiPath(L"unpackTarget", emptyText);
   } else {
     SetText(g_unpackTargetLabel, folder.wstring());
     SendUiPath(L"unpackTarget", folder.wstring());
   }
   if (g_mainWindow != nullptr) {
     const std::wstring drive = ComboText(g_unpackDriveCombo);
+    const auto chooseText = UiText("button_choose", L"Выберите");
     SetWindowTextW(GetDlgItem(g_mainWindow, kDrivePickerButton),
-                   drive.empty() ? L"Выберите" : drive.c_str());
+                   drive.empty() ? chooseText.c_str() : drive.c_str());
   }
 }
 
@@ -615,7 +624,8 @@ LRESULT CALLBACK DrivePopupProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
 void ShowDriveMenu(HWND owner) {
   const int count = static_cast<int>(SendMessageW(g_unpackDriveCombo, CB_GETCOUNT, 0, 0));
   if (count <= 0) {
-    SendUiError(L"Диск недоступен", L"Не найден доступный диск для распаковки.");
+    SendUiError(UiText("drive_unavailable_title", L"Диск недоступен"),
+                UiText("drive_unavailable_message", L"Не найден доступный диск для распаковки."));
     return;
   }
   DrivePopupData data;
@@ -889,10 +899,10 @@ LRESULT CALLBACK ThemedDialogProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM
     case WM_CREATE:
       ApplyWindowFrameTheme(hwnd);
       if (data != nullptr && data->confirmation) {
-        CreateButton(hwnd, IDYES, L"Да", 0, 0, 96, 32);
-        CreateButton(hwnd, IDNO, L"Нет", 0, 0, 96, 32);
+        CreateButton(hwnd, IDYES, UiText("button_yes", L"Да").c_str(), 0, 0, 96, 32);
+        CreateButton(hwnd, IDNO, UiText("button_no", L"Нет").c_str(), 0, 0, 96, 32);
       } else {
-        CreateButton(hwnd, IDOK, L"OK", 0, 0, 96, 32);
+        CreateButton(hwnd, IDOK, UiText("button_ok", L"OK").c_str(), 0, 0, 96, 32);
       }
       return 0;
     case WM_ERASEBKGND:
@@ -1216,16 +1226,19 @@ void SendUiError(const std::wstring& title, const std::wstring& message) {
 }
 
 void SendUiCleanupConfirm(const PendingFolderCleanup& folders) {
-  std::wstring message =
-      L"После предыдущей неудачной или остановленной установки остались файлы:";
+  std::wstring message = UiText(
+      "cleanup_intro", L"После предыдущей неудачной или остановленной установки остались файлы:");
   if (!folders.unpackFolder.empty()) {
-    message += L"\n\nПапка распаковки:\n" + PathToDisplay(folders.unpackFolder);
+    message += L"\n\n" + UiText("cleanup_unpack_folder", L"Папка распаковки:") +
+               L"\n" + PathToDisplay(folders.unpackFolder);
   }
   if (!folders.installFolder.empty()) {
-    message += L"\n\nПапка установки:\n" + PathToDisplay(folders.installFolder);
+    message += L"\n\n" + UiText("cleanup_install_folder", L"Папка установки:") +
+               L"\n" + PathToDisplay(folders.installFolder);
   }
-  message += L"\n\nОчистить указанные папки и продолжить установку?";
-  if (ShowThemedMessage(g_mainWindow, L"Очистить папки?", message, true) == IDYES) {
+  message += L"\n\n" + UiText("cleanup_question", L"Очистить указанные папки и продолжить установку?");
+  if (ShowThemedMessage(g_mainWindow, UiText("cleanup_title", L"Очистить папки?"),
+                        message, true) == IDYES) {
     ConfirmPendingFolderCleanup(g_mainWindow);
   } else {
     CancelPendingFolderCleanup();
@@ -2707,7 +2720,7 @@ bool ValidateFolders(const SpaceRequirements& requirements = {},
       }
       message << errors[i];
     }
-    SendUiError(L"Ошибка пути", message.str());
+    SendUiError(UiText("path_error_title", L"Ошибка пути"), message.str());
   }
 
   return ok;
@@ -2791,7 +2804,7 @@ void StartInstall(HWND hwnd) {
   if (const auto documentsError = EnsureGameDocumentsFolders();
       documentsError.has_value()) {
     AppendLog(*documentsError);
-    SendUiError(L"Ошибка папки документов", *documentsError);
+    SendUiError(UiText("documents_error_title", L"Ошибка папки документов"), *documentsError);
     return;
   }
   AppendLog(L"Начало установки...");
@@ -2869,12 +2882,14 @@ std::optional<std::wstring> ClearFolderContents(const std::filesystem::path& fol
 
 void ConfirmPendingFolderCleanup(HWND hwnd) {
   if (g_workerRunning) {
-    SendUiError(L"Установщик занят", L"Установщик уже запущен.");
+    SendUiError(UiText("installer_busy_title", L"Установщик занят"),
+                UiText("installer_busy_message", L"Установщик уже запущен."));
     return;
   }
 
   if (!g_pendingFolderCleanup.has_value()) {
-    SendUiError(L"Очистка отменена", L"Папки для очистки больше не выбраны.");
+    SendUiError(UiText("cleanup_cancelled_title", L"Очистка отменена"),
+                L"Папки для очистки больше не выбраны.");
     return;
   }
 
@@ -2899,7 +2914,7 @@ void ConfirmPendingFolderCleanup(HWND hwnd) {
        !IsSameFolder(currentInstallFolder, currentInstallFolder.root_path()));
   if (!safeUnpack || !safeInstall) {
     AppendLog(L"Очистка отменена: выбранные папки изменились.");
-    SendUiError(L"Очистка отменена",
+    SendUiError(UiText("cleanup_cancelled_title", L"Очистка отменена"),
                 L"Выбранные папки изменились. Нажмите «Установить» и проверьте пути ещё раз.");
     return;
   }
@@ -2909,7 +2924,7 @@ void ConfirmPendingFolderCleanup(HWND hwnd) {
     if (const auto error = ClearFolderContents(currentUnpackFolder, L"папку распаковки");
         error.has_value()) {
       AppendLog(*error);
-      SendUiError(L"Ошибка очистки", *error);
+      SendUiError(UiText("cleanup_error_title", L"Ошибка очистки"), *error);
       return;
     }
     AppendLog(L"Папка распаковки очищена.");
@@ -2920,7 +2935,7 @@ void ConfirmPendingFolderCleanup(HWND hwnd) {
     if (const auto error = ClearFolderContents(currentInstallFolder, L"папку установки");
         error.has_value()) {
       AppendLog(*error);
-      SendUiError(L"Ошибка очистки", *error);
+      SendUiError(UiText("cleanup_error_title", L"Ошибка очистки"), *error);
       return;
     }
     AppendLog(L"Папка установки очищена.");
@@ -3049,36 +3064,40 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
       if (!g_nativeView.Initialize(hwnd, UiFolder() / "style.css", &themeWarning)) {
         return -1;
       }
+      std::wstring stringsWarning;
+      g_strings.Load(UiFolder() / "strings.json", &stringsWarning);
+      g_statusText = UiText("status_idle", L"Ожидание | Ожидание проверки");
+      SetWindowTextW(hwnd, UiText("window_title", L"Modlist Installer Beta").c_str());
       g_contentBrush = CreateSolidBrush(kContentColor);
       g_headerBrush = CreateSolidBrush(kHeaderColor);
       g_panelBrush = CreateSolidBrush(kPanelColor);
       g_footerBrush = CreateSolidBrush(kFooterColor);
       g_editBrush = CreateSolidBrush(g_nativeView.InputColor());
       g_stepLabel = CreateLabel(hwnd, L"", 16, 18, 720, 24);
-      g_welcomeTitle = CreateLabel(hwnd, L"Modlist Installer Beta", 16, 92, 720, 38);
+      g_welcomeTitle = CreateLabel(hwnd, UiText("app_title", L"Modlist Installer Beta").c_str(), 16, 92, 720, 38);
       g_welcomeBody = CreateLabel(hwnd, L"", 16, 146, 720, 90);
       g_downloadLabel = CreateLabel(hwnd, L"Package", 16, 112, 100, 20);
       g_unpackDriveLabel = CreateLabel(hwnd, L"Unpack drive", 16, 136, 100, 20);
-      g_unpackTargetLabel = CreateLabel(hwnd, L"Выберите диск", 160, 136, 420, 20);
+      g_unpackTargetLabel = CreateLabel(hwnd, UiText("unpack_target_empty", L"Выберите диск").c_str(), 160, 136, 420, 20);
       g_installLabel = CreateLabel(hwnd, L"Установка", 16, 178, 100, 20);
       g_downloadEdit = CreateEdit(hwnd, kDownloadEdit, 120, 22, 420, 25);
       g_unpackDriveCombo = CreateCombo(hwnd, kUnpackDriveCombo, 120, 132, 120, 180);
-      CreateButton(hwnd, kDrivePickerButton, L"Выберите", 120, 132, 126, 32);
+      CreateButton(hwnd, kDrivePickerButton, UiText("button_choose", L"Выберите").c_str(), 120, 132, 126, 32);
       g_installEdit = CreateEdit(hwnd, kInstallEdit, 120, 57, 420, 25);
-      CreateButton(hwnd, kDownloadBrowse, L"Обзор", 550, 22, 88, 25);
-      CreateButton(hwnd, kInstallBrowse, L"Обзор", 550, 57, 88, 25);
-      CreateButton(hwnd, kValidateButton, L"Проверка", 120, 96, 120, 30);
-      CreateButton(hwnd, kStartButton, L"Установить", 252, 96, 120, 30);
-      CreateButton(hwnd, kUnpackButton, L"Распаковка", 384, 96, 120, 30);
-      CreateButton(hwnd, kPauseButton, L"Пауза", 516, 96, 120, 30);
-      CreateButton(hwnd, kStopButton, L"Остановить", 648, 96, 104, 30);
-      CreateButton(hwnd, kOpenLogButton, L"Открыть лог", 16, 450, 112, 30);
-      g_previousButton = CreateButton(hwnd, kPreviousButton, L"Предыдущий", 632, 450, 100, 30);
-      g_nextButton = CreateButton(hwnd, kNextButton, L"Дальше", 744, 450, 100, 30);
+      CreateButton(hwnd, kDownloadBrowse, UiText("button_browse", L"Обзор").c_str(), 550, 22, 88, 25);
+      CreateButton(hwnd, kInstallBrowse, UiText("button_browse", L"Обзор").c_str(), 550, 57, 88, 25);
+      CreateButton(hwnd, kValidateButton, UiText("button_validate", L"Проверка").c_str(), 120, 96, 120, 30);
+      CreateButton(hwnd, kStartButton, UiText("button_install", L"Установить").c_str(), 252, 96, 120, 30);
+      CreateButton(hwnd, kUnpackButton, UiText("button_unpack", L"Распаковка").c_str(), 384, 96, 120, 30);
+      CreateButton(hwnd, kPauseButton, UiText("button_pause", L"Пауза").c_str(), 516, 96, 120, 30);
+      CreateButton(hwnd, kStopButton, UiText("button_stop", L"Остановить").c_str(), 648, 96, 104, 30);
+      CreateButton(hwnd, kOpenLogButton, UiText("button_open_log", L"Открыть лог").c_str(), 16, 450, 112, 30);
+      g_previousButton = CreateButton(hwnd, kPreviousButton, UiText("button_previous", L"Предыдущий").c_str(), 632, 450, 100, 30);
+      g_nextButton = CreateButton(hwnd, kNextButton, UiText("button_next", L"Дальше").c_str(), 744, 450, 100, 30);
       g_progress = CreateWindowExW(0, PROGRESS_CLASSW, L"", WS_CHILD | WS_VISIBLE,
                                    16, 142, 622, 20, hwnd,
                                    reinterpret_cast<HMENU>(static_cast<INT_PTR>(kProgress)), g_instance, nullptr);
-      g_statusLabel = CreateWindowExW(0, L"STATIC", L"Ожидание | Ожидание проверки",
+      g_statusLabel = CreateWindowExW(0, L"STATIC", g_statusText.c_str(),
                                       WS_CHILD | WS_VISIBLE,
                                       16, 170, 622, 22, hwnd,
                                       reinterpret_cast<HMENU>(static_cast<INT_PTR>(kStatusLabel)), g_instance, nullptr);
@@ -3103,8 +3122,12 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
       SetText(g_installEdit, L"");
       AppendLog(L"App log: " + PathToDisplay(AppLogPath()));
       AppendLog(L"Native CSS theme: " + PathToDisplay(UiFolder() / "style.css"));
+      AppendLog(L"Native UI strings: " + PathToDisplay(UiFolder() / "strings.json"));
       if (!themeWarning.empty()) {
         AppendLog(themeWarning);
+      }
+      if (!stringsWarning.empty()) {
+        AppendLog(stringsWarning);
       }
       AppendLog(L"Manifest auto-detected at: " + PathToDisplay(ManifestPath()));
       AppendLog(L"Archive parts are detected in: " + PathToDisplay(ArchiveFolder()));
@@ -3138,12 +3161,20 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
       const auto unpackFolder = SelectedUnpackFolder();
       const auto finalFolder = FinalInstallFolder(std::filesystem::path(GetText(g_installEdit)));
       modlist::NativeInstallerViewState state;
-      state.version = L"Modlist Installer v0.2.9 by WallHead";
+      state.title = UiText("app_title", L"Modlist Installer Beta");
+      state.version = UiText("app_version", L"Modlist Installer v0.3.0 by WallHead");
+      state.unpackNote = UiText(
+          "unpack_note",
+          L"Распаковка должна происходить по короткому пути. После распаковки установщик перенесет все файлы в папку установки.");
+      state.unpackDriveLabel = UiText("unpack_drive_label", L"Диск для распаковки");
+      state.installFolderLabel = UiText("install_folder_label", L"Папка установки");
+      state.finalPathLabel = UiText("final_path_label", L"Итоговый путь");
       state.unpackTarget = unpackFolder.empty()
-                               ? L"Выберите диск"
-                               : L"Папка: " + unpackFolder.wstring();
+                               ? UiText("unpack_target_empty", L"Выберите диск")
+                               : g_strings.Format("unpack_target_format", L"Папка: {path}",
+                                                  {{L"path", unpackFolder.wstring()}});
       state.finalInstallFolder = finalFolder.empty()
-                                     ? L"Выберите папку установки"
+                                     ? UiText("final_path_empty", L"Выберите папку установки")
                                      : finalFolder.wstring();
       state.status = g_statusText;
       state.progress = g_progressPercent;
@@ -3289,15 +3320,18 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
       return 0;
     }
     case kValidationFailedMessage:
-      SendUiError(L"Ошибка проверки", L"Проверка завершилась ошибкой. Перехешируйте торрент файлы.");
+      SendUiError(UiText("validation_error_title", L"Ошибка проверки"),
+                  UiText("validation_error_message",
+                         L"Проверка завершилась ошибкой. Перехешируйте торрент файлы."));
       return 0;
     case kWorkerFinishedMessage: {
       SetControlsRunning(hwnd, false);
       if (wParam != 0 && !g_closeAfterWorker) {
         g_installCompleted = true;
-        SetWindowTextW(GetDlgItem(hwnd, kStartButton), L"Закрыть");
+        SetWindowTextW(GetDlgItem(hwnd, kStartButton), UiText("button_close", L"Закрыть").c_str());
         SendUiState();
-        ShowThemedMessage(hwnd, L"Modlist Installer Beta", L"Установка завершена!");
+        ShowThemedMessage(hwnd, UiText("window_title", L"Modlist Installer Beta"),
+                          UiText("install_complete_message", L"Установка завершена!"));
       } else {
         SendUiState();
       }
@@ -3310,7 +3344,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
       if (g_workerRunning) {
         g_closeAfterWorker = true;
         StopInstall();
-        SetWindowTextW(hwnd, L"Modlist Installer Beta - остановка...");
+        SetWindowTextW(hwnd, UiText("window_title_stopping", L"Modlist Installer Beta - остановка...").c_str());
         AppendLog(L"Ожидание остановки проверки перед закрытием.");
         return 0;
       }

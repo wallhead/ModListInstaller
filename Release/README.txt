@@ -8,7 +8,8 @@ The generated installer expects:
 - native theme in data\ui
 - bundled support files in data\tools
 
-The native Direct2D interface reads its editable theme from data\ui\style.css.
+The native Direct2D interface reads its editable theme from data\ui\style.css
+and its editable visible text from data\ui\strings.json.
 It does not require WebView2, Edge, .NET, or internet access.
 
 The installer extracts to the selected drive's short Unpacked path, then moves

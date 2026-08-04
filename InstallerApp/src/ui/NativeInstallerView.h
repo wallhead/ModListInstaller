@@ -51,7 +51,12 @@ struct NativeInstallerLayout {
 };
 
 struct NativeInstallerViewState {
+  std::wstring title;
   std::wstring version;
+  std::wstring unpackNote;
+  std::wstring unpackDriveLabel;
+  std::wstring installFolderLabel;
+  std::wstring finalPathLabel;
   std::wstring unpackTarget;
   std::wstring finalInstallFolder;
   std::wstring status;

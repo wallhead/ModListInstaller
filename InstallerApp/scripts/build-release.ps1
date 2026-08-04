@@ -28,6 +28,7 @@ try {
   }
   New-Item -ItemType Directory -Path ".\dist\data\ui" -Force | Out-Null
   Copy-Item ".\ui\style.css" ".\dist\data\ui\style.css" -Force
+  Copy-Item ".\ui\strings.json" ".\dist\data\ui\strings.json" -Force
   Copy-Item ".\build\windows\x64\release\modlist-installer-gui.exe" ".\dist\modlist-installer.exe" -Force
 
   if (Test-Path ".\dist\tools") {

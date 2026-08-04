@@ -11,14 +11,14 @@ PackerApp/dist/modlist-packer.exe
 
 `modlist-installer.exe` is the distributable launcher. Ship it at the release root and keep installer support files, UI, manifest, and archive parts under `data`.
 
-`modlist-packer.exe` is portable from `PackerApp/dist`: keep `modlist-installer.exe` beside it and keep `data/ui/style.css` plus `data/tools` beside both. The packer copies that local installer bundle into each release folder.
+`modlist-packer.exe` is portable from `PackerApp/dist`: keep `modlist-installer.exe` beside it and keep `data/ui/style.css`, `data/ui/strings.json`, and `data/tools` beside both. The packer copies that local installer bundle into each release folder.
 
 ## Release Package
 
 Ready-to-use versioned release archives are written to:
 
 ```text
-Release/ModlistInstaller-v0.2.9.zip
+Release/ModlistInstaller-v0.3.0.zip
 ```
 
 Extract the zip and run `modlist-packer.exe`. The archive contains the portable packer, the installer exe beside it, and the editable native CSS theme ready for release-folder creation.
@@ -39,6 +39,7 @@ MyPack/
       7zip/
     ui/
       style.css
+      strings.json
 ```
 
 The installer looks for `data\package\manifest.json` beside the exe and archive parts in `data\downloads`. There is no package-folder picker in the UI.
@@ -49,6 +50,7 @@ The installer looks for `data\package\manifest.json` beside the exe and archive 
 - Native Direct2D/DirectWrite interface with crisp hardware-accelerated rendering.
 - No WebView2, Edge, Electron, .NET, dev server, or remote UI assets.
 - Runtime CSS theme variables control colors, typography, spacing, and core dimensions.
+- Runtime JSON strings control the visible labels, buttons, dialogs, and primary messages.
 - Single-screen installer UI with unpack drive, install root, final archive-named path, progress, status, and log output.
 - One-read asynchronous SHA256 validation/extraction for chunked packer manifests: a background reader verifies blocks before an embedded 7-Zip SDK decoder can consume them.
 - Legacy manifests retain the separate full SHA256 pass and command-line 7-Zip extraction path.
@@ -69,7 +71,7 @@ The installer looks for `data\package\manifest.json` beside the exe and archive 
 1. Put `modlist-installer.exe` at the release root.
 2. Put archive parts in `data\downloads`.
 3. Put the manifest at `data\package\manifest.json`.
-4. Keep the optional native theme at `data\ui\style.css`; built-in defaults are used if it is missing or invalid.
+4. Keep the editable native theme and text at `data\ui\style.css` and `data\ui\strings.json`; built-in defaults are used if either file is missing or invalid.
 5. Run `modlist-installer.exe`.
 6. Select an unpack drive and install root. The installer creates `<install root>\<archive_name>`.
 7. Press `Install`.
@@ -91,9 +93,9 @@ cd InstallerApp
 .\scripts\build-release.ps1
 ```
 
-The release script builds with xmake, runs tests, and copies the native CSS theme into `dist`. No browser runtime is downloaded or bundled.
+The release script builds with xmake, runs tests, and copies the native CSS theme and text catalogue into `dist`. No browser runtime is downloaded or bundled.
 
-## Change Installer CSS
+## Change Installer Theme And Text
 
 Edit the source stylesheet:
 
@@ -108,6 +110,8 @@ Copy-Item -Force InstallerApp\ui\style.css InstallerApp\dist\data\ui\style.css
 ```
 
 Then restart `InstallerApp\dist\modlist-installer.exe`.
+
+To change visible text, edit `InstallerApp\ui\strings.json` or the packaged `data\ui\strings.json`. Keep placeholder names such as `{path}` unchanged. The installer reads the file at startup and falls back to its built-in text when a key or the file is missing.
 
 For a release build, run:
 

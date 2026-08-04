@@ -78,6 +78,7 @@ InstallerApp\dist\
       7zip\
     ui\
       style.css
+      strings.json
 ```
 
 Do not commit generated logs.
@@ -89,9 +90,9 @@ cd InstallerApp
 .\scripts\build-release.ps1
 ```
 
-The script configures xmake for release, runs tests, and copies the GUI exe and native CSS theme into `dist`. No browser runtime is required.
+The script configures xmake for release, runs tests, and copies the GUI exe, native CSS theme, and editable text catalogue into `dist`. No browser runtime is required.
 
-## Change CSS
+## Change Theme And Text
 
 Edit the source stylesheet:
 
@@ -114,6 +115,8 @@ For release builds, use:
 ```
 
 The renderer reads supported `:root` variables at startup: the palette variables plus `--font-family`, `--font-size`, `--header-height`, `--footer-height`, `--control-height`, `--corner-radius`, `--content-padding`, and `--label-width`. Treat edits in `dist\data\ui` as temporary because the next release build overwrites them.
+
+Edit `ui\strings.json` to change visible labels, buttons, dialogs, and primary messages without rebuilding. Copy it to `dist\data\ui\strings.json` for a quick test, preserve placeholders such as `{path}`, and restart the installer. Missing keys use built-in defaults.
 
 ## Build With CMake
 
@@ -139,6 +142,7 @@ MyPack/
     tools/
     ui/
       style.css
+      strings.json
 ```
 
 Run from that folder:
@@ -147,7 +151,7 @@ Run from that folder:
 modlist-installer.exe
 ```
 
-The GUI requires `data\package\manifest.json`, optionally loads native theme variables from `data\ui\style.css`, uses archive files from `data\downloads`, and uses the manifest's `unpacked_size` for space checks. Chunked packer manifests use a bounded verified-block cache: validation runs ahead of extraction, and unverified bytes never reach 7-Zip. Legacy manifests use the original separate verification pass. If the manifest is missing, invalid, or any hash fails, installation stops and shows a validation failure message.
+The GUI requires `data\package\manifest.json`, loads optional native theme variables from `data\ui\style.css` and text from `data\ui\strings.json`, uses archive files from `data\downloads`, and uses the manifest's `unpacked_size` for space checks. Chunked packer manifests use a bounded verified-block cache: validation runs ahead of extraction, and unverified bytes never reach 7-Zip. Legacy manifests use the original separate verification pass. If the manifest is missing, invalid, or any hash fails, installation stops and shows a validation failure message.
 
 The interface uses Windows Direct2D and DirectWrite. It does not require WebView2, Edge, .NET, or an internet connection.
 

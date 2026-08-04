@@ -4,7 +4,7 @@ Native Windows helper for building modlist release folders.
 
 It provides a focused 7-Zip-style archive settings window, runs embedded 7-Zip, tests the archive when requested, then writes a chunked SHA-256 manifest into `data\package\manifest.json`.
 
-`modlist-packer.exe` is portable. Keep `modlist-installer.exe` beside it, the native CSS theme under `data\ui`, and installer dependencies under `data\tools`. The packer copies those files into each release folder.
+`modlist-packer.exe` is portable. Keep `modlist-installer.exe` beside it, the native CSS theme and `strings.json` under `data\ui`, and installer dependencies under `data\tools`. The packer copies those files into each release folder.
 
 ## Release Layout
 
@@ -19,6 +19,7 @@ ReleaseFolder\
       MyPack.7z.002
     ui\
       style.css
+      strings.json
     logs\
     tools\
       7zip\

@@ -1,5 +1,5 @@
 set_project("ModlistInstaller")
-set_version("0.2.9")
+set_version("0.3.0")
 
 add_rules("mode.debug", "mode.release")
 set_languages("c++20")
@@ -81,7 +81,7 @@ target("modlist-installer-gui")
     end
     set_rundir("$(projectdir)")
     add_includedirs("resources")
-    add_files("src/ui/WinInstallerApp.cpp", "src/ui/NativeInstallerView.cpp")
+    add_files("src/ui/WinInstallerApp.cpp", "src/ui/NativeInstallerView.cpp", "src/ui/NativeStrings.cpp")
     add_deps("installer_core")
     if is_plat("windows") then
         add_files("resources/app.rc")

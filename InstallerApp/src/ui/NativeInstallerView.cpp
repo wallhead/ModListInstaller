@@ -450,17 +450,16 @@ void NativeInstallerView::Paint(HWND hwnd, const NativeInstallerViewState& state
   target_->DrawLine(D2D1::Point2F(0, footerTop + 0.5f),
                     D2D1::Point2F(width, footerTop + 0.5f), softLine.Get());
 
-  DrawText(target_.Get(), L"Modlist Installer Beta",
+  DrawText(target_.Get(), state.title,
            D2D1::RectF(left, 11.0f, right, 43.0f), titleFormat_.Get(), text.Get());
   DrawText(target_.Get(), state.version,
            D2D1::RectF(left, 45.0f, right, theme_.headerHeight - 8.0f),
            versionFormat_.Get(), muted.Get());
-  DrawText(target_.Get(),
-           L"Распаковка должна происходить по короткому пути. После распаковки установщик перенесет все файлы в папку установки.",
+  DrawText(target_.Get(), state.unpackNote,
            D2D1::RectF(left, noteTop, right, noteTop + 38.0f), bodyFormat_.Get(),
            muted.Get(), DWRITE_TEXT_ALIGNMENT_LEADING, true);
 
-  DrawText(target_.Get(), L"Диск для распаковки",
+  DrawText(target_.Get(), state.unpackDriveLabel,
            D2D1::RectF(left, layout.driveCombo.top, fieldLeft - 12.0f,
                        layout.driveCombo.bottom),
            labelFormat_.Get(), text.Get());
@@ -469,7 +468,7 @@ void NativeInstallerView::Paint(HWND hwnd, const NativeInstallerViewState& state
                        right, layout.driveCombo.bottom),
            bodyFormat_.Get(), muted.Get());
 
-  DrawText(target_.Get(), L"Папка установки",
+  DrawText(target_.Get(), state.installFolderLabel,
            D2D1::RectF(left, layout.installFrame.top, fieldLeft - 12.0f,
                        layout.installFrame.bottom),
            labelFormat_.Get(), text.Get());
@@ -480,7 +479,7 @@ void NativeInstallerView::Paint(HWND hwnd, const NativeInstallerViewState& state
       D2D1::RoundedRect(layout.installFrame, theme_.cornerRadius, theme_.cornerRadius),
       line.Get());
 
-  DrawText(target_.Get(), L"Итоговый путь",
+  DrawText(target_.Get(), state.finalPathLabel,
            D2D1::RectF(left, layout.finalPath.top, fieldLeft - 12.0f,
                        layout.finalPath.bottom),
            labelFormat_.Get(), muted.Get());

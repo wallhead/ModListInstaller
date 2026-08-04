@@ -38,6 +38,7 @@ if(WIN32)
   add_executable(modlist-installer-gui WIN32
     ui/WinInstallerApp.cpp
     ui/NativeInstallerView.cpp
+    ui/NativeStrings.cpp
     ../resources/app.rc)
   target_include_directories(modlist-installer-gui PRIVATE ../resources)
   if(MSVC)
@@ -51,5 +52,8 @@ if(WIN32)
       "$<TARGET_FILE_DIR:modlist-installer-gui>/data/ui"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
       "${CMAKE_CURRENT_SOURCE_DIR}/../ui/style.css"
-      "$<TARGET_FILE_DIR:modlist-installer-gui>/data/ui/style.css")
+      "$<TARGET_FILE_DIR:modlist-installer-gui>/data/ui/style.css"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+      "${CMAKE_CURRENT_SOURCE_DIR}/../ui/strings.json"
+      "$<TARGET_FILE_DIR:modlist-installer-gui>/data/ui/strings.json")
 endif()
