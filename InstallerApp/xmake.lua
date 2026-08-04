@@ -1,5 +1,5 @@
 set_project("ModlistInstaller")
-set_version("0.2.8")
+set_version("0.2.9")
 
 add_rules("mode.debug", "mode.release")
 set_languages("c++20")
@@ -34,19 +34,6 @@ local function add_vcpkg_libtorrent()
     if is_plat("windows") then
         set_runtimes("MT")
     end
-end
-
-local function add_webview2_sdk()
-    local sdk = path.join(os.projectdir(), "third_party", "webview2", "Microsoft.Web.WebView2")
-    add_includedirs(path.join(sdk, "build", "native", "include"))
-    if is_arch("x86") then
-        add_linkdirs(path.join(sdk, "build", "native", "x86"))
-    elseif is_arch("arm64") then
-        add_linkdirs(path.join(sdk, "build", "native", "arm64"))
-    else
-        add_linkdirs(path.join(sdk, "build", "native", "x64"))
-    end
-    add_links("WebView2LoaderStatic")
 end
 
 target("installer_core")
@@ -94,20 +81,14 @@ target("modlist-installer-gui")
     end
     set_rundir("$(projectdir)")
     add_includedirs("resources")
-    add_files("src/ui/WinInstallerApp.cpp", "src/ui/WebViewHost.cpp")
+    add_files("src/ui/WinInstallerApp.cpp", "src/ui/NativeInstallerView.cpp")
     add_deps("installer_core")
-    add_webview2_sdk()
     if is_plat("windows") then
         add_files("resources/app.rc")
         add_cxxflags("/utf-8", {tools = "cl"})
-        add_syslinks("user32", "gdi32", "comdlg32", "shell32", "ole32", "oleaut32", "comctl32", "shlwapi", "advapi32")
+        add_syslinks("user32", "gdi32", "d2d1", "dwrite", "dwmapi", "uxtheme", "comdlg32", "shell32", "ole32", "oleaut32", "comctl32", "shlwapi", "advapi32")
         add_ldflags("/SUBSYSTEM:WINDOWS", {tools = "link"})
     end
-    after_build(function (target)
-        local ui_target = path.join(target:targetdir(), "data", "ui")
-        os.rm(ui_target)
-        os.cp("ui", ui_target)
-    end)
 target_end()
 
 target("installer_core_tests")

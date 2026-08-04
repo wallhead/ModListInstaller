@@ -11,6 +11,8 @@ InstallerApp/dist/data/downloads/
 InstallerApp/dist/modlist-installer-updated.exe
 PackerApp/.xmake/
 PackerApp/build/
+InstallerApp/third_party/webview2-runtime/
+Release/ModlistInstaller-v*.zip
 
 *.obj
 *.pdb
@@ -27,8 +29,5 @@ PackerApp/build/
 !InstallerApp/dist/modlist-installer.exe
 !InstallerApp/resources/7z.exe
 !InstallerApp/resources/7z.dll
-!InstallerApp/resources/webview2/MicrosoftEdgeWebview2Setup.exe
-!InstallerApp/dist/data/tools/webview2/MicrosoftEdgeWebview2Setup.exe
 !PackerApp/dist/modlist-installer.exe
 !PackerApp/dist/modlist-packer.exe
-!PackerApp/dist/data/tools/webview2/MicrosoftEdgeWebview2Setup.exe

@@ -3,12 +3,13 @@ $ErrorActionPreference = "Stop"
 $ProjectRoot = Split-Path -Parent $PSScriptRoot
 Push-Location $ProjectRoot
 try {
-  & ".\scripts\restore-webview2.ps1"
-
   xmake f --use_libtorrent=n -m release
+  if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
   xmake
+  if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
   xmake run installer_core_tests
+  if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
   New-Item -ItemType Directory -Path ".\dist" -Force | Out-Null
   New-Item -ItemType Directory -Path ".\dist\data\package" -Force | Out-Null
@@ -19,14 +20,14 @@ try {
   if (Test-Path ".\dist\data\tools\webview2") {
     Remove-Item ".\dist\data\tools\webview2" -Recurse -Force
   }
-  Copy-Item ".\resources\webview2" ".\dist\data\tools\webview2" -Recurse -Force
   if (Test-Path ".\dist\data\ui") {
     Remove-Item ".\dist\data\ui" -Recurse -Force
   }
   if (Test-Path ".\dist\ui") {
     Remove-Item ".\dist\ui" -Recurse -Force
   }
-  Copy-Item ".\ui" ".\dist\data\ui" -Recurse -Force
+  New-Item -ItemType Directory -Path ".\dist\data\ui" -Force | Out-Null
+  Copy-Item ".\ui\style.css" ".\dist\data\ui\style.css" -Force
   Copy-Item ".\build\windows\x64\release\modlist-installer-gui.exe" ".\dist\modlist-installer.exe" -Force
 
   if (Test-Path ".\dist\tools") {

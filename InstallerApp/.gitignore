@@ -10,8 +10,6 @@ out/
 *.ilk
 *.exe
 !dist/modlist-installer.exe
-!dist/data/tools/webview2/MicrosoftEdgeWebview2Setup.exe
-!resources/webview2/MicrosoftEdgeWebview2Setup.exe
 dist/data/logs/
 dist/data/downloads/
 *.dll
@@ -20,3 +18,4 @@ dist/data/downloads/
 *.exp
 dist/ui/
 third_party/webview2/
+third_party/webview2-runtime/

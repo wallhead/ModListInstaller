@@ -26,7 +26,7 @@ The GUI executable is built as:
 InstallerApp\build\windows\x64\release\modlist-installer-gui.exe
 ```
 
-Copy it into `dist`, put `manifest.json` in `dist\data\package`, keep archive parts in `dist\data\downloads`, and keep UI files in `dist\data\ui`. The GUI does not use torrent files.
+Copy it into `dist`, put `manifest.json` in `dist\data\package`, keep archive parts in `dist\data\downloads`, and keep the optional native theme in `dist\data\ui\style.css`. The GUI does not use torrent files.
 
 The `Install` button runs the install pipeline on a background thread:
 
@@ -48,7 +48,7 @@ The `Install` button runs the install pipeline on a background thread:
 - run 7-Zip inside a memory-limited child process so oversized archives fail cleanly instead of exhausting system RAM
 - extract with bundled 7-Zip into the selected install folder
 
-The GUI is organized as a single WebView2-powered installer screen with unpack drive, final install folder, progress, and log output.
+The GUI is a single native Direct2D/DirectWrite installer screen with unpack drive, final install folder, progress, and log output.
 
 The unpack drive selector asks only for a drive letter. The app derives the unpack target as `<drive>:\Unpacked`, for example `X:\Unpacked`.
 
@@ -76,13 +76,8 @@ InstallerApp\dist\
       YourPack.7z.002
     tools\
       7zip\
-      webview2\
-        MicrosoftEdgeWebview2Setup.exe
     ui\
-      index.html
       style.css
-      app.js
-      assets\
 ```
 
 Do not commit generated logs.
@@ -94,7 +89,7 @@ cd InstallerApp
 .\scripts\build-release.ps1
 ```
 
-The script restores the WebView2 SDK if needed, configures xmake for release, runs tests, and copies the GUI exe, local UI assets, and signed WebView2 Evergreen Bootstrapper into `dist`.
+The script configures xmake for release, runs tests, and copies the GUI exe and native CSS theme into `dist`. No browser runtime is required.
 
 ## Change CSS
 
@@ -104,11 +99,10 @@ Edit the source stylesheet:
 InstallerApp\ui\style.css
 ```
 
-For a quick local test without rebuilding the exe, copy the UI folder into `dist\data\ui`:
+For a quick local test without rebuilding the exe, copy the theme into `dist\data\ui`:
 
 ```powershell
-Remove-Item -Recurse -Force .\dist\data\ui -ErrorAction SilentlyContinue
-Copy-Item -Recurse -Force .\ui .\dist\data\ui
+Copy-Item -Force .\ui\style.css .\dist\data\ui\style.css
 ```
 
 Then restart `dist\modlist-installer.exe`.
@@ -119,7 +113,7 @@ For release builds, use:
 .\scripts\build-release.ps1
 ```
 
-The release script copies `ui` into `dist\data\ui`. Treat edits in `dist\data\ui` as temporary because the next release build overwrites them.
+The renderer reads supported `:root` variables at startup: the palette variables plus `--font-family`, `--font-size`, `--header-height`, `--footer-height`, `--control-height`, `--corner-radius`, `--content-padding`, and `--label-width`. Treat edits in `dist\data\ui` as temporary because the next release build overwrites them.
 
 ## Build With CMake
 
@@ -143,13 +137,8 @@ MyPack/
       MyPack.7z.001
       MyPack.7z.002
     tools/
-      webview2/
-        MicrosoftEdgeWebview2Setup.exe
     ui/
-      index.html
       style.css
-      app.js
-      assets/
 ```
 
 Run from that folder:
@@ -158,8 +147,8 @@ Run from that folder:
 modlist-installer.exe
 ```
 
-The GUI requires `data\package\manifest.json`, loads UI from `data\ui`, uses archive files from `data\downloads`, and uses the manifest's `unpacked_size` for space checks. Chunked packer manifests use a bounded verified-block cache: validation runs ahead of extraction, and unverified bytes never reach 7-Zip. Legacy manifests use the original separate verification pass. If the manifest is missing, invalid, or any hash fails, installation stops and shows a validation failure message.
+The GUI requires `data\package\manifest.json`, optionally loads native theme variables from `data\ui\style.css`, uses archive files from `data\downloads`, and uses the manifest's `unpacked_size` for space checks. Chunked packer manifests use a bounded verified-block cache: validation runs ahead of extraction, and unverified bytes never reach 7-Zip. Legacy manifests use the original separate verification pass. If the manifest is missing, invalid, or any hash fails, installation stops and shows a validation failure message.
 
-The themed UI requires Microsoft Edge WebView2 Runtime. If it is unavailable, the native launcher shows a warning and runs `data\tools\webview2\MicrosoftEdgeWebview2Setup.exe /silent /install`. The Evergreen Bootstrapper requires an internet connection; if installation fails, the standard native fallback remains available.
+The interface uses Windows Direct2D and DirectWrite. It does not require WebView2, Edge, .NET, or an internet connection.
 
 The SDK component is from [7-Zip](https://www.7-zip.org/) and is distributed with its original license in `resources\7zip-License.txt` and `data\tools\7zip\License.txt`.

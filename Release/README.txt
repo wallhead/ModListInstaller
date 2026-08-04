@@ -5,8 +5,11 @@ Run modlist-packer.exe to create a complete modlist release folder.
 The generated installer expects:
 - data\package\manifest.json
 - archive parts in data\downloads
-- interface files in data\ui
+- native theme in data\ui
 - bundled support files in data\tools
+
+The native Direct2D interface reads its editable theme from data\ui\style.css.
+It does not require WebView2, Edge, .NET, or internet access.
 
 The installer extracts to the selected drive's short Unpacked path, then moves
 the files into <selected install root>\<archive_name>. After a successful

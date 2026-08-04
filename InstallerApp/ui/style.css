@@ -12,6 +12,14 @@
   --danger: #c48b86;
   --input: #111719;
   --shadow: rgba(0, 0, 0, 0.35);
+  --font-family: "Segoe UI";
+  --font-size: 14px;
+  --header-height: 78px;
+  --footer-height: 58px;
+  --control-height: 32px;
+  --corner-radius: 3px;
+  --content-padding: 24px;
+  --label-width: 150px;
 }
 
 * {
@@ -27,9 +35,7 @@ body {
 
 body {
   color: var(--text);
-  background:
-    linear-gradient(rgba(16, 20, 22, 0.9), rgba(16, 20, 22, 0.93)),
-    url("assets/background.webp") center / cover fixed;
+  background: var(--bg);
   font: 14px/1.42 "Segoe UI Variable Text", "Segoe UI", Tahoma, sans-serif;
   overflow: hidden;
 }

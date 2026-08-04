@@ -4,16 +4,16 @@
 #include "extractor/PipelinedSevenZipExtractor.h"
 #include "extractor/SevenZipExtractor.h"
 #include "manifest/Manifest.h"
-#include "manifest/Json.h"
 #include "paths/PathValidator.h"
 #include "resource.h"
-#include "ui/WebViewHost.h"
+#include "ui/NativeInstallerView.h"
 #include "verifier/Sha256.h"
 
 #include <windows.h>
 #include <commctrl.h>
 #include <shellapi.h>
 #include <shlobj.h>
+#include <uxtheme.h>
 #include <winioctl.h>
 
 #include <algorithm>
@@ -55,13 +55,14 @@ constexpr int kUnpackButton = 1014;
 constexpr int kPreviousButton = 1015;
 constexpr int kNextButton = 1016;
 constexpr int kUnpackDriveCombo = 1017;
+constexpr int kOpenLogButton = 1018;
+constexpr int kDrivePickerButton = 1019;
 
 constexpr UINT kLogMessage = WM_APP + 1;
 constexpr UINT kProgressMessage = WM_APP + 2;
 constexpr UINT kWorkerFinishedMessage = WM_APP + 3;
 constexpr UINT kStatusMessage = WM_APP + 4;
 constexpr UINT kValidationFailedMessage = WM_APP + 5;
-constexpr UINT kWebViewInstallFinishedMessage = WM_APP + 6;
 
 enum class WizardPage {
   Welcome,
@@ -86,8 +87,8 @@ HWND g_statusLabel = nullptr;
 HWND g_previousButton = nullptr;
 HWND g_nextButton = nullptr;
 HWND g_hotButton = nullptr;
-std::unique_ptr<modlist::WebViewHost> g_webView;
-std::vector<std::wstring> g_uiLogLines;
+HWND g_mainWindow = nullptr;
+modlist::NativeInstallerView g_nativeView;
 std::wstring g_archiveFolderName;
 struct PendingFolderCleanup {
   std::filesystem::path unpackFolder;
@@ -100,9 +101,6 @@ struct PendingFolderCleanup {
 std::optional<PendingFolderCleanup> g_pendingFolderCleanup;
 std::wstring g_statusText = L"Ожидание | Ожидание проверки";
 int g_progressPercent = 0;
-bool g_webUiVisible = false;
-bool g_webViewInstallAttempted = false;
-bool g_webViewInstallRunning = false;
 WizardPage g_page = WizardPage::Folders;
 HBRUSH g_contentBrush = nullptr;
 HBRUSH g_headerBrush = nullptr;
@@ -205,9 +203,7 @@ std::wstring JsonString(const std::wstring& text) {
 }
 
 void PostUiJson(const std::wstring& json) {
-  if (g_webView != nullptr && g_webView->IsReady()) {
-    g_webView->PostJson(json);
-  }
+  (void)json;
 }
 
 void SendUiProgress(int percent, const std::wstring& status);
@@ -220,6 +216,8 @@ void SendUiError(const std::wstring& title, const std::wstring& message);
 void SendUiCleanupConfirm(const PendingFolderCleanup& folders);
 void SendUiButtonEnabled(const std::wstring& buttonName, bool enabled);
 void SendUiState();
+void ConfirmPendingFolderCleanup(HWND hwnd);
+void CancelPendingFolderCleanup();
 
 void SetDwmColorAttribute(HWND hwnd, DWORD attribute, COLORREF color) {
   HMODULE dwm = LoadLibraryW(L"dwmapi.dll");
@@ -331,10 +329,6 @@ void SetText(HWND hwnd, const std::wstring& text) {
 
 void AppendLog(const std::wstring& text) {
   AppendAppLog(text);
-  g_uiLogLines.push_back(text);
-  if (g_uiLogLines.size() > 300) {
-    g_uiLogLines.erase(g_uiLogLines.begin(), g_uiLogLines.begin() + static_cast<std::ptrdiff_t>(g_uiLogLines.size() - 300));
-  }
   const int length = GetWindowTextLengthW(g_logEdit);
   SendMessageW(g_logEdit, EM_SETSEL, length, length);
   std::wstring line = text + L"\r\n";
@@ -427,13 +421,16 @@ HWND CreateLabel(HWND parent, const wchar_t* text, int x, int y, int width, int 
 }
 
 HWND CreateEdit(HWND parent, int id, int x, int y, int width, int height) {
-  return CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
+  HWND edit = CreateWindowExW(0, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
                          x, y, width, height, parent, reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), g_instance, nullptr);
+  SendMessageW(edit, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN, MAKELPARAM(8, 8));
+  return edit;
 }
 
 HWND CreateCombo(HWND parent, int id, int x, int y, int width, int height) {
-  return CreateWindowExW(WS_EX_CLIENTEDGE, L"COMBOBOX", L"",
-                         WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL,
+  return CreateWindowExW(0, L"COMBOBOX", L"",
+                         WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST |
+                             CBS_OWNERDRAWFIXED | CBS_HASSTRINGS | WS_VSCROLL,
                          x, y, width, height, parent, reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), g_instance, nullptr);
 }
 
@@ -475,6 +472,11 @@ void UpdateUnpackTargetLabel() {
     SetText(g_unpackTargetLabel, folder.wstring());
     SendUiPath(L"unpackTarget", folder.wstring());
   }
+  if (g_mainWindow != nullptr) {
+    const std::wstring drive = ComboText(g_unpackDriveCombo);
+    SetWindowTextW(GetDlgItem(g_mainWindow, kDrivePickerButton),
+                   drive.empty() ? L"Выберите" : drive.c_str());
+  }
 }
 
 void PopulateDriveCombo() {
@@ -503,6 +505,198 @@ void PopulateDriveCombo() {
   UpdateUnpackTargetLabel();
 }
 
+struct DrivePopupData {
+  std::vector<std::wstring> drives;
+  int selectedIndex = -1;
+  int hotIndex = -1;
+  int result = -1;
+};
+
+int DrivePopupIndexAt(HWND hwnd, const DrivePopupData& data, LPARAM lParam) {
+  const int x = static_cast<short>(LOWORD(lParam));
+  const int y = static_cast<short>(HIWORD(lParam));
+  RECT client{};
+  GetClientRect(hwnd, &client);
+  if (x < 0 || y < 0 || x >= client.right || y >= client.bottom) {
+    return -1;
+  }
+  const float dipY = static_cast<float>(y) * 96.0f /
+                     static_cast<float>(GetDpiForWindow(hwnd));
+  const int index = static_cast<int>((dipY - 1.0f) /
+                                     g_nativeView.Theme().controlHeight);
+  return index >= 0 && index < static_cast<int>(data.drives.size()) ? index : -1;
+}
+
+LRESULT CALLBACK DrivePopupProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
+  auto* data = reinterpret_cast<DrivePopupData*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+  if (message == WM_NCCREATE) {
+    const auto* create = reinterpret_cast<CREATESTRUCTW*>(lParam);
+    data = static_cast<DrivePopupData*>(create->lpCreateParams);
+    SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(data));
+  }
+  switch (message) {
+    case WM_CREATE:
+      SetCapture(hwnd);
+      return 0;
+    case WM_ERASEBKGND:
+      return 1;
+    case WM_PAINT: {
+      PAINTSTRUCT paint{};
+      BeginPaint(hwnd, &paint);
+      if (data != nullptr) {
+        g_nativeView.PaintDrivePopup(hwnd, data->drives, data->selectedIndex,
+                                     data->hotIndex);
+      }
+      EndPaint(hwnd, &paint);
+      return 0;
+    }
+    case WM_MOUSEMOVE:
+      if (data != nullptr) {
+        const int hotIndex = DrivePopupIndexAt(hwnd, *data, lParam);
+        if (hotIndex != data->hotIndex) {
+          data->hotIndex = hotIndex;
+          InvalidateRect(hwnd, nullptr, FALSE);
+        }
+      }
+      return 0;
+    case WM_LBUTTONUP:
+      if (data != nullptr) {
+        data->result = DrivePopupIndexAt(hwnd, *data, lParam);
+      }
+      DestroyWindow(hwnd);
+      return 0;
+    case WM_KEYDOWN:
+      if (data == nullptr || data->drives.empty()) {
+        break;
+      }
+      if (wParam == VK_ESCAPE) {
+        DestroyWindow(hwnd);
+        return 0;
+      }
+      if (wParam == VK_RETURN || wParam == VK_SPACE) {
+        data->result = data->hotIndex;
+        DestroyWindow(hwnd);
+        return 0;
+      }
+      if (wParam == VK_UP || wParam == VK_DOWN) {
+        const int direction = wParam == VK_UP ? -1 : 1;
+        const int count = static_cast<int>(data->drives.size());
+        data->hotIndex = (data->hotIndex + direction + count) % count;
+        InvalidateRect(hwnd, nullptr, FALSE);
+        return 0;
+      }
+      break;
+    case WM_DPICHANGED: {
+      const auto* suggested = reinterpret_cast<const RECT*>(lParam);
+      if (suggested != nullptr) {
+        SetWindowPos(hwnd, nullptr, suggested->left, suggested->top,
+                     suggested->right - suggested->left,
+                     suggested->bottom - suggested->top,
+                     SWP_NOACTIVATE | SWP_NOZORDER);
+      }
+      InvalidateRect(hwnd, nullptr, FALSE);
+      return 0;
+    }
+    case WM_CAPTURECHANGED:
+      if (reinterpret_cast<HWND>(lParam) != hwnd && IsWindow(hwnd)) {
+        DestroyWindow(hwnd);
+      }
+      return 0;
+    case WM_NCDESTROY:
+      if (GetCapture() == hwnd) {
+        ReleaseCapture();
+      }
+      SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+      return 0;
+  }
+  return DefWindowProcW(hwnd, message, wParam, lParam);
+}
+
+void ShowDriveMenu(HWND owner) {
+  const int count = static_cast<int>(SendMessageW(g_unpackDriveCombo, CB_GETCOUNT, 0, 0));
+  if (count <= 0) {
+    SendUiError(L"Диск недоступен", L"Не найден доступный диск для распаковки.");
+    return;
+  }
+  DrivePopupData data;
+  data.selectedIndex = static_cast<int>(SendMessageW(g_unpackDriveCombo, CB_GETCURSEL, 0, 0));
+  data.hotIndex = data.selectedIndex >= 0 ? data.selectedIndex : 0;
+  for (int i = 0; i < count; ++i) {
+    const int length = static_cast<int>(SendMessageW(g_unpackDriveCombo, CB_GETLBTEXTLEN, i, 0));
+    if (length <= 0) {
+      continue;
+    }
+    std::wstring value(static_cast<size_t>(length) + 1, L'\0');
+    SendMessageW(g_unpackDriveCombo, CB_GETLBTEXT, i, reinterpret_cast<LPARAM>(value.data()));
+    value.resize(static_cast<size_t>(length));
+    data.drives.push_back(std::move(value));
+  }
+  if (data.drives.empty()) {
+    return;
+  }
+
+  constexpr const wchar_t* className = L"ModlistInstallerDrivePopup";
+  WNDCLASSW windowClass{};
+  windowClass.style = CS_DROPSHADOW;
+  windowClass.lpfnWndProc = DrivePopupProc;
+  windowClass.hInstance = g_instance;
+  windowClass.lpszClassName = className;
+  windowClass.hCursor = LoadCursor(nullptr, IDC_ARROW);
+  RegisterClassW(&windowClass);
+
+  HWND buttonWindow = GetDlgItem(owner, kDrivePickerButton);
+  RECT button{};
+  GetWindowRect(buttonWindow, &button);
+  const UINT dpi = GetDpiForWindow(buttonWindow);
+  const int popupWidth = button.right - button.left;
+  const int popupHeight = MulDiv(
+      static_cast<int>(std::lround(data.drives.size() *
+                                   g_nativeView.Theme().controlHeight + 2.0f)),
+      static_cast<int>(dpi), 96);
+  MONITORINFO monitorInfo{};
+  monitorInfo.cbSize = sizeof(monitorInfo);
+  GetMonitorInfoW(MonitorFromRect(&button, MONITOR_DEFAULTTONEAREST), &monitorInfo);
+  const int workLeft = static_cast<int>(monitorInfo.rcWork.left);
+  const int workTop = static_cast<int>(monitorInfo.rcWork.top);
+  const int workRight = static_cast<int>(monitorInfo.rcWork.right);
+  const int workBottom = static_cast<int>(monitorInfo.rcWork.bottom);
+  int x = std::clamp(static_cast<int>(button.left), workLeft,
+                     std::max(workLeft, workRight - popupWidth));
+  int y = button.bottom;
+  if (y + popupHeight > workBottom) {
+    y = button.top - popupHeight;
+  }
+  y = std::clamp(y, workTop, std::max(workTop, workBottom - popupHeight));
+
+  HWND popup = CreateWindowExW(WS_EX_TOOLWINDOW, className, L"",
+                               WS_POPUP, x, y, popupWidth, popupHeight,
+                               owner, nullptr, g_instance, &data);
+  if (popup == nullptr) {
+    return;
+  }
+  ShowWindow(popup, SW_SHOWNORMAL);
+  SetForegroundWindow(popup);
+  SetFocus(popup);
+
+  MSG popupMessage{};
+  while (IsWindow(popup)) {
+    const BOOL messageResult = GetMessageW(&popupMessage, nullptr, 0, 0);
+    if (messageResult <= 0) {
+      if (messageResult == 0) {
+        PostQuitMessage(static_cast<int>(popupMessage.wParam));
+      }
+      break;
+    }
+    TranslateMessage(&popupMessage);
+    DispatchMessageW(&popupMessage);
+  }
+  SetFocus(buttonWindow);
+  if (data.result >= 0 && data.result < count) {
+    SendMessageW(g_unpackDriveCombo, CB_SETCURSEL, data.result, 0);
+    UpdateUnpackTargetLabel();
+  }
+}
+
 LRESULT CALLBACK ButtonSubclassProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam, UINT_PTR subclassId, DWORD_PTR refData) {
   (void)subclassId;
   (void)refData;
@@ -510,10 +704,10 @@ LRESULT CALLBACK ButtonSubclassProc(HWND hwnd, UINT message, WPARAM wParam, LPAR
     case WM_MOUSEMOVE: {
       if (g_hotButton != hwnd) {
         if (g_hotButton != nullptr) {
-          InvalidateRect(g_hotButton, nullptr, TRUE);
+          InvalidateRect(g_hotButton, nullptr, FALSE);
         }
         g_hotButton = hwnd;
-        InvalidateRect(hwnd, nullptr, TRUE);
+        InvalidateRect(hwnd, nullptr, FALSE);
       }
       TRACKMOUSEEVENT track{};
       track.cbSize = sizeof(track);
@@ -525,7 +719,7 @@ LRESULT CALLBACK ButtonSubclassProc(HWND hwnd, UINT message, WPARAM wParam, LPAR
     case WM_MOUSELEAVE:
       if (g_hotButton == hwnd) {
         g_hotButton = nullptr;
-        InvalidateRect(hwnd, nullptr, TRUE);
+        InvalidateRect(hwnd, nullptr, FALSE);
       }
       break;
     case WM_ENABLE:
@@ -533,7 +727,7 @@ LRESULT CALLBACK ButtonSubclassProc(HWND hwnd, UINT message, WPARAM wParam, LPAR
     case WM_KILLFOCUS:
     case WM_LBUTTONDOWN:
     case WM_LBUTTONUP:
-      InvalidateRect(hwnd, nullptr, TRUE);
+      InvalidateRect(hwnd, nullptr, FALSE);
       break;
     case WM_NCDESTROY:
       if (g_hotButton == hwnd) {
@@ -553,12 +747,11 @@ HWND CreateButton(HWND parent, int id, const wchar_t* text, int x, int y, int wi
   return button;
 }
 
-HFONT CreateUiFont(int pointSize, int weight = FW_NORMAL, const wchar_t* family = L"Segoe UI") {
-  HDC screen = GetDC(nullptr);
-  const int height = -MulDiv(pointSize, GetDeviceCaps(screen, LOGPIXELSY), 72);
-  ReleaseDC(nullptr, screen);
+HFONT CreateUiFont(int pointSize, UINT dpi, int weight = FW_NORMAL,
+                   const wchar_t* family = L"Segoe UI") {
+  const int height = -MulDiv(pointSize, static_cast<int>(dpi), 72);
   return CreateFontW(height, 0, 0, 0, weight, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
-                     CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, family);
+                      CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, family);
 }
 
 void SetControlFont(HWND hwnd, HFONT font) {
@@ -621,87 +814,245 @@ void PaintInstallerChrome(HWND hwnd, HDC dc) {
 }
 
 void DrawNsisButton(const DRAWITEMSTRUCT& item) {
-  const bool disabled = (item.itemState & ODS_DISABLED) != 0;
-  const bool pressed = (item.itemState & ODS_SELECTED) != 0;
-  const bool focused = (item.itemState & ODS_FOCUS) != 0;
-  const bool hot = item.hwndItem == g_hotButton && !disabled;
   const int controlId = GetDlgCtrlID(item.hwndItem);
-  const bool primary = controlId == kStartButton || controlId == kNextButton;
-  const bool danger = controlId == kStopButton;
+  modlist::NativeButtonStyle style = modlist::NativeButtonStyle::Normal;
+  if (controlId == kDrivePickerButton) {
+    style = modlist::NativeButtonStyle::Input;
+  } else if (controlId == kStartButton || controlId == kNextButton ||
+             controlId == IDOK || controlId == IDYES) {
+    style = modlist::NativeButtonStyle::Primary;
+  } else if (controlId == kStopButton) {
+    style = modlist::NativeButtonStyle::Danger;
+  }
+  g_nativeView.DrawButton(item, style, item.hwndItem == g_hotButton);
+}
 
-  RECT rect = item.rcItem;
-  COLORREF top = kButtonTopColor;
-  COLORREF bottom = kButtonBottomColor;
-  COLORREF border = kButtonBorderColor;
-  COLORREF textColor = kPrimaryTextColor;
-  if (disabled) {
-    top = RGB(22, 27, 30);
-    bottom = RGB(18, 22, 24);
-    border = kLineColor;
-    textColor = kButtonDisabledTextColor;
-  } else if (pressed) {
-    top = kButtonPressedTopColor;
-    bottom = kButtonPressedBottomColor;
-    border = primary ? kAccentTextColor : kStrongLineColor;
-  } else if (hot) {
-    top = kButtonHoverTopColor;
-    bottom = kButtonHoverBottomColor;
-    border = danger ? kDangerColor : kAccentTextColor;
-  } else if (primary) {
-    top = RGB(27, 40, 45);
-    bottom = RGB(23, 32, 37);
-    border = kAccentTextColor;
-    textColor = kAccentStrongColor;
+void RecreateUiFonts(HWND hwnd) {
+  const UINT dpi = GetDpiForWindow(hwnd);
+  const int bodyPointSize = std::max(
+      8, static_cast<int>(std::lround(g_nativeView.Theme().fontSize * 0.75f)));
+  HFONT stepFont = CreateUiFont(10, dpi, FW_SEMIBOLD);
+  HFONT titleFont = CreateUiFont(22, dpi, FW_NORMAL, L"Georgia");
+  HFONT bodyFont = CreateUiFont(bodyPointSize, dpi, FW_NORMAL,
+                                g_nativeView.Theme().fontFamily.c_str());
+  HFONT labelFont = CreateUiFont(9, dpi, FW_SEMIBOLD);
+
+  SetControlFont(g_stepLabel, stepFont);
+  SetControlFont(g_welcomeTitle, titleFont);
+  SetControlFont(g_welcomeBody, bodyFont);
+  SetControlFont(g_downloadLabel, labelFont);
+  SetControlFont(g_unpackDriveLabel, labelFont);
+  SetControlFont(g_unpackTargetLabel, bodyFont);
+  SetControlFont(g_installLabel, labelFont);
+  SetControlFont(g_downloadEdit, bodyFont);
+  SetControlFont(g_unpackDriveCombo, bodyFont);
+  SetControlFont(GetDlgItem(hwnd, kDrivePickerButton), bodyFont);
+  SetControlFont(g_installEdit, bodyFont);
+  SetControlFont(g_statusLabel, bodyFont);
+  SetControlFont(g_logEdit, bodyFont);
+  SetControlFont(GetDlgItem(hwnd, kDownloadBrowse), bodyFont);
+  SetControlFont(GetDlgItem(hwnd, kInstallBrowse), bodyFont);
+  SetControlFont(GetDlgItem(hwnd, kValidateButton), bodyFont);
+  SetControlFont(GetDlgItem(hwnd, kStartButton), bodyFont);
+  SetControlFont(GetDlgItem(hwnd, kUnpackButton), bodyFont);
+  SetControlFont(GetDlgItem(hwnd, kPauseButton), bodyFont);
+  SetControlFont(GetDlgItem(hwnd, kStopButton), bodyFont);
+  SetControlFont(GetDlgItem(hwnd, kOpenLogButton), bodyFont);
+  SetControlFont(g_previousButton, bodyFont);
+  SetControlFont(g_nextButton, bodyFont);
+
+  DeleteObject(g_stepFont);
+  DeleteObject(g_titleFont);
+  DeleteObject(g_bodyFont);
+  DeleteObject(g_labelFont);
+  g_stepFont = stepFont;
+  g_titleFont = titleFont;
+  g_bodyFont = bodyFont;
+  g_labelFont = labelFont;
+}
+
+struct ThemedDialogData {
+  std::wstring title;
+  std::wstring message;
+  bool confirmation = false;
+  int result = IDCANCEL;
+};
+
+LRESULT CALLBACK ThemedDialogProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
+  auto* data = reinterpret_cast<ThemedDialogData*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+  if (message == WM_NCCREATE) {
+    const auto* create = reinterpret_cast<CREATESTRUCTW*>(lParam);
+    data = static_cast<ThemedDialogData*>(create->lpCreateParams);
+    SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(data));
+  }
+  switch (message) {
+    case WM_CREATE:
+      ApplyWindowFrameTheme(hwnd);
+      if (data != nullptr && data->confirmation) {
+        CreateButton(hwnd, IDYES, L"Да", 0, 0, 96, 32);
+        CreateButton(hwnd, IDNO, L"Нет", 0, 0, 96, 32);
+      } else {
+        CreateButton(hwnd, IDOK, L"OK", 0, 0, 96, 32);
+      }
+      return 0;
+    case WM_ERASEBKGND:
+      return 1;
+    case WM_PAINT: {
+      PAINTSTRUCT paint{};
+      BeginPaint(hwnd, &paint);
+      if (data != nullptr) {
+        g_nativeView.PaintDialog(hwnd, data->title, data->message);
+      }
+      EndPaint(hwnd, &paint);
+      return 0;
+    }
+    case WM_SIZE: {
+      const int width = LOWORD(lParam);
+      const int height = HIWORD(lParam);
+      const int dpi = static_cast<int>(GetDpiForWindow(hwnd));
+      const int buttonWidth = MulDiv(96, dpi, 96);
+      const int buttonHeight = MulDiv(32, dpi, 96);
+      const int bottom = MulDiv(13, dpi, 96);
+      const int gap = MulDiv(8, dpi, 96);
+      const int y = height - bottom - buttonHeight;
+      if (data != nullptr && data->confirmation) {
+        const int groupWidth = buttonWidth * 2 + gap;
+        const int x = (width - groupWidth) / 2;
+        MoveWindow(GetDlgItem(hwnd, IDNO), x, y, buttonWidth, buttonHeight, TRUE);
+        MoveWindow(GetDlgItem(hwnd, IDYES), x + buttonWidth + gap, y,
+                   buttonWidth, buttonHeight, TRUE);
+      } else {
+        MoveWindow(GetDlgItem(hwnd, IDOK), (width - buttonWidth) / 2, y,
+                   buttonWidth, buttonHeight, TRUE);
+      }
+      InvalidateRect(hwnd, nullptr, FALSE);
+      return 0;
+    }
+    case WM_DPICHANGED: {
+      const auto* suggested = reinterpret_cast<const RECT*>(lParam);
+      if (suggested != nullptr) {
+        SetWindowPos(hwnd, nullptr, suggested->left, suggested->top,
+                     suggested->right - suggested->left,
+                     suggested->bottom - suggested->top,
+                     SWP_NOACTIVATE | SWP_NOZORDER);
+      }
+      InvalidateRect(hwnd, nullptr, FALSE);
+      return 0;
+    }
+    case WM_DRAWITEM: {
+      const auto* item = reinterpret_cast<DRAWITEMSTRUCT*>(lParam);
+      if (item != nullptr && item->CtlType == ODT_BUTTON) {
+        DrawNsisButton(*item);
+        return TRUE;
+      }
+      break;
+    }
+    case WM_COMMAND: {
+      const int id = LOWORD(wParam);
+      if (id == IDOK || id == IDYES || id == IDNO) {
+        if (data != nullptr) {
+          data->result = id;
+        }
+        DestroyWindow(hwnd);
+        return 0;
+      }
+      break;
+    }
+    case WM_KEYDOWN:
+      if (wParam == VK_ESCAPE) {
+        if (data != nullptr) {
+          data->result = data->confirmation ? IDNO : IDOK;
+        }
+        DestroyWindow(hwnd);
+        return 0;
+      }
+      break;
+    case WM_CLOSE:
+      if (data != nullptr) {
+        data->result = data->confirmation ? IDNO : IDOK;
+      }
+      DestroyWindow(hwnd);
+      return 0;
+  }
+  return DefWindowProcW(hwnd, message, wParam, lParam);
+}
+
+int ShowThemedMessage(HWND owner,
+                      const std::wstring& title,
+                      const std::wstring& message,
+                      bool confirmation = false) {
+  static bool registered = false;
+  constexpr wchar_t className[] = L"ModlistInstallerThemedDialog";
+  if (!registered) {
+    WNDCLASSW windowClass{};
+    windowClass.lpfnWndProc = ThemedDialogProc;
+    windowClass.hInstance = g_instance;
+    windowClass.lpszClassName = className;
+    windowClass.hCursor = LoadCursorW(nullptr, MAKEINTRESOURCEW(32512));
+    windowClass.hIcon = LoadIconW(g_instance, MAKEINTRESOURCEW(IDI_MODLIST_INSTALLER));
+    if (RegisterClassW(&windowClass) == 0 && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
+      return confirmation ? IDNO : IDOK;
+    }
+    registered = true;
   }
 
-  FillVerticalGradient(item.hDC, rect, top, bottom);
+  ThemedDialogData data;
+  data.title = title;
+  data.message = message;
+  data.confirmation = confirmation;
+  data.result = confirmation ? IDNO : IDOK;
 
-  HPEN borderPen = CreatePen(PS_SOLID, 1, border);
-  HPEN oldPen = static_cast<HPEN>(SelectObject(item.hDC, borderPen));
-  HBRUSH oldBrush = static_cast<HBRUSH>(SelectObject(item.hDC, GetStockObject(NULL_BRUSH)));
-  Rectangle(item.hDC, rect.left, rect.top, rect.right, rect.bottom);
-  SelectObject(item.hDC, oldBrush);
-  SelectObject(item.hDC, oldPen);
-  DeleteObject(borderPen);
-
-  HPEN lightPen = CreatePen(PS_SOLID, 1, pressed ? kLineColor : RGB(52, 61, 66));
-  HPEN shadowPen = CreatePen(PS_SOLID, 1, pressed ? kStrongLineColor : RGB(9, 12, 13));
-  oldPen = static_cast<HPEN>(SelectObject(item.hDC, lightPen));
-  MoveToEx(item.hDC, rect.left + 1, rect.bottom - 2, nullptr);
-  LineTo(item.hDC, rect.left + 1, rect.top + 1);
-  LineTo(item.hDC, rect.right - 2, rect.top + 1);
-  SelectObject(item.hDC, shadowPen);
-  MoveToEx(item.hDC, rect.left + 2, rect.bottom - 2, nullptr);
-  LineTo(item.hDC, rect.right - 2, rect.bottom - 2);
-  LineTo(item.hDC, rect.right - 2, rect.top + 1);
-  SelectObject(item.hDC, oldPen);
-  DeleteObject(lightPen);
-  DeleteObject(shadowPen);
-
-  wchar_t text[128]{};
-  GetWindowTextW(item.hwndItem, text, static_cast<int>(sizeof(text) / sizeof(text[0])));
-  RECT textRect = rect;
-  if (pressed) {
-    OffsetRect(&textRect, 1, 1);
+  const size_t explicitLines = static_cast<size_t>(std::count(message.begin(), message.end(), L'\n')) + 1;
+  const size_t wrappedLines = std::max<size_t>(1, message.size() / 54);
+  const int heightDip = std::clamp(210 + static_cast<int>(std::max(explicitLines, wrappedLines)) * 18,
+                                   250, 430);
+  const UINT dpi = owner != nullptr ? GetDpiForWindow(owner) : GetDpiForSystem();
+  RECT windowRect{0, 0, MulDiv(480, static_cast<int>(dpi), 96),
+                  MulDiv(heightDip, static_cast<int>(dpi), 96)};
+  constexpr DWORD style = WS_POPUP | WS_CAPTION | WS_SYSMENU;
+  AdjustWindowRectExForDpi(&windowRect, style, FALSE, WS_EX_DLGMODALFRAME, dpi);
+  int x = CW_USEDEFAULT;
+  int y = CW_USEDEFAULT;
+  if (owner != nullptr) {
+    RECT ownerRect{};
+    GetWindowRect(owner, &ownerRect);
+    x = ownerRect.left + ((ownerRect.right - ownerRect.left) -
+                          (windowRect.right - windowRect.left)) / 2;
+    y = ownerRect.top + ((ownerRect.bottom - ownerRect.top) -
+                         (windowRect.bottom - windowRect.top)) / 2;
   }
-
-  SetBkMode(item.hDC, TRANSPARENT);
-  SetTextColor(item.hDC, textColor);
-  HFONT oldFont = static_cast<HFONT>(SelectObject(item.hDC, g_bodyFont));
-  DrawTextW(item.hDC, text, -1, &textRect, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
-  SelectObject(item.hDC, oldFont);
-
-  if (focused && !disabled) {
-    RECT focusRect = rect;
-    InflateRect(&focusRect, -4, -4);
-    HPEN focusPen = CreatePen(PS_DOT, 1, kAccentTextColor);
-    HPEN oldFocusPen = static_cast<HPEN>(SelectObject(item.hDC, focusPen));
-    HBRUSH oldFocusBrush = static_cast<HBRUSH>(SelectObject(item.hDC, GetStockObject(NULL_BRUSH)));
-    Rectangle(item.hDC, focusRect.left, focusRect.top, focusRect.right, focusRect.bottom);
-    SelectObject(item.hDC, oldFocusBrush);
-    SelectObject(item.hDC, oldFocusPen);
-    DeleteObject(focusPen);
+  HWND dialog = CreateWindowExW(
+      WS_EX_DLGMODALFRAME, className, title.c_str(), style,
+      x, y, windowRect.right - windowRect.left, windowRect.bottom - windowRect.top,
+      owner, nullptr, g_instance, &data);
+  if (dialog == nullptr) {
+    return data.result;
   }
+  if (owner != nullptr) {
+    EnableWindow(owner, FALSE);
+  }
+  ShowWindow(dialog, SW_SHOW);
+  UpdateWindow(dialog);
+
+  MSG messageData{};
+  while (IsWindow(dialog)) {
+    const BOOL messageResult = GetMessageW(&messageData, nullptr, 0, 0);
+    if (messageResult <= 0) {
+      if (messageResult == 0) {
+        PostQuitMessage(static_cast<int>(messageData.wParam));
+      }
+      break;
+    }
+    if (!IsDialogMessageW(dialog, &messageData)) {
+      TranslateMessage(&messageData);
+      DispatchMessageW(&messageData);
+    }
+  }
+  if (owner != nullptr && IsWindow(owner)) {
+    EnableWindow(owner, TRUE);
+    SetForegroundWindow(owner);
+  }
+  return data.result;
 }
 
 void ShowControl(HWND hwnd, bool visible) {
@@ -795,41 +1146,73 @@ bool IsWindowEnabledSafe(HWND hwnd) {
   return hwnd != nullptr && IsWindowEnabled(hwnd) != FALSE;
 }
 
-void SendUiProgress(int percent, const std::wstring& status) {
-  g_progressPercent = std::clamp(percent, 0, 100);
-  if (!status.empty()) {
-    g_statusText = status;
+void InvalidateDipArea(const D2D1_RECT_F& dipArea) {
+  if (g_mainWindow == nullptr) {
+    return;
   }
-  PostUiJson(L"{\"type\":\"progress\",\"percent\":" + std::to_wstring(g_progressPercent) +
-             L",\"status\":" + JsonString(g_statusText) + L"}");
+  RECT area = g_nativeView.ToPixels(g_mainWindow, dipArea);
+  const int padding = MulDiv(2, static_cast<int>(GetDpiForWindow(g_mainWindow)), 96);
+  InflateRect(&area, padding, padding);
+  InvalidateRect(g_mainWindow, &area, FALSE);
+}
+
+void InvalidateActivityArea() {
+  if (g_mainWindow == nullptr) {
+    return;
+  }
+  const auto layout = g_nativeView.CalculateLayout(g_mainWindow);
+  D2D1_RECT_F area = layout.statusArea;
+  area.bottom = layout.progressBar.bottom;
+  InvalidateDipArea(area);
+}
+
+void SendUiProgress(int percent, const std::wstring& status) {
+  const int nextProgress = std::clamp(percent, 0, 100);
+  bool changed = nextProgress != g_progressPercent;
+  g_progressPercent = nextProgress;
+  if (!status.empty() && status != g_statusText) {
+    g_statusText = status;
+    changed = true;
+  }
+  if (changed) {
+    InvalidateActivityArea();
+  }
 }
 
 void SendUiStatus(const std::wstring& status) {
+  if (status == g_statusText) {
+    return;
+  }
   g_statusText = status;
-  PostUiJson(L"{\"type\":\"status\",\"status\":" + JsonString(status) + L"}");
+  InvalidateActivityArea();
 }
 
 void SendUiLog(const std::wstring& message) {
-  PostUiJson(L"{\"type\":\"log\",\"message\":" + JsonString(message) + L"}");
+  (void)message;
 }
 
 void SendUiStep(const std::wstring& stepName) {
-  PostUiJson(L"{\"type\":\"step\",\"step\":" + JsonString(stepName) + L"}");
+  (void)stepName;
 }
 
 void SendUiPath(const std::wstring& fieldName, const std::wstring& path) {
-  PostUiJson(L"{\"type\":\"path\",\"name\":" + JsonString(fieldName) +
-             L",\"value\":" + JsonString(path) + L"}");
+  (void)path;
+  if (g_mainWindow != nullptr) {
+    if (fieldName == L"installFolder") {
+      InvalidateDipArea(g_nativeView.CalculateLayout(g_mainWindow).finalPath);
+    } else {
+      InvalidateRect(g_mainWindow, nullptr, FALSE);
+    }
+  }
 }
 
 void SendUiOption(const std::wstring& optionName, bool value) {
-  PostUiJson(L"{\"type\":\"option\",\"name\":" + JsonString(optionName) +
-             L",\"value\":" + (value ? L"true" : L"false") + L"}");
+  (void)optionName;
+  (void)value;
 }
 
 void SendUiError(const std::wstring& title, const std::wstring& message) {
-  PostUiJson(L"{\"type\":\"error\",\"title\":" + JsonString(title) +
-             L",\"message\":" + JsonString(message) + L"}");
+  ShowThemedMessage(g_mainWindow, title, message);
 }
 
 void SendUiCleanupConfirm(const PendingFolderCleanup& folders) {
@@ -842,111 +1225,41 @@ void SendUiCleanupConfirm(const PendingFolderCleanup& folders) {
     message += L"\n\nПапка установки:\n" + PathToDisplay(folders.installFolder);
   }
   message += L"\n\nОчистить указанные папки и продолжить установку?";
-  PostUiJson(L"{\"type\":\"cleanupConfirm\",\"title\":\"Очистить папки?\","
-             L"\"message\":" + JsonString(message) + L"}");
+  if (ShowThemedMessage(g_mainWindow, L"Очистить папки?", message, true) == IDYES) {
+    ConfirmPendingFolderCleanup(g_mainWindow);
+  } else {
+    CancelPendingFolderCleanup();
+  }
 }
 
 void SendUiButtonEnabled(const std::wstring& buttonName, bool enabled) {
-  PostUiJson(L"{\"type\":\"button\",\"name\":" + JsonString(buttonName) +
-             L",\"enabled\":" + (enabled ? L"true" : L"false") + L"}");
+  (void)buttonName;
+  (void)enabled;
 }
 
 void SendUiState() {
-  if (g_webView == nullptr || !g_webView->IsReady()) {
-    return;
+  if (g_mainWindow != nullptr) {
+    InvalidateRect(g_mainWindow, nullptr, FALSE);
   }
-
-  const bool running = g_workerRunning.load();
-  const auto unpackFolder = SelectedUnpackFolder();
-  const std::wstring unpackTarget =
-      unpackFolder.empty() ? L"Выберите диск" : unpackFolder.wstring();
-  const auto finalInstallFolder =
-      FinalInstallFolder(std::filesystem::path(GetText(g_installEdit)));
-  HWND parent = g_progress != nullptr ? GetParent(g_progress) : nullptr;
-
-  std::wostringstream logs;
-  logs << L"[";
-  for (size_t i = 0; i < g_uiLogLines.size(); ++i) {
-    if (i > 0) {
-      logs << L",";
-    }
-    logs << JsonString(g_uiLogLines[i]);
-  }
-  logs << L"]";
-
-  std::wostringstream out;
-  out << L"{\"type\":\"state\",\"state\":{"
-      << L"\"step\":" << JsonString(UiStepForPage(g_page)) << L","
-      << L"\"installFolder\":" << JsonString(GetText(g_installEdit)) << L","
-      << L"\"finalInstallFolder\":" << JsonString(finalInstallFolder.wstring()) << L","
-      << L"\"unpackDrive\":" << JsonString(ComboText(g_unpackDriveCombo)) << L","
-      << L"\"unpackTarget\":" << JsonString(unpackTarget) << L","
-      << L"\"drives\":" << JsonArray(AvailableDrives()) << L","
-      << L"\"progress\":" << g_progressPercent << L","
-      << L"\"status\":" << JsonString(g_statusText) << L","
-      << L"\"logs\":" << logs.str() << L","
-      << L"\"version\":\"Modlist Installer v0.2.8 by WallHead\","
-      << L"\"installCompleted\":" << (g_installCompleted ? L"true" : L"false") << L","
-      << L"\"options\":{},"
-      << L"\"buttons\":{"
-      << L"\"back\":false,"
-      << L"\"next\":false,"
-      << L"\"start\":" << (!running ? L"true" : L"false") << L","
-      << L"\"cancel\":" << (running ? L"true" : L"false") << L","
-      << L"\"browseInstall\":" << (IsWindowEnabledSafe(GetDlgItem(parent, kInstallBrowse)) ? L"true" : L"false")
-      << L"}}}";
-
-  PostUiJson(out.str());
 }
 
 void Layout(HWND hwnd) {
-  RECT rect{};
-  GetClientRect(hwnd, &rect);
-  const int width = rect.right - rect.left;
-  const int height = rect.bottom - rect.top;
-  const int margin = 16;
-  const int railWidth = 116;
-  const int contentX = railWidth + 28;
-  const int contentRightPadding = 28;
-  const int navY = height - 48;
-  const int labelWidth = 115;
-  const int buttonWidth = 88;
-  const int rowHeight = 25;
-  const int editX = contentX + labelWidth;
-  const int editWidth = width - editX - buttonWidth - contentRightPadding - 8;
-  const int buttonX = editX + editWidth + 8;
-  const int contentWidth = width - contentX - contentRightPadding;
-
-  MoveWindow(g_stepLabel, contentX, 24, contentWidth, 24, TRUE);
-
-  MoveWindow(g_welcomeTitle, contentX, 96, contentWidth, 42, TRUE);
-  MoveWindow(g_welcomeBody, contentX, 154, contentWidth, 96, TRUE);
-
-  MoveWindow(g_downloadLabel, contentX, 94, labelWidth, 20, TRUE);
-  MoveWindow(GetDlgItem(hwnd, kDownloadEdit), editX, 90, editWidth, rowHeight, TRUE);
-  MoveWindow(GetDlgItem(hwnd, kDownloadBrowse), buttonX, 90, buttonWidth, rowHeight, TRUE);
-  MoveWindow(g_unpackDriveLabel, contentX, 94, labelWidth, 20, TRUE);
-  MoveWindow(g_unpackDriveCombo, editX, 90, 120, 180, TRUE);
-  MoveWindow(g_unpackTargetLabel, editX + 136, 94, editWidth - 136 + buttonWidth + 8, 20, TRUE);
-  MoveWindow(g_installLabel, contentX, 136, labelWidth, 20, TRUE);
-  MoveWindow(GetDlgItem(hwnd, kInstallEdit), editX, 132, editWidth, rowHeight, TRUE);
-  MoveWindow(GetDlgItem(hwnd, kInstallBrowse), buttonX, 132, buttonWidth, rowHeight, TRUE);
-
-  MoveWindow(GetDlgItem(hwnd, kValidateButton), contentX, 74, 120, 30, TRUE);
-  MoveWindow(GetDlgItem(hwnd, kStartButton), contentX + 132, 74, 120, 30, TRUE);
-  MoveWindow(GetDlgItem(hwnd, kUnpackButton), contentX + 264, 74, 120, 30, TRUE);
-  MoveWindow(GetDlgItem(hwnd, kPauseButton), contentX + 396, 74, 120, 30, TRUE);
-  MoveWindow(GetDlgItem(hwnd, kStopButton), contentX + 264, 74, 92, 30, TRUE);
-  MoveWindow(g_progress, contentX, 122, contentWidth, 20, TRUE);
-  MoveWindow(g_statusLabel, contentX, 150, contentWidth, 22, TRUE);
-  MoveWindow(g_logEdit, contentX, 182, contentWidth, navY - 198, TRUE);
-
-  MoveWindow(g_previousButton, width - 228, navY, 100, 30, TRUE);
-  MoveWindow(g_nextButton, width - 116, navY, 100, 30, TRUE);
-
-  if (g_webView != nullptr) {
-    g_webView->Resize();
-  }
+  const auto layout = g_nativeView.CalculateLayout(hwnd);
+  const auto move = [hwnd](HWND control, const D2D1_RECT_F& dipRect) {
+    if (control == nullptr) {
+      return;
+    }
+    const RECT rect = g_nativeView.ToPixels(hwnd, dipRect);
+    MoveWindow(control, rect.left, rect.top, rect.right - rect.left,
+               rect.bottom - rect.top, TRUE);
+  };
+  move(GetDlgItem(hwnd, kDrivePickerButton), layout.driveCombo);
+  move(g_installEdit, layout.installEdit);
+  move(GetDlgItem(hwnd, kInstallBrowse), layout.browseButton);
+  move(g_logEdit, layout.logEdit);
+  move(GetDlgItem(hwnd, kOpenLogButton), layout.openLogButton);
+  move(GetDlgItem(hwnd, kStartButton), layout.startButton);
+  move(GetDlgItem(hwnd, kStopButton), layout.stopButton);
 }
 
 std::wstring FormatBytes(uintmax_t bytes);
@@ -1434,59 +1747,50 @@ bool IsExistingNonEmptyDirectory(const std::filesystem::path& folder) {
 }
 
 void ShowWizardPage(HWND hwnd, WizardPage page) {
-  g_page = page;
-  SetText(g_stepLabel, WizardPageTitle(page));
-
-  const bool welcome = page == WizardPage::Welcome;
-  const bool folders = page == WizardPage::Folders;
-  const bool activity = page == WizardPage::Activity;
+  (void)page;
+  g_page = WizardPage::Activity;
   const bool running = g_workerRunning.load();
 
-  ShowControl(g_welcomeTitle, welcome);
-  ShowControl(g_welcomeBody, welcome);
-
+  ShowControl(g_stepLabel, false);
+  ShowControl(g_welcomeTitle, false);
+  ShowControl(g_welcomeBody, false);
   ShowControl(g_downloadLabel, false);
   ShowControl(hwnd, kDownloadEdit, false);
   ShowControl(hwnd, kDownloadBrowse, false);
-  ShowControl(g_unpackDriveLabel, folders);
-  ShowControl(g_unpackDriveCombo, folders);
-  ShowControl(g_unpackTargetLabel, folders);
-  ShowControl(g_installLabel, folders);
-  ShowControl(hwnd, kInstallEdit, folders);
-  ShowControl(hwnd, kInstallBrowse, folders);
-
-  ShowControl(hwnd, kValidateButton, activity);
-  ShowControl(hwnd, kStartButton, activity);
+  ShowControl(g_unpackDriveLabel, false);
+  ShowControl(g_unpackDriveCombo, false);
+  ShowControl(hwnd, kDrivePickerButton, true);
+  ShowControl(g_unpackTargetLabel, false);
+  ShowControl(g_installLabel, false);
+  ShowControl(hwnd, kInstallEdit, true);
+  ShowControl(hwnd, kInstallBrowse, true);
+  ShowControl(hwnd, kOpenLogButton, true);
+  ShowControl(hwnd, kValidateButton, false);
+  ShowControl(hwnd, kStartButton, true);
   ShowControl(hwnd, kUnpackButton, false);
   ShowControl(hwnd, kPauseButton, false);
-  ShowControl(hwnd, kStopButton, activity);
-  ShowControl(g_progress, activity);
-  ShowControl(g_statusLabel, activity);
-  ShowControl(g_logEdit, activity);
+  ShowControl(hwnd, kStopButton, true);
+  ShowControl(g_progress, false);
+  ShowControl(g_statusLabel, false);
+  ShowControl(g_logEdit, true);
+  ShowControl(g_previousButton, false);
+  ShowControl(g_nextButton, false);
 
-  EnableWindow(g_previousButton, page != WizardPage::Welcome && !running);
-  EnableWindow(g_nextButton, page != WizardPage::Activity && !running);
-
-  EnableWindow(GetDlgItem(hwnd, kDownloadBrowse), !running);
-  EnableWindow(g_unpackDriveCombo, folders && !running);
+  EnableWindow(GetDlgItem(hwnd, kDrivePickerButton), !running);
   EnableWindow(GetDlgItem(hwnd, kInstallBrowse), !running);
-  EnableWindow(GetDlgItem(hwnd, kValidateButton), activity && !running);
-  EnableWindow(GetDlgItem(hwnd, kStartButton), activity && !running);
-  EnableWindow(GetDlgItem(hwnd, kUnpackButton), false);
-  EnableWindow(GetDlgItem(hwnd, kPauseButton), false);
-  EnableWindow(GetDlgItem(hwnd, kStopButton), activity && running);
+  EnableWindow(g_installEdit, !running);
+  EnableWindow(GetDlgItem(hwnd, kOpenLogButton), true);
+  EnableWindow(GetDlgItem(hwnd, kStartButton), !running);
+  EnableWindow(GetDlgItem(hwnd, kStopButton), running);
 
-  if (g_webUiVisible) {
-    HideNativeControls(hwnd);
-  }
-
-  SendUiStep(UiStepForPage(page));
+  SendUiStep(UiStepForPage(g_page));
   SendUiButtonEnabled(L"back", false);
   SendUiButtonEnabled(L"next", false);
   SendUiButtonEnabled(L"start", !running);
-  SendUiButtonEnabled(L"cancel", activity && running);
+  SendUiButtonEnabled(L"cancel", running);
   SendUiButtonEnabled(L"browseInstall", !running);
   SendUiState();
+  InvalidateRect(hwnd, nullptr, FALSE);
 }
 
 void GoToPreviousPage(HWND hwnd) {
@@ -2487,12 +2791,7 @@ void StartInstall(HWND hwnd) {
   if (const auto documentsError = EnsureGameDocumentsFolders();
       documentsError.has_value()) {
     AppendLog(*documentsError);
-    if (g_webView != nullptr && g_webView->IsReady()) {
-      SendUiError(L"Ошибка папки документов", *documentsError);
-    } else {
-      MessageBoxW(hwnd, documentsError->c_str(), L"Ошибка папки документов",
-                  MB_OK | MB_ICONERROR);
-    }
+    SendUiError(L"Ошибка папки документов", *documentsError);
     return;
   }
   AppendLog(L"Начало установки...");
@@ -2728,244 +3027,15 @@ void UnpackOnly(HWND hwnd) {
   std::thread(RunUnpackWorker, hwnd, *archive, unpackFolder).detach();
 }
 
-const modlist::JsonValue* RequireField(const modlist::JsonValue& object, const std::string& name) {
-  const auto* field = object.Find(name);
-  return field;
-}
-
-std::optional<std::wstring> JsonFieldString(const modlist::JsonValue& object, const std::string& name) {
-  const auto* field = RequireField(object, name);
-  if (field == nullptr || !field->IsString()) {
-    return std::nullopt;
-  }
-  return Widen(field->AsString());
-}
-
-std::optional<bool> JsonFieldBool(const modlist::JsonValue& object, const std::string& name) {
-  const auto* field = RequireField(object, name);
-  if (field == nullptr || !field->IsBool()) {
-    return std::nullopt;
-  }
-  return field->AsBool();
-}
-
-bool IsReasonableUiPath(const std::wstring& path) {
-  if (path.size() > 32767) {
-    return false;
-  }
-  return std::none_of(path.begin(), path.end(), [](wchar_t ch) {
-    return ch != L'\t' && ch != L'\r' && ch != L'\n' && ch < 0x20;
-  });
-}
-
-void SelectUnpackDrive(const std::wstring& drive) {
-  const int count = static_cast<int>(SendMessageW(g_unpackDriveCombo, CB_GETCOUNT, 0, 0));
-  for (int i = 0; i < count; ++i) {
-    const int length = static_cast<int>(SendMessageW(g_unpackDriveCombo, CB_GETLBTEXTLEN, static_cast<WPARAM>(i), 0));
-    if (length <= 0) {
-      continue;
-    }
-    std::wstring item(static_cast<size_t>(length) + 1, L'\0');
-    SendMessageW(g_unpackDriveCombo, CB_GETLBTEXT, static_cast<WPARAM>(i), reinterpret_cast<LPARAM>(item.data()));
-    item.resize(static_cast<size_t>(length));
-    if (_wcsicmp(item.c_str(), drive.c_str()) == 0) {
-      SendMessageW(g_unpackDriveCombo, CB_SETCURSEL, static_cast<WPARAM>(i), 0);
-      UpdateUnpackTargetLabel();
-      SendUiPath(L"unpackDrive", item);
-      return;
-    }
-  }
-  SendUiError(L"Диск недоступен", L"Выбранный диск для распаковки недоступен");
-}
-
 void OpenLogFile() {
   const auto path = AppLogPath();
   ShellExecuteW(nullptr, L"open", path.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
 }
 
-void HandleUiCommand(HWND hwnd, const std::wstring& rawJson) {
-  auto parsed = modlist::ParseJson(Narrow(rawJson));
-  if (!parsed.ok() || !parsed.value().IsObject()) {
-    SendUiError(L"Bridge message rejected", L"Malformed JSON command.");
-    return;
-  }
-
-  const auto command = JsonFieldString(parsed.value(), "command");
-  if (!command.has_value() || command->empty()) {
-    SendUiError(L"Bridge message rejected", L"Missing command name.");
-    return;
-  }
-
-  if (*command == L"uiReady") {
-    SendUiState();
-  } else if (*command == L"browseDownloadFolder") {
-    SendUiError(L"Package folder is automatic",
-                L"The installer reads data\\package\\manifest.json beside the executable.");
-  } else if (*command == L"browseInstallFolder") {
-    if (auto path = PickFolder(hwnd)) {
-      SetText(g_installEdit, path->wstring());
-      SendUiPath(L"installFolder", path->wstring());
-      SendUiState();
-    }
-  } else if (*command == L"setPath") {
-    const auto name = JsonFieldString(parsed.value(), "name");
-    const auto value = JsonFieldString(parsed.value(), "value");
-    if (!name.has_value() || !value.has_value() || !IsReasonableUiPath(*value)) {
-      SendUiError(L"В пути отказано", L"The path update was malformed.");
-      return;
-    }
-    if (*name == L"downloadFolder") {
-      SendUiError(L"Package folder is automatic",
-                  L"The installer reads data\\package\\manifest.json beside the executable.");
-    } else if (*name == L"installFolder") {
-      SetText(g_installEdit, *value);
-      SendUiPath(L"installFolder", *value);
-    } else if (*name == L"unpackDrive") {
-      SelectUnpackDrive(*value);
-    } else {
-      SendUiError(L"В пути отказано", L"Unknown path field.");
-    }
-    SendUiState();
-  } else if (*command == L"setOption") {
-    SendUiError(L"Option rejected", L"Installer defaults cannot be changed.");
-    SendUiState();
-  } else if (*command == L"startInstall") {
-    StartInstall(hwnd);
-  } else if (*command == L"confirmFolderCleanup") {
-    ConfirmPendingFolderCleanup(hwnd);
-  } else if (*command == L"cancelFolderCleanup") {
-    CancelPendingFolderCleanup();
-  } else if (*command == L"cancelInstall") {
-    StopInstall();
-    SendUiState();
-  } else if (*command == L"nextStep") {
-    GoToNextPage(hwnd);
-  } else if (*command == L"previousStep") {
-    GoToPreviousPage(hwnd);
-  } else if (*command == L"openLog") {
-    OpenLogFile();
-  } else if (*command == L"closeWindow") {
-    SendMessageW(hwnd, WM_CLOSE, 0, 0);
-  } else {
-    SendUiError(L"Bridge command rejected", L"Unknown command: " + *command);
-  }
-}
-
-std::filesystem::path WebViewInstallerPath() {
-  return DataFolder() / "tools" / "webview2" / "MicrosoftEdgeWebview2Setup.exe";
-}
-
-void BeginWebViewRuntimeInstall(HWND hwnd);
-
-void InitializeWebUi(HWND hwnd) {
-  const auto uiPath = UiFolder() / "index.html";
-  g_webView = std::make_unique<modlist::WebViewHost>();
-  g_webView->Initialize(
-      hwnd,
-      uiPath,
-      [hwnd](const std::wstring& message) {
-        HandleUiCommand(hwnd, message);
-      },
-      [hwnd]() {
-        g_webUiVisible = true;
-        HideNativeControls(hwnd);
-        SendUiState();
-      },
-      [hwnd](HRESULT error) {
-        if (!modlist::WebViewHost::IsRuntimeAvailable() && !g_webViewInstallAttempted) {
-          g_webView.reset();
-          BeginWebViewRuntimeInstall(hwnd);
-          return;
-        }
-        std::wostringstream message;
-        message << L"Не удалось запустить интерфейс WebView2. Будет доступен запасной "
-                   L"стандартный интерфейс.\n\nКод ошибки: 0x"
-                << std::hex << std::uppercase << static_cast<unsigned long>(error);
-        MessageBoxW(hwnd, message.str().c_str(), L"Ошибка WebView2", MB_OK | MB_ICONERROR);
-      });
-}
-
-void BeginWebViewRuntimeInstall(HWND hwnd) {
-  if (g_webViewInstallRunning) {
-    return;
-  }
-  g_webViewInstallAttempted = true;
-
-  const auto installer = WebViewInstallerPath();
-  std::error_code ec;
-  if (!std::filesystem::exists(installer, ec) || ec) {
-    const auto message =
-        L"Microsoft Edge WebView2 Runtime не установлен, а установщик не найден:\n\n" +
-        PathToDisplay(installer) +
-        L"\n\nИспользуйте запасной стандартный интерфейс или установите WebView2 вручную.";
-    MessageBoxW(hwnd, message.c_str(), L"Требуется WebView2 Runtime", MB_OK | MB_ICONERROR);
-    return;
-  }
-
-  MessageBoxW(hwnd,
-              L"Microsoft Edge WebView2 Runtime не установлен. Он необходим для отображения "
-              L"интерфейса. Сейчас будет запущен встроенный установщик WebView2.",
-              L"Требуется WebView2 Runtime",
-              MB_OK | MB_ICONWARNING);
-
-  std::wstring commandLine = L"\"" + installer.wstring() + L"\" /silent /install";
-  std::vector<wchar_t> commandBuffer(commandLine.begin(), commandLine.end());
-  commandBuffer.push_back(L'\0');
-  STARTUPINFOW startup{};
-  startup.cb = sizeof(startup);
-  PROCESS_INFORMATION process{};
-  if (!CreateProcessW(installer.c_str(), commandBuffer.data(), nullptr, nullptr, FALSE,
-                      CREATE_NO_WINDOW, nullptr, installer.parent_path().c_str(),
-                      &startup, &process)) {
-    const auto message =
-        L"Не удалось запустить установщик WebView2. Windows error " +
-        std::to_wstring(GetLastError()) + L".";
-    MessageBoxW(hwnd, message.c_str(), L"Ошибка установки WebView2", MB_OK | MB_ICONERROR);
-    return;
-  }
-
-  CloseHandle(process.hThread);
-  g_webViewInstallRunning = true;
-  EnableWindow(hwnd, FALSE);
-  std::thread([hwnd, processHandle = process.hProcess]() {
-    WaitForSingleObject(processHandle, INFINITE);
-    DWORD exitCode = ERROR_INSTALL_FAILURE;
-    GetExitCodeProcess(processHandle, &exitCode);
-    CloseHandle(processHandle);
-    PostMessageW(hwnd, kWebViewInstallFinishedMessage, static_cast<WPARAM>(exitCode), 0);
-  }).detach();
-}
-
-void EnsureWebUi(HWND hwnd) {
-  if (modlist::WebViewHost::IsRuntimeAvailable()) {
-    InitializeWebUi(hwnd);
-  } else {
-    BeginWebViewRuntimeInstall(hwnd);
-  }
-}
-
-void FinishWebViewRuntimeInstall(HWND hwnd, DWORD exitCode) {
-  g_webViewInstallRunning = false;
-  EnableWindow(hwnd, TRUE);
-  SetForegroundWindow(hwnd);
-  if (modlist::WebViewHost::IsRuntimeAvailable()) {
-    AppendLog(L"Microsoft Edge WebView2 Runtime установлен.");
-    InitializeWebUi(hwnd);
-    return;
-  }
-
-  const auto message =
-      L"Не удалось установить Microsoft Edge WebView2 Runtime. Код установщика: " +
-      std::to_wstring(exitCode) +
-      L".\n\nПроверьте подключение к интернету или установите WebView2 вручную. "
-      L"Будет доступен запасной стандартный интерфейс.";
-  AppendLog(message);
-  MessageBoxW(hwnd, message.c_str(), L"Ошибка установки WebView2", MB_OK | MB_ICONERROR);
-}
-
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
   switch (message) {
     case WM_CREATE: {
+      g_mainWindow = hwnd;
       INITCOMMONCONTROLSEX controls{};
       controls.dwSize = sizeof(controls);
       controls.dwICC = ICC_PROGRESS_CLASS;
@@ -2975,16 +3045,15 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
       std::filesystem::create_directories(ArchiveFolder());
       std::filesystem::create_directories(DataFolder() / "tools" / "7zip");
       ApplyWindowFrameTheme(hwnd);
+      std::wstring themeWarning;
+      if (!g_nativeView.Initialize(hwnd, UiFolder() / "style.css", &themeWarning)) {
+        return -1;
+      }
       g_contentBrush = CreateSolidBrush(kContentColor);
       g_headerBrush = CreateSolidBrush(kHeaderColor);
       g_panelBrush = CreateSolidBrush(kPanelColor);
       g_footerBrush = CreateSolidBrush(kFooterColor);
-      g_editBrush = CreateSolidBrush(kEditColor);
-      g_stepFont = CreateUiFont(10, FW_SEMIBOLD);
-      g_titleFont = CreateUiFont(22, FW_NORMAL, L"Georgia");
-      g_bodyFont = CreateUiFont(10);
-      g_labelFont = CreateUiFont(9, FW_SEMIBOLD);
-
+      g_editBrush = CreateSolidBrush(g_nativeView.InputColor());
       g_stepLabel = CreateLabel(hwnd, L"", 16, 18, 720, 24);
       g_welcomeTitle = CreateLabel(hwnd, L"Modlist Installer Beta", 16, 92, 720, 38);
       g_welcomeBody = CreateLabel(hwnd, L"", 16, 146, 720, 90);
@@ -2994,14 +3063,16 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
       g_installLabel = CreateLabel(hwnd, L"Установка", 16, 178, 100, 20);
       g_downloadEdit = CreateEdit(hwnd, kDownloadEdit, 120, 22, 420, 25);
       g_unpackDriveCombo = CreateCombo(hwnd, kUnpackDriveCombo, 120, 132, 120, 180);
+      CreateButton(hwnd, kDrivePickerButton, L"Выберите", 120, 132, 126, 32);
       g_installEdit = CreateEdit(hwnd, kInstallEdit, 120, 57, 420, 25);
       CreateButton(hwnd, kDownloadBrowse, L"Обзор", 550, 22, 88, 25);
       CreateButton(hwnd, kInstallBrowse, L"Обзор", 550, 57, 88, 25);
       CreateButton(hwnd, kValidateButton, L"Проверка", 120, 96, 120, 30);
-      CreateButton(hwnd, kStartButton, L"Установка", 252, 96, 120, 30);
+      CreateButton(hwnd, kStartButton, L"Установить", 252, 96, 120, 30);
       CreateButton(hwnd, kUnpackButton, L"Распаковка", 384, 96, 120, 30);
       CreateButton(hwnd, kPauseButton, L"Пауза", 516, 96, 120, 30);
-      CreateButton(hwnd, kStopButton, L"Стоп", 648, 96, 92, 30);
+      CreateButton(hwnd, kStopButton, L"Остановить", 648, 96, 104, 30);
+      CreateButton(hwnd, kOpenLogButton, L"Открыть лог", 16, 450, 112, 30);
       g_previousButton = CreateButton(hwnd, kPreviousButton, L"Предыдущий", 632, 450, 100, 30);
       g_nextButton = CreateButton(hwnd, kNextButton, L"Дальше", 744, 450, 100, 30);
       g_progress = CreateWindowExW(0, PROGRESS_CLASSW, L"", WS_CHILD | WS_VISIBLE,
@@ -3011,31 +3082,19 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
                                       WS_CHILD | WS_VISIBLE,
                                       16, 170, 622, 22, hwnd,
                                       reinterpret_cast<HMENU>(static_cast<INT_PTR>(kStatusLabel)), g_instance, nullptr);
-      g_logEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+      g_logEdit = CreateWindowExW(0, L"EDIT", L"",
                                   WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL,
                                   16, 177, 622, 258, hwnd,
                                   reinterpret_cast<HMENU>(static_cast<INT_PTR>(kLogEdit)), g_instance, nullptr);
-      SetControlFont(g_stepLabel, g_stepFont);
-      SetControlFont(g_welcomeTitle, g_titleFont);
-      SetControlFont(g_welcomeBody, g_bodyFont);
-      SetControlFont(g_downloadLabel, g_labelFont);
-      SetControlFont(g_unpackDriveLabel, g_labelFont);
-      SetControlFont(g_unpackTargetLabel, g_bodyFont);
-      SetControlFont(g_installLabel, g_labelFont);
-      SetControlFont(g_downloadEdit, g_bodyFont);
-      SetControlFont(g_unpackDriveCombo, g_bodyFont);
-      SetControlFont(g_installEdit, g_bodyFont);
-      SetControlFont(g_statusLabel, g_bodyFont);
-      SetControlFont(g_logEdit, g_bodyFont);
-      SetControlFont(GetDlgItem(hwnd, kDownloadBrowse), g_bodyFont);
-      SetControlFont(GetDlgItem(hwnd, kInstallBrowse), g_bodyFont);
-      SetControlFont(GetDlgItem(hwnd, kValidateButton), g_bodyFont);
-      SetControlFont(GetDlgItem(hwnd, kStartButton), g_bodyFont);
-      SetControlFont(GetDlgItem(hwnd, kUnpackButton), g_bodyFont);
-      SetControlFont(GetDlgItem(hwnd, kPauseButton), g_bodyFont);
-      SetControlFont(GetDlgItem(hwnd, kStopButton), g_bodyFont);
-      SetControlFont(g_previousButton, g_bodyFont);
-      SetControlFont(g_nextButton, g_bodyFont);
+      RecreateUiFonts(hwnd);
+      SetWindowTheme(g_unpackDriveCombo, L"DarkMode_CFD", nullptr);
+      SetWindowTheme(g_installEdit, L"DarkMode_Explorer", nullptr);
+      SetWindowTheme(g_logEdit, L"DarkMode_Explorer", nullptr);
+      const int comboItemHeight = MulDiv(
+          static_cast<int>(g_nativeView.Theme().controlHeight) - 2,
+          static_cast<int>(GetDpiForWindow(hwnd)), 96);
+      SendMessageW(g_unpackDriveCombo, CB_SETITEMHEIGHT, static_cast<WPARAM>(-1), comboItemHeight);
+      SendMessageW(g_unpackDriveCombo, CB_SETITEMHEIGHT, 0, comboItemHeight);
       SendMessageW(g_progress, PBM_SETRANGE, 0, MAKELPARAM(0, 100));
       SendMessageW(g_progress, PBM_SETBARCOLOR, 0, static_cast<LPARAM>(RGB(159, 196, 216)));
       SendMessageW(g_progress, PBM_SETBKCOLOR, 0, static_cast<LPARAM>(kContentColor));
@@ -3043,6 +3102,10 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
       PopulateDriveCombo();
       SetText(g_installEdit, L"");
       AppendLog(L"App log: " + PathToDisplay(AppLogPath()));
+      AppendLog(L"Native CSS theme: " + PathToDisplay(UiFolder() / "style.css"));
+      if (!themeWarning.empty()) {
+        AppendLog(themeWarning);
+      }
       AppendLog(L"Manifest auto-detected at: " + PathToDisplay(ManifestPath()));
       AppendLog(L"Archive parts are detected in: " + PathToDisplay(ArchiveFolder()));
       std::wstring manifestMessage;
@@ -3064,25 +3127,27 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
       }
       AppendLog(L"Выберите диск для распаковки; папка будет создана как <drive>:\\Unpacked.");
       Layout(hwnd);
-      ShowWizardPage(hwnd, WizardPage::Folders);
-
-      const auto uiPath = UiFolder() / "index.html";
-      if (!std::filesystem::exists(uiPath)) {
-        MessageBoxW(hwnd,
-                    L"Файлы интерфейса не найдены. Ожидается data\\ui\\index.html рядом с установщиком.",
-                    L"Интерфейс установщика не найден",
-                    MB_OK | MB_ICONWARNING);
-      } else {
-        EnsureWebUi(hwnd);
-      }
+      ShowWizardPage(hwnd, WizardPage::Activity);
       return 0;
     }
     case WM_ERASEBKGND:
       return 1;
     case WM_PAINT: {
       PAINTSTRUCT paint{};
-      HDC dc = BeginPaint(hwnd, &paint);
-      PaintInstallerChrome(hwnd, dc);
+      BeginPaint(hwnd, &paint);
+      const auto unpackFolder = SelectedUnpackFolder();
+      const auto finalFolder = FinalInstallFolder(std::filesystem::path(GetText(g_installEdit)));
+      modlist::NativeInstallerViewState state;
+      state.version = L"Modlist Installer v0.2.9 by WallHead";
+      state.unpackTarget = unpackFolder.empty()
+                               ? L"Выберите диск"
+                               : L"Папка: " + unpackFolder.wstring();
+      state.finalInstallFolder = finalFolder.empty()
+                                     ? L"Выберите папку установки"
+                                     : finalFolder.wstring();
+      state.status = g_statusText;
+      state.progress = g_progressPercent;
+      g_nativeView.Paint(hwnd, state, &paint.rcPaint);
       EndPaint(hwnd, &paint);
       return 0;
     }
@@ -3092,8 +3157,8 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
       SetBkMode(dc, TRANSPARENT);
       if (control == g_logEdit) {
         SetBkMode(dc, OPAQUE);
-        SetTextColor(dc, kMutedTextColor);
-        SetBkColor(dc, kEditColor);
+        SetTextColor(dc, g_nativeView.MutedColor());
+        SetBkColor(dc, g_nativeView.InputColor());
         return reinterpret_cast<LRESULT>(g_editBrush);
       }
       if (control == g_stepLabel) {
@@ -3110,15 +3175,25 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
     }
     case WM_CTLCOLOREDIT: {
       HDC dc = reinterpret_cast<HDC>(wParam);
-      SetTextColor(dc, kPrimaryTextColor);
-      SetBkColor(dc, kEditColor);
+      SetTextColor(dc, g_nativeView.TextColor());
+      SetBkColor(dc, g_nativeView.InputColor());
       return reinterpret_cast<LRESULT>(g_editBrush);
     }
     case WM_CTLCOLORLISTBOX: {
       HDC dc = reinterpret_cast<HDC>(wParam);
-      SetTextColor(dc, kPrimaryTextColor);
-      SetBkColor(dc, kEditColor);
+      SetTextColor(dc, g_nativeView.TextColor());
+      SetBkColor(dc, g_nativeView.InputColor());
       return reinterpret_cast<LRESULT>(g_editBrush);
+    }
+    case WM_MEASUREITEM: {
+      auto* item = reinterpret_cast<MEASUREITEMSTRUCT*>(lParam);
+      if (item != nullptr && item->CtlType == ODT_COMBOBOX) {
+        item->itemHeight = MulDiv(
+            static_cast<int>(g_nativeView.Theme().controlHeight) - 2,
+            static_cast<int>(GetDpiForWindow(hwnd)), 96);
+        return TRUE;
+      }
+      return DefWindowProcW(hwnd, message, wParam, lParam);
     }
     case WM_DRAWITEM: {
       const auto* item = reinterpret_cast<DRAWITEMSTRUCT*>(lParam);
@@ -3126,16 +3201,41 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
         DrawNsisButton(*item);
         return TRUE;
       }
+      if (item != nullptr && item->CtlType == ODT_COMBOBOX) {
+        return g_nativeView.DrawComboItem(*item) ? TRUE : FALSE;
+      }
       return DefWindowProcW(hwnd, message, wParam, lParam);
     }
     case WM_SIZE:
+      g_nativeView.Resize(LOWORD(lParam), HIWORD(lParam));
       Layout(hwnd);
-      InvalidateRect(hwnd, nullptr, TRUE);
+      InvalidateRect(hwnd, nullptr, FALSE);
       return 0;
+    case WM_DPICHANGED: {
+      g_nativeView.DiscardDeviceResources();
+      const auto* suggested = reinterpret_cast<const RECT*>(lParam);
+      if (suggested != nullptr) {
+        SetWindowPos(hwnd, nullptr, suggested->left, suggested->top,
+                     suggested->right - suggested->left,
+                     suggested->bottom - suggested->top,
+                     SWP_NOACTIVATE | SWP_NOZORDER);
+      }
+      RecreateUiFonts(hwnd);
+      const int comboItemHeight = MulDiv(
+          static_cast<int>(g_nativeView.Theme().controlHeight) - 2,
+          static_cast<int>(GetDpiForWindow(hwnd)), 96);
+      SendMessageW(g_unpackDriveCombo, CB_SETITEMHEIGHT,
+                   static_cast<WPARAM>(-1), comboItemHeight);
+      SendMessageW(g_unpackDriveCombo, CB_SETITEMHEIGHT, 0, comboItemHeight);
+      Layout(hwnd);
+      InvalidateRect(hwnd, nullptr, FALSE);
+      return 0;
+    }
     case WM_GETMINMAXINFO: {
       auto* info = reinterpret_cast<MINMAXINFO*>(lParam);
-      info->ptMinTrackSize.x = 760;
-      info->ptMinTrackSize.y = 560;
+      const UINT dpi = GetDpiForWindow(hwnd);
+      info->ptMinTrackSize.x = MulDiv(760, static_cast<int>(dpi), 96);
+      info->ptMinTrackSize.y = MulDiv(600, static_cast<int>(dpi), 96);
       return 0;
     }
     case WM_COMMAND: {
@@ -3149,6 +3249,12 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
         }
       } else if (id == kUnpackDriveCombo && HIWORD(wParam) == CBN_SELCHANGE) {
         UpdateUnpackTargetLabel();
+      } else if (id == kDrivePickerButton) {
+        ShowDriveMenu(hwnd);
+      } else if (id == kInstallEdit && HIWORD(wParam) == EN_CHANGE) {
+        InvalidateRect(hwnd, nullptr, FALSE);
+      } else if (id == kOpenLogButton) {
+        OpenLogFile();
       } else if (id == kValidateButton) {
         ValidatePackage();
       } else if (id == kStartButton) {
@@ -3183,17 +3289,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
       return 0;
     }
     case kValidationFailedMessage:
-      if (g_webView != nullptr && g_webView->IsReady()) {
-        SendUiError(L"Ошибка проверки", L"Проверка завершилась ошибкой. Перехешируйте торрент файлы.");
-      } else {
-        MessageBoxW(hwnd,
-                    L"Проверка завершилась ошибкой. Перехешируйте торрент файлы.",
-                    L"Ошибка проверки",
-                    MB_OK | MB_ICONERROR);
-      }
-      return 0;
-    case kWebViewInstallFinishedMessage:
-      FinishWebViewRuntimeInstall(hwnd, static_cast<DWORD>(wParam));
+      SendUiError(L"Ошибка проверки", L"Проверка завершилась ошибкой. Перехешируйте торрент файлы.");
       return 0;
     case kWorkerFinishedMessage: {
       SetControlsRunning(hwnd, false);
@@ -3201,14 +3297,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
         g_installCompleted = true;
         SetWindowTextW(GetDlgItem(hwnd, kStartButton), L"Закрыть");
         SendUiState();
-        if (g_webView != nullptr && g_webView->IsReady()) {
-          PostUiJson(L"{\"type\":\"installComplete\"}");
-        } else {
-          MessageBoxW(hwnd,
-                      L"Установка завершена!",
-                      L"Modlist Installer Beta",
-                      MB_OK | MB_ICONINFORMATION);
-        }
+        ShowThemedMessage(hwnd, L"Modlist Installer Beta", L"Установка завершена!");
       } else {
         SendUiState();
       }
@@ -3237,7 +3326,8 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
       DeleteObject(g_titleFont);
       DeleteObject(g_bodyFont);
       DeleteObject(g_labelFont);
-      g_webView.reset();
+      g_nativeView.DiscardDeviceResources();
+      g_mainWindow = nullptr;
       PostQuitMessage(0);
       return 0;
     default:
@@ -3263,14 +3353,32 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
   windowClass.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
   RegisterClassW(&windowClass);
 
+  constexpr DWORD windowStyle = WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN;
+  const UINT dpi = GetDpiForSystem();
+  RECT windowRect{0, 0, MulDiv(920, static_cast<int>(dpi), 96),
+                  MulDiv(660, static_cast<int>(dpi), 96)};
+  AdjustWindowRectExForDpi(&windowRect, windowStyle, FALSE, 0, dpi);
   HWND hwnd = CreateWindowExW(0, className, L"Modlist Installer Beta",
-                              WS_OVERLAPPEDWINDOW,
-                              CW_USEDEFAULT, CW_USEDEFAULT, 920, 660,
+                              windowStyle,
+                              CW_USEDEFAULT, CW_USEDEFAULT,
+                              windowRect.right - windowRect.left,
+                              windowRect.bottom - windowRect.top,
                               nullptr, nullptr, instance, nullptr);
   if (hwnd == nullptr) {
     OleUninitialize();
     return 1;
   }
+
+  RECT currentRect{};
+  GetWindowRect(hwnd, &currentRect);
+  const UINT windowDpi = GetDpiForWindow(hwnd);
+  RECT initialRect{0, 0, MulDiv(920, static_cast<int>(windowDpi), 96),
+                   MulDiv(660, static_cast<int>(windowDpi), 96)};
+  AdjustWindowRectExForDpi(&initialRect, windowStyle, FALSE, 0, windowDpi);
+  SetWindowPos(hwnd, nullptr, currentRect.left, currentRect.top,
+               initialRect.right - initialRect.left,
+               initialRect.bottom - initialRect.top,
+               SWP_NOACTIVATE | SWP_NOZORDER);
 
   ShowWindow(hwnd, showCommand);
   UpdateWindow(hwnd);

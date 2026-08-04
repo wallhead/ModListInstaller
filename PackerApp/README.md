@@ -4,7 +4,7 @@ Native Windows helper for building modlist release folders.
 
 It provides a focused 7-Zip-style archive settings window, runs embedded 7-Zip, tests the archive when requested, then writes a chunked SHA-256 manifest into `data\package\manifest.json`.
 
-`modlist-packer.exe` is portable. Keep `modlist-installer.exe` beside it, and keep installer UI files under `data\ui` and installer dependencies under `data\tools` beside the packer. The packer copies those files into each release folder.
+`modlist-packer.exe` is portable. Keep `modlist-installer.exe` beside it, the native CSS theme under `data\ui`, and installer dependencies under `data\tools`. The packer copies those files into each release folder.
 
 ## Release Layout
 
@@ -18,15 +18,10 @@ ReleaseFolder\
       MyPack.7z.001
       MyPack.7z.002
     ui\
-      index.html
       style.css
-      app.js
-      assets\
     logs\
     tools\
       7zip\
-      webview2\
-        MicrosoftEdgeWebview2Setup.exe
 ```
 
 ## Manifest
@@ -56,7 +51,7 @@ The default compression profile matches the recommended release settings:
 
 The RAM limit defaults to 80% of physical memory and is enforced on the 7-Zip process with a Windows Job Object. The packing status reports 7-Zip's own percentage together with live process read throughput, ETA, elapsed time, and RAM use.
 
-`Build Package` writes archive parts into `data\downloads`, writes the manifest into `data\package`, and refreshes the installer exe plus `data\ui` and `data\tools`, including the WebView2 Evergreen Bootstrapper.
+`Build Package` writes archive parts into `data\downloads`, writes the manifest into `data\package`, and refreshes the native installer exe, CSS theme, and support tools. No browser runtime is bundled.
 
 Before a build, the packer removes older archive parts, interrupted `.tmp` files for the selected archive name, and the previous manifest. Source and release folders cannot be the same folder or contain one another, preventing the release output from being archived recursively.
 
