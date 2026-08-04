@@ -185,6 +185,15 @@ void WebViewHost::PostJson(const std::wstring& json) {
   }
 }
 
+bool WebViewHost::IsRuntimeAvailable() {
+  LPWSTR version = nullptr;
+  const HRESULT result = GetAvailableCoreWebView2BrowserVersionString(nullptr, &version);
+  if (version != nullptr) {
+    CoTaskMemFree(version);
+  }
+  return SUCCEEDED(result);
+}
+
 bool WebViewHost::IsReady() const {
   return impl_->ready;
 }

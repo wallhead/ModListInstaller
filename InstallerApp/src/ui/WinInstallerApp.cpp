@@ -1,6 +1,7 @@
 #define NOMINMAX
 
 #include "app/PackageDiscovery.h"
+#include "extractor/PipelinedSevenZipExtractor.h"
 #include "extractor/SevenZipExtractor.h"
 #include "manifest/Manifest.h"
 #include "manifest/Json.h"
@@ -60,6 +61,7 @@ constexpr UINT kProgressMessage = WM_APP + 2;
 constexpr UINT kWorkerFinishedMessage = WM_APP + 3;
 constexpr UINT kStatusMessage = WM_APP + 4;
 constexpr UINT kValidationFailedMessage = WM_APP + 5;
+constexpr UINT kWebViewInstallFinishedMessage = WM_APP + 6;
 
 enum class WizardPage {
   Welcome,
@@ -87,10 +89,20 @@ HWND g_hotButton = nullptr;
 std::unique_ptr<modlist::WebViewHost> g_webView;
 std::vector<std::wstring> g_uiLogLines;
 std::wstring g_archiveFolderName;
-std::filesystem::path g_pendingOverwriteFolder;
+struct PendingFolderCleanup {
+  std::filesystem::path unpackFolder;
+  std::filesystem::path installFolder;
+
+  bool empty() const {
+    return unpackFolder.empty() && installFolder.empty();
+  }
+};
+std::optional<PendingFolderCleanup> g_pendingFolderCleanup;
 std::wstring g_statusText = L"Ожидание | Ожидание проверки";
 int g_progressPercent = 0;
 bool g_webUiVisible = false;
+bool g_webViewInstallAttempted = false;
+bool g_webViewInstallRunning = false;
 WizardPage g_page = WizardPage::Folders;
 HBRUSH g_contentBrush = nullptr;
 HBRUSH g_headerBrush = nullptr;
@@ -205,7 +217,7 @@ void SendUiStep(const std::wstring& stepName);
 void SendUiPath(const std::wstring& fieldName, const std::wstring& path);
 void SendUiOption(const std::wstring& optionName, bool value);
 void SendUiError(const std::wstring& title, const std::wstring& message);
-void SendUiOverwriteConfirm(const std::filesystem::path& folder);
+void SendUiCleanupConfirm(const PendingFolderCleanup& folders);
 void SendUiButtonEnabled(const std::wstring& buttonName, bool enabled);
 void SendUiState();
 
@@ -820,12 +832,17 @@ void SendUiError(const std::wstring& title, const std::wstring& message) {
              L",\"message\":" + JsonString(message) + L"}");
 }
 
-void SendUiOverwriteConfirm(const std::filesystem::path& folder) {
-  const auto displayPath = PathToDisplay(folder);
-  const auto message =
-      L"Папка установки уже существует и не пуста:\n" + displayPath +
-      L"\n\nВсе файлы и папки внутри будут безвозвратно удалены. Продолжить?";
-  PostUiJson(L"{\"type\":\"overwriteConfirm\",\"title\":\"Перезаписать установку?\","
+void SendUiCleanupConfirm(const PendingFolderCleanup& folders) {
+  std::wstring message =
+      L"После предыдущей неудачной или остановленной установки остались файлы:";
+  if (!folders.unpackFolder.empty()) {
+    message += L"\n\nПапка распаковки:\n" + PathToDisplay(folders.unpackFolder);
+  }
+  if (!folders.installFolder.empty()) {
+    message += L"\n\nПапка установки:\n" + PathToDisplay(folders.installFolder);
+  }
+  message += L"\n\nОчистить указанные папки и продолжить установку?";
+  PostUiJson(L"{\"type\":\"cleanupConfirm\",\"title\":\"Очистить папки?\","
              L"\"message\":" + JsonString(message) + L"}");
 }
 
@@ -868,7 +885,7 @@ void SendUiState() {
       << L"\"progress\":" << g_progressPercent << L","
       << L"\"status\":" << JsonString(g_statusText) << L","
       << L"\"logs\":" << logs.str() << L","
-      << L"\"version\":\"Modlist Installer v0.2.7 by WallHead\","
+      << L"\"version\":\"Modlist Installer v0.2.8 by WallHead\","
       << L"\"installCompleted\":" << (g_installCompleted ? L"true" : L"false") << L","
       << L"\"options\":{},"
       << L"\"buttons\":{"
@@ -1345,6 +1362,48 @@ bool HasEnoughSpace(const std::filesystem::path& folder, uintmax_t requiredBytes
   return free >= requiredBytes;
 }
 
+std::optional<std::wstring> EnsureGameDocumentsFolders() {
+  PWSTR documentsPath = nullptr;
+  const HRESULT result =
+      SHGetKnownFolderPath(FOLDERID_Documents, KF_FLAG_CREATE, nullptr, &documentsPath);
+  if (FAILED(result) || documentsPath == nullptr) {
+    if (documentsPath != nullptr) {
+      CoTaskMemFree(documentsPath);
+    }
+    std::wostringstream message;
+    message << L"Невозможно определить папку «Документы». Код ошибки: 0x"
+            << std::hex << std::uppercase << static_cast<unsigned long>(result);
+    return message.str();
+  }
+
+  const std::filesystem::path myGames =
+      std::filesystem::path(documentsPath) / L"My Games";
+  CoTaskMemFree(documentsPath);
+
+  constexpr const wchar_t* gameFolders[] = {
+      L"Skyrim Special Edition",
+      L"Fallout4",
+  };
+  for (const auto* gameFolderName : gameFolders) {
+    const auto gameFolder = myGames / gameFolderName;
+    std::error_code createError;
+    std::filesystem::create_directories(gameFolder, createError);
+    if (createError) {
+      return L"Невозможно создать папку игры:\n" + PathToDisplay(gameFolder) +
+             L"\n\n" + Widen(createError.message());
+    }
+
+    std::error_code directoryError;
+    if (!std::filesystem::is_directory(gameFolder, directoryError) || directoryError) {
+      return L"Путь папки игры недоступен или не является папкой:\n" +
+             PathToDisplay(gameFolder) +
+             (directoryError ? L"\n\n" + Widen(directoryError.message()) : L"");
+    }
+    AppendLog(L"Папка документов игры готова: " + PathToDisplay(gameFolder));
+  }
+  return std::nullopt;
+}
+
 std::optional<std::wstring> FolderMustBeEmptyError(const std::filesystem::path& folder,
                                                    const std::wstring& label) {
   std::error_code ec;
@@ -1363,6 +1422,15 @@ std::optional<std::wstring> FolderMustBeEmptyError(const std::filesystem::path& 
     return label + L" должна быть пустой. Удалите файлы от предыдущей или незавершённой установки.";
   }
   return std::nullopt;
+}
+
+bool IsExistingNonEmptyDirectory(const std::filesystem::path& folder) {
+  std::error_code existsEc;
+  std::error_code directoryEc;
+  std::error_code emptyEc;
+  return std::filesystem::exists(folder, existsEc) && !existsEc &&
+         std::filesystem::is_directory(folder, directoryEc) && !directoryEc &&
+         !std::filesystem::is_empty(folder, emptyEc) && !emptyEc;
 }
 
 void ShowWizardPage(HWND hwnd, WizardPage page) {
@@ -1535,6 +1603,134 @@ bool RunExtractionStep(HWND hwnd,
     PostStatus(hwnd, FormatExtractionStatus(statusLabel, 100, 0, -1, static_cast<int>(elapsed)));
   }
   return result.ok;
+}
+
+bool RunPipelinedExtractionStep(HWND hwnd,
+                                const modlist::PipelinedExtractionConfig& extraction,
+                                int progressBase,
+                                int progressSpan) {
+  PostLog(hwnd, L"Асинхронная проверка и распаковка: " +
+                    PathToDisplay(extraction.manifest->extract.firstArchivePart));
+  PostLog(hwnd, L"Каждый блок SHA-256 проверяется до передачи данных в 7-Zip.");
+  PostLog(hwnd, L"Потоки распаковки 7-Zip: " +
+                    std::to_wstring(extraction.decoderThreads));
+  PostProgress(hwnd, progressBase);
+  const auto startedAt = std::chrono::steady_clock::now();
+  struct PipelineActivityLogState {
+    std::vector<bool> announcedArchives;
+    std::vector<bool> completedArchives;
+    std::vector<bool> extractedArchives;
+    std::vector<std::filesystem::path> validationNames;
+    std::vector<std::filesystem::path> extractionNames;
+    size_t nextAnnouncedArchive{0};
+    size_t nextCompletedArchive{0};
+    size_t nextExtractedArchive{0};
+  };
+  const auto activityLog = std::make_shared<PipelineActivityLogState>();
+  modlist::PipelinedSevenZipExtractor extractor;
+  const auto result = extractor.Extract(
+      extraction,
+      [hwnd, progressBase, progressSpan, startedAt, activityLog](const auto& progress) {
+        const int validationPercent = progress.validationTotalBytes > 0
+            ? static_cast<int>(std::min<uint64_t>(
+                  100, progress.validatedBytes * 100 / progress.validationTotalBytes))
+            : 0;
+        const int overallPercent = std::min(validationPercent, progress.extractionPercent);
+        PostProgress(hwnd, progressBase + overallPercent * progressSpan / 100);
+
+        if (progress.validationArchiveCount > 0 &&
+            activityLog->announcedArchives.size() != progress.validationArchiveCount) {
+          activityLog->announcedArchives.assign(progress.validationArchiveCount, false);
+          activityLog->completedArchives.assign(progress.validationArchiveCount, false);
+          activityLog->validationNames.resize(progress.validationArchiveCount);
+        }
+        if (progress.validationArchiveIndex > 0 &&
+            progress.validationArchiveIndex <= activityLog->announcedArchives.size()) {
+          const size_t archiveIndex = progress.validationArchiveIndex - 1;
+          activityLog->validationNames[archiveIndex] = progress.validationArchive;
+          activityLog->announcedArchives[archiveIndex] = true;
+          if (progress.validationArchiveTotalBytes > 0 &&
+              progress.validationArchiveBytes >= progress.validationArchiveTotalBytes) {
+            activityLog->completedArchives[archiveIndex] = true;
+          }
+          while (activityLog->nextAnnouncedArchive <
+                     activityLog->announcedArchives.size() &&
+                 activityLog->announcedArchives[activityLog->nextAnnouncedArchive]) {
+            const size_t next = activityLog->nextAnnouncedArchive++;
+            PostLog(hwnd, L"Проверка архива " +
+                              std::to_wstring(next + 1) + L"/" +
+                              std::to_wstring(progress.validationArchiveCount) + L": " +
+                              PathToDisplay(activityLog->validationNames[next]));
+          }
+          while (activityLog->nextCompletedArchive <
+                     activityLog->completedArchives.size() &&
+                 activityLog->completedArchives[activityLog->nextCompletedArchive]) {
+            const size_t next = activityLog->nextCompletedArchive++;
+            PostLog(hwnd, L"Архив проверен: " +
+                              PathToDisplay(activityLog->validationNames[next]));
+          }
+        }
+
+        if (progress.extractionArchiveCount > 0 &&
+            activityLog->extractedArchives.size() != progress.extractionArchiveCount) {
+          activityLog->extractedArchives.assign(progress.extractionArchiveCount, false);
+          activityLog->extractionNames.resize(progress.extractionArchiveCount);
+        }
+        if (progress.extractionArchiveIndex > 0 &&
+            progress.extractionArchiveIndex <= activityLog->extractedArchives.size()) {
+          const size_t archiveIndex = progress.extractionArchiveIndex - 1;
+          activityLog->extractionNames[archiveIndex] = progress.extractionArchive;
+          activityLog->extractedArchives[archiveIndex] = true;
+          while (activityLog->nextExtractedArchive <
+                     activityLog->extractedArchives.size() &&
+                 activityLog->extractedArchives[activityLog->nextExtractedArchive]) {
+            const size_t next = activityLog->nextExtractedArchive++;
+            PostLog(hwnd, L"Распаковка архива " +
+                              std::to_wstring(next + 1) + L"/" +
+                              std::to_wstring(progress.extractionArchiveCount) + L": " +
+                              PathToDisplay(activityLog->extractionNames[next]));
+          }
+        }
+
+        const auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::steady_clock::now() - startedAt).count();
+        uintmax_t speed = 0;
+        int eta = -1;
+        if (elapsed > 0 && progress.validatedBytes > 0) {
+          speed = progress.validatedBytes / static_cast<uintmax_t>(elapsed);
+          if (speed > 0 && progress.validationTotalBytes > progress.validatedBytes) {
+            eta = static_cast<int>(
+                (progress.validationTotalBytes - progress.validatedBytes) / speed);
+          }
+        }
+        std::wostringstream status;
+        status << L"Проверка " << validationPercent << L"% | Распаковка "
+               << progress.extractionPercent << L"%";
+        if (speed > 0) {
+          status << L" | " << FormatBytesPerSecond(speed);
+        }
+        if (eta >= 0) {
+          status << L" | Осталось: " << FormatEta(eta);
+        }
+        status << L" | Прошло " << FormatEta(static_cast<int>(elapsed));
+        PostStatus(hwnd, status.str());
+      });
+
+  PostLog(hwnd, Widen(result.message));
+  WriteLastSevenZipLog(result.output);
+  if (!result.ok) {
+    PostLog(hwnd, L"Ошибка асинхронной проверки/распаковки: " + Widen(result.message));
+    if (result.message.find("SHA256 mismatch") != std::string::npos) {
+      PostValidationFailed(hwnd);
+    }
+    return false;
+  }
+  PostProgress(hwnd, progressBase + progressSpan);
+  const auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+      std::chrono::steady_clock::now() - startedAt).count();
+  PostStatus(hwnd, L"Проверка 100% | Распаковка 100% | Прошло " +
+                       FormatEta(static_cast<int>(elapsed)));
+  return true;
 }
 
 bool ExtractArchiveChain(HWND hwnd,
@@ -1988,9 +2184,22 @@ void RunInstallWorker(HWND hwnd,
     FinishWorker(hwnd);
     return;
   }
-  if (!VerifyPackageManifest(hwnd, *manifest)) {
-    FinishWorker(hwnd);
-    return;
+  modlist::PipelinedSevenZipExtractor pipelineExtractor;
+  const auto pipelineLibrary = pipelineExtractor.LocateLibrary(ExeFolder());
+  const bool usePipeline =
+      modlist::PipelinedSevenZipExtractor::CanUse(*manifest) && pipelineLibrary.ok();
+  if (usePipeline) {
+    PostLog(hwnd, L"Доступна асинхронная проверка SHA-256 во время распаковки.");
+  } else {
+    if (!pipelineLibrary.ok()) {
+      PostLog(hwnd, L"Асинхронная проверка недоступна: " + Widen(pipelineLibrary.error()));
+    } else {
+      PostLog(hwnd, L"Manifest не содержит совместимые блоки SHA-256; используется обычная проверка.");
+    }
+    if (!VerifyPackageManifest(hwnd, *manifest)) {
+      FinishWorker(hwnd);
+      return;
+    }
   }
 
   PostLog(hwnd, L"Поиск архива для распаковки...");
@@ -2049,17 +2258,27 @@ void RunInstallWorker(HWND hwnd,
     PostLog(hwnd, L"Распаковка и установка находятся на одном томе; вторая полная копия не требуется.");
   }
 
-  modlist::SevenZipExtractor extractor;
-  auto sevenZip = extractor.LocateExecutable(ExeFolder());
-  if (!sevenZip.ok()) {
-    PostLog(hwnd, L"Ошибка 7-Zip: " + Widen(sevenZip.error()));
-    FinishWorker(hwnd);
-    return;
+  bool extracted = false;
+  if (usePipeline) {
+    modlist::PipelinedExtractionConfig extraction;
+    extraction.sevenZipLibrary = pipelineLibrary.value();
+    extraction.archiveFolder = ArchiveFolder();
+    extraction.installFolder = unpackFolder;
+    extraction.manifest = &*manifest;
+    extraction.cancelRequested = &g_stopRequested;
+    extracted = RunPipelinedExtractionStep(hwnd, extraction, 0, 95);
+  } else {
+    modlist::SevenZipExtractor extractor;
+    auto sevenZip = extractor.LocateExecutable(ExeFolder());
+    if (!sevenZip.ok()) {
+      PostLog(hwnd, L"Ошибка 7-Zip: " + Widen(sevenZip.error()));
+      FinishWorker(hwnd);
+      return;
+    }
+    extracted = ExtractArchiveChain(
+        hwnd, extractor, sevenZip.value(), *firstArchivePart, unpackFolder,
+        35, 60, requirements.unpackedBytes);
   }
-
-  const bool extracted = ExtractArchiveChain(
-      hwnd, extractor, sevenZip.value(), *firstArchivePart, unpackFolder,
-      35, 60, requirements.unpackedBytes);
   if (!extracted) {
     PostProgress(hwnd, 0);
     FinishWorker(hwnd);
@@ -2072,12 +2291,13 @@ void RunInstallWorker(HWND hwnd,
 }
 
 bool ValidateFolders(const SpaceRequirements& requirements = {},
-                     bool allowOverwritePrompt = false) {
+                     bool allowCleanupPrompt = false) {
   modlist::PathValidator validator;
   bool ok = true;
   std::vector<std::wstring> errors;
-  std::optional<std::wstring> overwriteError;
-  g_pendingOverwriteFolder.clear();
+  std::vector<std::wstring> cleanupErrors;
+  PendingFolderCleanup pendingCleanup;
+  g_pendingFolderCleanup.reset();
 
   auto addError = [&](const std::wstring& message) {
     AppendLog(message);
@@ -2101,7 +2321,15 @@ bool ValidateFolders(const SpaceRequirements& requirements = {},
     if (result.ok) {
       if (const auto emptyError = FolderMustBeEmptyError(unpackFolder, L"Папка распаковки");
           emptyError.has_value()) {
-        addError(*emptyError + L"\n" + PathToDisplay(unpackFolder));
+        const auto message = *emptyError + L"\n" + PathToDisplay(unpackFolder);
+        if (allowCleanupPrompt && IsExistingNonEmptyDirectory(unpackFolder)) {
+          AppendLog(message);
+          cleanupErrors.push_back(message);
+          pendingCleanup.unpackFolder = unpackFolder;
+          ok = false;
+        } else {
+          addError(message);
+        }
       }
     }
   } else {
@@ -2124,20 +2352,14 @@ bool ValidateFolders(const SpaceRequirements& requirements = {},
     if (result.ok && (unpackFolder.empty() || !IsSameFolder(unpackFolder, installFolder))) {
       if (const auto emptyError = FolderMustBeEmptyError(installFolder, L"Папка установки");
           emptyError.has_value()) {
-        std::error_code existsEc;
-        std::error_code directoryEc;
-        std::error_code emptyEc;
-        const bool existingNonEmptyDirectory =
-            std::filesystem::exists(installFolder, existsEc) && !existsEc &&
-            std::filesystem::is_directory(installFolder, directoryEc) && !directoryEc &&
-            !std::filesystem::is_empty(installFolder, emptyEc) && !emptyEc;
-        if (allowOverwritePrompt && existingNonEmptyDirectory) {
-          overwriteError = *emptyError + L"\n" + PathToDisplay(installFolder);
-          AppendLog(*overwriteError);
-          g_pendingOverwriteFolder = installFolder;
+        const auto message = *emptyError + L"\n" + PathToDisplay(installFolder);
+        if (allowCleanupPrompt && IsExistingNonEmptyDirectory(installFolder)) {
+          AppendLog(message);
+          cleanupErrors.push_back(message);
+          pendingCleanup.installFolder = installFolder;
           ok = false;
         } else {
-          addError(*emptyError + L"\n" + PathToDisplay(installFolder));
+          addError(message);
         }
       }
     }
@@ -2164,12 +2386,12 @@ bool ValidateFolders(const SpaceRequirements& requirements = {},
     }
   }
 
-  if (!g_pendingOverwriteFolder.empty()) {
+  if (!pendingCleanup.empty()) {
     if (errors.empty()) {
-      SendUiOverwriteConfirm(g_pendingOverwriteFolder);
+      g_pendingFolderCleanup = pendingCleanup;
+      SendUiCleanupConfirm(pendingCleanup);
     } else {
-      errors.push_back(*overwriteError);
-      g_pendingOverwriteFolder.clear();
+      errors.insert(errors.end(), cleanupErrors.begin(), cleanupErrors.end());
     }
   }
 
@@ -2262,6 +2484,17 @@ void StartInstall(HWND hwnd) {
     AppendLog(L"Установщик уже запущен.");
     return;
   }
+  if (const auto documentsError = EnsureGameDocumentsFolders();
+      documentsError.has_value()) {
+    AppendLog(*documentsError);
+    if (g_webView != nullptr && g_webView->IsReady()) {
+      SendUiError(L"Ошибка папки документов", *documentsError);
+    } else {
+      MessageBoxW(hwnd, documentsError->c_str(), L"Ошибка папки документов",
+                  MB_OK | MB_ICONERROR);
+    }
+    return;
+  }
   AppendLog(L"Начало установки...");
   auto package = ReadPackageFromUi();
   if (!package.ok()) {
@@ -2279,7 +2512,7 @@ void StartInstall(HWND hwnd) {
   SendUiState();
   const auto requirements = EstimateSpaceRequirements(package.value());
   if (!ValidateFolders(requirements, true)) {
-    if (g_pendingOverwriteFolder.empty()) {
+    if (!g_pendingFolderCleanup.has_value()) {
       AppendLog(L"Исправьте ошибки перед началом.");
     }
     return;
@@ -2295,84 +2528,113 @@ void StartInstall(HWND hwnd) {
   std::thread(RunInstallWorker, hwnd, std::move(package.value()), unpackFolder, installFolder).detach();
 }
 
-void ConfirmPendingOverwrite(HWND hwnd) {
+std::optional<std::wstring> ClearFolderContents(const std::filesystem::path& folder,
+                                                const std::wstring& label) {
+  std::error_code existsEc;
+  if (!std::filesystem::exists(folder, existsEc)) {
+    if (existsEc) {
+      return L"Невозможно проверить " + label + L":\n" + PathToDisplay(folder) +
+             L"\n\n" + Widen(existsEc.message());
+    }
+    return std::nullopt;
+  }
+
+  std::error_code directoryEc;
+  if (!std::filesystem::is_directory(folder, directoryEc) || directoryEc) {
+    return label + L" больше не является папкой:\n" + PathToDisplay(folder);
+  }
+
+  std::error_code readEc;
+  std::vector<std::filesystem::path> entries;
+  auto iterator = std::filesystem::directory_iterator(folder, readEc);
+  const auto end = std::filesystem::directory_iterator();
+  while (!readEc && iterator != end) {
+    entries.push_back(iterator->path());
+    iterator.increment(readEc);
+  }
+  if (readEc) {
+    return L"Невозможно прочитать " + label + L":\n" + PathToDisplay(folder) +
+           L"\n\n" + Widen(readEc.message());
+  }
+
+  for (const auto& entry : entries) {
+    std::error_code removeEc;
+    std::filesystem::remove_all(entry, removeEc);
+    if (removeEc) {
+      return L"Невозможно удалить:\n" + PathToDisplay(entry) +
+             L"\n\n" + Widen(removeEc.message());
+    }
+  }
+  return std::nullopt;
+}
+
+void ConfirmPendingFolderCleanup(HWND hwnd) {
   if (g_workerRunning) {
     SendUiError(L"Установщик занят", L"Установщик уже запущен.");
     return;
   }
 
-  const auto pendingFolder = g_pendingOverwriteFolder;
-  g_pendingOverwriteFolder.clear();
+  if (!g_pendingFolderCleanup.has_value()) {
+    SendUiError(L"Очистка отменена", L"Папки для очистки больше не выбраны.");
+    return;
+  }
+
+  const auto pending = *g_pendingFolderCleanup;
+  g_pendingFolderCleanup.reset();
+  const auto currentUnpackFolder = SelectedUnpackFolder();
   const auto selectedRoot = std::filesystem::path(GetText(g_installEdit));
-  const auto currentFolder = FinalInstallFolder(selectedRoot);
-  const bool safeDestination =
-      !pendingFolder.empty() && !selectedRoot.empty() && !currentFolder.empty() &&
-      IsSameFolder(pendingFolder, currentFolder) &&
-      IsSameFolder(currentFolder.parent_path(), selectedRoot) &&
-      !IsSameFolder(currentFolder, currentFolder.root_path());
-  if (!safeDestination) {
-    AppendLog(L"Перезапись отменена: папка установки изменилась.");
-    SendUiError(L"Перезапись отменена",
-                L"Папка установки изменилась. Нажмите «Установить» и проверьте путь ещё раз.");
+  const auto currentInstallFolder = FinalInstallFolder(selectedRoot);
+
+  const bool safeUnpack =
+      pending.unpackFolder.empty() ||
+      (!currentUnpackFolder.empty() &&
+       IsSameFolder(pending.unpackFolder, currentUnpackFolder) &&
+       IsSameFolder(currentUnpackFolder.parent_path(), currentUnpackFolder.root_path()) &&
+       !IsSameFolder(currentUnpackFolder, currentUnpackFolder.root_path()) &&
+       currentUnpackFolder.filename() == kUnpackFolderName);
+  const bool safeInstall =
+      pending.installFolder.empty() ||
+      (!selectedRoot.empty() && !currentInstallFolder.empty() &&
+       IsSameFolder(pending.installFolder, currentInstallFolder) &&
+       IsSameFolder(currentInstallFolder.parent_path(), selectedRoot) &&
+       !IsSameFolder(currentInstallFolder, currentInstallFolder.root_path()));
+  if (!safeUnpack || !safeInstall) {
+    AppendLog(L"Очистка отменена: выбранные папки изменились.");
+    SendUiError(L"Очистка отменена",
+                L"Выбранные папки изменились. Нажмите «Установить» и проверьте пути ещё раз.");
     return;
   }
 
-  std::error_code existsEc;
-  if (!std::filesystem::exists(currentFolder, existsEc)) {
-    if (existsEc) {
-      SendUiError(L"Ошибка удаления",
-                  L"Невозможно проверить папку установки: " + Widen(existsEc.message()));
+  if (!pending.unpackFolder.empty()) {
+    AppendLog(L"Пользователь подтвердил очистку: " + PathToDisplay(currentUnpackFolder));
+    if (const auto error = ClearFolderContents(currentUnpackFolder, L"папку распаковки");
+        error.has_value()) {
+      AppendLog(*error);
+      SendUiError(L"Ошибка очистки", *error);
       return;
     }
-    StartInstall(hwnd);
-    return;
+    AppendLog(L"Папка распаковки очищена.");
   }
 
-  std::error_code directoryEc;
-  if (!std::filesystem::is_directory(currentFolder, directoryEc) || directoryEc) {
-    SendUiError(L"Ошибка удаления", L"Путь установки больше не является папкой.");
-    return;
-  }
-
-  AppendLog(L"Пользователь подтвердил перезапись: " + PathToDisplay(currentFolder));
-  std::error_code readEc;
-  std::vector<std::filesystem::path> existingEntries;
-  auto iterator = std::filesystem::directory_iterator(currentFolder, readEc);
-  const auto end = std::filesystem::directory_iterator();
-  while (!readEc && iterator != end) {
-    existingEntries.push_back(iterator->path());
-    iterator.increment(readEc);
-  }
-  if (readEc) {
-    const auto message =
-        L"Невозможно прочитать папку установки:\n" + PathToDisplay(currentFolder) +
-        L"\n\n" + Widen(readEc.message());
-    AppendLog(message);
-    SendUiError(L"Ошибка удаления", message);
-    return;
-  }
-
-  for (const auto& entry : existingEntries) {
-    std::error_code removeEc;
-    std::filesystem::remove_all(entry, removeEc);
-    if (removeEc) {
-      const auto message =
-          L"Невозможно удалить:\n" + PathToDisplay(entry) +
-          L"\n\n" + Widen(removeEc.message());
-      AppendLog(message);
-      SendUiError(L"Ошибка удаления", message);
+  if (!pending.installFolder.empty()) {
+    AppendLog(L"Пользователь подтвердил очистку: " + PathToDisplay(currentInstallFolder));
+    if (const auto error = ClearFolderContents(currentInstallFolder, L"папку установки");
+        error.has_value()) {
+      AppendLog(*error);
+      SendUiError(L"Ошибка очистки", *error);
       return;
     }
+    AppendLog(L"Папка установки очищена.");
   }
 
-  AppendLog(L"Папка установки очищена.");
   StartInstall(hwnd);
 }
 
-void CancelPendingOverwrite() {
-  if (!g_pendingOverwriteFolder.empty()) {
-    AppendLog(L"Перезапись отменена пользователем.");
-    g_pendingOverwriteFolder.clear();
+void CancelPendingFolderCleanup() {
+  if (g_pendingFolderCleanup.has_value()) {
+    AppendLog(L"Очистка отменена пользователем. Файлы не изменены.");
+    g_pendingFolderCleanup.reset();
+    SendUiState();
   }
 }
 
@@ -2569,10 +2831,10 @@ void HandleUiCommand(HWND hwnd, const std::wstring& rawJson) {
     SendUiState();
   } else if (*command == L"startInstall") {
     StartInstall(hwnd);
-  } else if (*command == L"confirmOverwrite") {
-    ConfirmPendingOverwrite(hwnd);
-  } else if (*command == L"cancelOverwrite") {
-    CancelPendingOverwrite();
+  } else if (*command == L"confirmFolderCleanup") {
+    ConfirmPendingFolderCleanup(hwnd);
+  } else if (*command == L"cancelFolderCleanup") {
+    CancelPendingFolderCleanup();
   } else if (*command == L"cancelInstall") {
     StopInstall();
     SendUiState();
@@ -2587,6 +2849,118 @@ void HandleUiCommand(HWND hwnd, const std::wstring& rawJson) {
   } else {
     SendUiError(L"Bridge command rejected", L"Unknown command: " + *command);
   }
+}
+
+std::filesystem::path WebViewInstallerPath() {
+  return DataFolder() / "tools" / "webview2" / "MicrosoftEdgeWebview2Setup.exe";
+}
+
+void BeginWebViewRuntimeInstall(HWND hwnd);
+
+void InitializeWebUi(HWND hwnd) {
+  const auto uiPath = UiFolder() / "index.html";
+  g_webView = std::make_unique<modlist::WebViewHost>();
+  g_webView->Initialize(
+      hwnd,
+      uiPath,
+      [hwnd](const std::wstring& message) {
+        HandleUiCommand(hwnd, message);
+      },
+      [hwnd]() {
+        g_webUiVisible = true;
+        HideNativeControls(hwnd);
+        SendUiState();
+      },
+      [hwnd](HRESULT error) {
+        if (!modlist::WebViewHost::IsRuntimeAvailable() && !g_webViewInstallAttempted) {
+          g_webView.reset();
+          BeginWebViewRuntimeInstall(hwnd);
+          return;
+        }
+        std::wostringstream message;
+        message << L"Не удалось запустить интерфейс WebView2. Будет доступен запасной "
+                   L"стандартный интерфейс.\n\nКод ошибки: 0x"
+                << std::hex << std::uppercase << static_cast<unsigned long>(error);
+        MessageBoxW(hwnd, message.str().c_str(), L"Ошибка WebView2", MB_OK | MB_ICONERROR);
+      });
+}
+
+void BeginWebViewRuntimeInstall(HWND hwnd) {
+  if (g_webViewInstallRunning) {
+    return;
+  }
+  g_webViewInstallAttempted = true;
+
+  const auto installer = WebViewInstallerPath();
+  std::error_code ec;
+  if (!std::filesystem::exists(installer, ec) || ec) {
+    const auto message =
+        L"Microsoft Edge WebView2 Runtime не установлен, а установщик не найден:\n\n" +
+        PathToDisplay(installer) +
+        L"\n\nИспользуйте запасной стандартный интерфейс или установите WebView2 вручную.";
+    MessageBoxW(hwnd, message.c_str(), L"Требуется WebView2 Runtime", MB_OK | MB_ICONERROR);
+    return;
+  }
+
+  MessageBoxW(hwnd,
+              L"Microsoft Edge WebView2 Runtime не установлен. Он необходим для отображения "
+              L"интерфейса. Сейчас будет запущен встроенный установщик WebView2.",
+              L"Требуется WebView2 Runtime",
+              MB_OK | MB_ICONWARNING);
+
+  std::wstring commandLine = L"\"" + installer.wstring() + L"\" /silent /install";
+  std::vector<wchar_t> commandBuffer(commandLine.begin(), commandLine.end());
+  commandBuffer.push_back(L'\0');
+  STARTUPINFOW startup{};
+  startup.cb = sizeof(startup);
+  PROCESS_INFORMATION process{};
+  if (!CreateProcessW(installer.c_str(), commandBuffer.data(), nullptr, nullptr, FALSE,
+                      CREATE_NO_WINDOW, nullptr, installer.parent_path().c_str(),
+                      &startup, &process)) {
+    const auto message =
+        L"Не удалось запустить установщик WebView2. Windows error " +
+        std::to_wstring(GetLastError()) + L".";
+    MessageBoxW(hwnd, message.c_str(), L"Ошибка установки WebView2", MB_OK | MB_ICONERROR);
+    return;
+  }
+
+  CloseHandle(process.hThread);
+  g_webViewInstallRunning = true;
+  EnableWindow(hwnd, FALSE);
+  std::thread([hwnd, processHandle = process.hProcess]() {
+    WaitForSingleObject(processHandle, INFINITE);
+    DWORD exitCode = ERROR_INSTALL_FAILURE;
+    GetExitCodeProcess(processHandle, &exitCode);
+    CloseHandle(processHandle);
+    PostMessageW(hwnd, kWebViewInstallFinishedMessage, static_cast<WPARAM>(exitCode), 0);
+  }).detach();
+}
+
+void EnsureWebUi(HWND hwnd) {
+  if (modlist::WebViewHost::IsRuntimeAvailable()) {
+    InitializeWebUi(hwnd);
+  } else {
+    BeginWebViewRuntimeInstall(hwnd);
+  }
+}
+
+void FinishWebViewRuntimeInstall(HWND hwnd, DWORD exitCode) {
+  g_webViewInstallRunning = false;
+  EnableWindow(hwnd, TRUE);
+  SetForegroundWindow(hwnd);
+  if (modlist::WebViewHost::IsRuntimeAvailable()) {
+    AppendLog(L"Microsoft Edge WebView2 Runtime установлен.");
+    InitializeWebUi(hwnd);
+    return;
+  }
+
+  const auto message =
+      L"Не удалось установить Microsoft Edge WebView2 Runtime. Код установщика: " +
+      std::to_wstring(exitCode) +
+      L".\n\nПроверьте подключение к интернету или установите WebView2 вручную. "
+      L"Будет доступен запасной стандартный интерфейс.";
+  AppendLog(message);
+  MessageBoxW(hwnd, message.c_str(), L"Ошибка установки WebView2", MB_OK | MB_ICONERROR);
 }
 
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
@@ -2699,25 +3073,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
                     L"Интерфейс установщика не найден",
                     MB_OK | MB_ICONWARNING);
       } else {
-        g_webView = std::make_unique<modlist::WebViewHost>();
-        g_webView->Initialize(
-            hwnd,
-            uiPath,
-            [hwnd](const std::wstring& message) {
-              HandleUiCommand(hwnd, message);
-            },
-            [hwnd]() {
-              g_webUiVisible = true;
-              HideNativeControls(hwnd);
-              SendUiState();
-            },
-            [hwnd](HRESULT) {
-              MessageBoxW(hwnd,
-                          L"Для отображения интерфейса установщика требуется Microsoft Edge WebView2 Runtime. "
-                          L"Будет доступен запасной стандартный интерфейс.",
-                          L"Требуется WebView2 Runtime",
-                          MB_OK | MB_ICONERROR);
-            });
+        EnsureWebUi(hwnd);
       }
       return 0;
     }
@@ -2835,6 +3191,9 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
                     L"Ошибка проверки",
                     MB_OK | MB_ICONERROR);
       }
+      return 0;
+    case kWebViewInstallFinishedMessage:
+      FinishWebViewRuntimeInstall(hwnd, static_cast<DWORD>(wParam));
       return 0;
     case kWorkerFinishedMessage: {
       SetControlsRunning(hwnd, false);

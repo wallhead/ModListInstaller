@@ -32,6 +32,7 @@ public:
   void Resize();
   void PostJson(const std::wstring& json);
 
+  static bool IsRuntimeAvailable();
   bool IsReady() const;
 
 private:

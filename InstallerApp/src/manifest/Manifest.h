@@ -43,6 +43,7 @@ struct ManifestFile {
   std::filesystem::path path;
   uint64_t size{0};
   std::string sha256;
+  std::vector<std::string> chunkSha256;
 };
 
 struct ExtractSettings {
@@ -60,6 +61,7 @@ struct Manifest {
   TorrentFeatures torrentFeatures;
   InstallSettings install;
   std::vector<ManifestFile> files;
+  uint64_t hashChunkSize{0};
   uint64_t unpackedSize{0};
   ExtractSettings extract;
 };

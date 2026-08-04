@@ -1,5 +1,5 @@
 set_project("ModlistInstaller")
-set_version("0.2.7")
+set_version("0.2.8")
 
 add_rules("mode.debug", "mode.release")
 set_languages("c++20")
@@ -55,6 +55,7 @@ target("installer_core")
     add_files(
         "src/app/PackageDiscovery.cpp",
         "src/downloader/LibtorrentDownloader.cpp",
+        "src/extractor/PipelinedSevenZipExtractor.cpp",
         "src/extractor/SevenZipExtractor.cpp",
         "src/logging/Logger.cpp",
         "src/manifest/Json.cpp",
@@ -66,6 +67,7 @@ target("installer_core")
 
     if is_plat("windows") then
         add_cxxflags("/W4", "/permissive-", {tools = "cl"})
+        add_syslinks("bcrypt", "ole32", "oleaut32", {public = true})
     else
         add_cxxflags("-Wall", "-Wextra", "-Wpedantic")
     end
@@ -115,5 +117,8 @@ target("installer_core_tests")
     end
     set_rundir("$(projectdir)")
     add_files("tests/test_main.cpp")
+    if is_plat("windows") then
+        add_files("resources/app.rc")
+    end
     add_deps("installer_core")
 target_end()

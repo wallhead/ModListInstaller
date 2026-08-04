@@ -2,4 +2,6 @@
 
 IDI_MODLIST_INSTALLER ICON "app.ico"
 IDR_7ZIP_EXE RCDATA "7z.exe"
+IDR_7ZIP_DLL RCDATA "7z.dll"
+IDR_7ZIP_LICENSE RCDATA "7zip-License.txt"
 1 RT_MANIFEST "app.manifest"

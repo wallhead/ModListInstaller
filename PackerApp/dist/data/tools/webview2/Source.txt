@@ -1,0 +1,10 @@
+Microsoft Edge WebView2 Evergreen Bootstrapper
+
+Official download:
+https://go.microsoft.com/fwlink/p/?LinkId=2124703
+
+Bundled filename:
+MicrosoftEdgeWebview2Setup.exe
+
+Silent installation command:
+MicrosoftEdgeWebview2Setup.exe /silent /install

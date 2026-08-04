@@ -11,14 +11,14 @@ PackerApp/dist/modlist-packer.exe
 
 `modlist-installer.exe` is the distributable launcher. Ship it at the release root and keep installer support files, UI, manifest, and archive parts under `data`.
 
-`modlist-packer.exe` is portable from `PackerApp/dist`: keep `modlist-installer.exe` beside it and `data/ui` beside both. The packer copies that local installer bundle into each release folder.
+`modlist-packer.exe` is portable from `PackerApp/dist`: keep `modlist-installer.exe` beside it and keep `data/ui` plus `data/tools` beside both. The packer copies that local installer bundle into each release folder.
 
 ## Release Package
 
 Ready-to-use versioned release archives are written to:
 
 ```text
-Release/ModlistInstaller-v0.2.7.zip
+Release/ModlistInstaller-v0.2.8.zip
 ```
 
 Extract the zip and run `modlist-packer.exe`. The archive contains the portable packer, the installer exe beside it, and `data/ui` ready for release-folder creation.
@@ -37,6 +37,8 @@ MyPack/
     logs/
     tools/
       7zip/
+      webview2/
+        MicrosoftEdgeWebview2Setup.exe
     ui/
       index.html
       style.css
@@ -52,16 +54,19 @@ The installer looks for `data\package\manifest.json` beside the exe and archive 
 - WebView2-powered local HTML/CSS/JS interface.
 - No Electron, no dev server, no remote UI assets.
 - Single-screen installer UI with unpack drive, install root, final archive-named path, progress, status, and log output.
-- Manifest SHA256 verification before extraction.
+- One-read asynchronous SHA256 validation/extraction for chunked packer manifests: a background reader verifies blocks before an embedded 7-Zip SDK decoder can consume them.
+- Legacy manifests retain the separate full SHA256 pass and command-line 7-Zip extraction path.
 - Archive discovery in `data\downloads`, using the archive filename from `data\package\manifest.json`.
 - Unpack drive selection automatically resolves to `<drive>:\Unpacked`.
 - Unpacked payload size recorded in new manifests for accurate free-space checks.
 - Same-volume installs reserve extraction space once; cross-volume installs also check the destination for the full payload.
-- Existing non-empty unpack folders are rejected. A non-empty final archive-named folder requires explicit confirmation before its contents are permanently removed and installation restarts.
+- Existing files in the unpack or final install folder require explicit confirmation before their contents are permanently removed and installation restarts.
+- Before installation, the installer uses the Windows Documents known folder and ensures `My Games\Skyrim Special Edition` and `My Games\Fallout4` exist.
 - Live validation, extraction, and install progress with status text.
 - Same-drive installs use move/cut semantics automatically when possible.
 - Successful installs remove the empty `<drive>:\Unpacked` staging folder.
-- Embedded 7-Zip extraction to `data\tools\7zip`.
+- Embedded 7-Zip command-line and SDK extraction components under `data\tools\7zip`.
+- Bundled Microsoft WebView2 Evergreen Bootstrapper under `data\tools\webview2`; if the runtime is missing, the installer explains the requirement, installs it silently, verifies it, and then loads the themed UI.
 - Full diagnostics under `data\logs`.
 
 ## Quick Use
@@ -69,12 +74,12 @@ The installer looks for `data\package\manifest.json` beside the exe and archive 
 1. Put `modlist-installer.exe` at the release root.
 2. Put archive parts in `data\downloads`.
 3. Put the manifest at `data\package\manifest.json`.
-4. Put WebView UI files in `data\ui`.
+4. Put WebView UI files in `data\ui` and the bundled WebView2 bootstrapper in `data\tools\webview2`.
 5. Run `modlist-installer.exe`.
 6. Select an unpack drive and install root. The installer creates `<install root>\<archive_name>`.
 7. Press `Install`.
 
-The derived `<drive>:\Unpacked` folder must be empty. If the final `<install root>\<archive_name>` folder is not empty, the installer offers to permanently clear its contents before installing. The install root itself may contain other folders. The packer removes older outputs for the selected archive name before building, and rejects source and release folders that overlap.
+If `<drive>:\Unpacked` or the final `<install root>\<archive_name>` folder contains files, the installer offers to permanently clear the affected folders before installing. The install root itself may contain other folders. The packer removes older outputs for the selected archive name before building, and rejects source and release folders that overlap.
 
 ## Build
 
@@ -119,6 +124,10 @@ cd InstallerApp
 ```
 
 The release script copies `InstallerApp\ui` into `InstallerApp\dist\data\ui`, so changes made only inside `dist\data\ui` are temporary and can be overwritten by the next build.
+
+## 7-Zip
+
+This project uses 7-Zip components under the GNU LGPL and BSD 3-clause licenses. The bundled license is written to `data\tools\7zip\License.txt` at runtime. Source and project information are available from [7-zip.org](https://www.7-zip.org/).
 
 ## Repository Layout
 

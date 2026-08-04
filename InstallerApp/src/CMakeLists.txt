@@ -1,6 +1,7 @@
 add_library(installer_core
   app/PackageDiscovery.cpp
   downloader/LibtorrentDownloader.cpp
+  extractor/PipelinedSevenZipExtractor.cpp
   extractor/SevenZipExtractor.cpp
   logging/Logger.cpp
   manifest/Json.cpp
@@ -18,6 +19,10 @@ if(MSVC)
   target_compile_options(installer_core PRIVATE /W4 /permissive-)
 else()
   target_compile_options(installer_core PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+
+if(WIN32)
+  target_link_libraries(installer_core PUBLIC bcrypt ole32 oleaut32)
 endif()
 
 if(MODLIST_USE_LIBTORRENT)

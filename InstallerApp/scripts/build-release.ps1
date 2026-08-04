@@ -15,6 +15,11 @@ try {
   New-Item -ItemType Directory -Path ".\dist\data\downloads" -Force | Out-Null
   New-Item -ItemType Directory -Path ".\dist\data\logs" -Force | Out-Null
   New-Item -ItemType Directory -Path ".\dist\data\tools\7zip" -Force | Out-Null
+  Copy-Item ".\resources\7zip-License.txt" ".\dist\data\tools\7zip\License.txt" -Force
+  if (Test-Path ".\dist\data\tools\webview2") {
+    Remove-Item ".\dist\data\tools\webview2" -Recurse -Force
+  }
+  Copy-Item ".\resources\webview2" ".\dist\data\tools\webview2" -Recurse -Force
   if (Test-Path ".\dist\data\ui") {
     Remove-Item ".\dist\data\ui" -Recurse -Force
   }

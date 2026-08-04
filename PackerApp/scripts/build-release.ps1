@@ -17,12 +17,16 @@ try {
   $InstallerDist = Join-Path $RepoRoot "InstallerApp\dist"
   $InstallerExe = Join-Path $InstallerDist "modlist-installer.exe"
   $InstallerUi = Join-Path $InstallerDist "data\ui"
+  $InstallerTools = Join-Path $InstallerDist "data\tools"
 
   if (-not (Test-Path -LiteralPath $InstallerExe)) {
     throw "Installer exe not found: $InstallerExe. Run InstallerApp\scripts\build-release.ps1 first."
   }
   if (-not (Test-Path -LiteralPath $InstallerUi)) {
     throw "Installer UI not found: $InstallerUi. Run InstallerApp\scripts\build-release.ps1 first."
+  }
+  if (-not (Test-Path -LiteralPath $InstallerTools)) {
+    throw "Installer tools not found: $InstallerTools. Run InstallerApp\scripts\build-release.ps1 first."
   }
 
   New-Item -ItemType Directory -Path ".\dist\data" -Force | Out-Null
@@ -32,9 +36,13 @@ try {
   if (Test-Path -LiteralPath ".\dist\ui") {
     Remove-Item -LiteralPath ".\dist\ui" -Recurse -Force
   }
+  if (Test-Path -LiteralPath ".\dist\data\tools") {
+    Remove-Item -LiteralPath ".\dist\data\tools" -Recurse -Force
+  }
 
   Copy-Item -LiteralPath $InstallerExe -Destination ".\dist\modlist-installer.exe" -Force
   Copy-Item -LiteralPath $InstallerUi -Destination ".\dist\data\ui" -Recurse -Force
+  Copy-Item -LiteralPath $InstallerTools -Destination ".\dist\data\tools" -Recurse -Force
 
   Get-Item ".\dist\modlist-packer.exe", ".\dist\modlist-installer.exe"
 } finally {

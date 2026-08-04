@@ -1,3 +1,6 @@
 add_executable(installer_core_tests test_main.cpp)
+if(WIN32)
+  target_sources(installer_core_tests PRIVATE ../resources/app.rc)
+endif()
 target_link_libraries(installer_core_tests PRIVATE installer_core)
 add_test(NAME installer_core_tests COMMAND installer_core_tests)

@@ -1,5 +1,6 @@
 InstallerApp/.xmake/
 InstallerApp/build/
+.cache/
 InstallerApp/dist/data/logs/
 InstallerApp/dist/data/last-7z-output.log
 InstallerApp/dist/Cyber_TEST/
@@ -25,5 +26,9 @@ PackerApp/build/
 *.exe
 !InstallerApp/dist/modlist-installer.exe
 !InstallerApp/resources/7z.exe
+!InstallerApp/resources/7z.dll
+!InstallerApp/resources/webview2/MicrosoftEdgeWebview2Setup.exe
+!InstallerApp/dist/data/tools/webview2/MicrosoftEdgeWebview2Setup.exe
 !PackerApp/dist/modlist-installer.exe
 !PackerApp/dist/modlist-packer.exe
+!PackerApp/dist/data/tools/webview2/MicrosoftEdgeWebview2Setup.exe

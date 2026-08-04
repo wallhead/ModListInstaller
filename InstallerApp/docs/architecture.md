@@ -8,7 +8,7 @@ This project follows the prompt in `Windows Installer with Torrent Support.pdf`.
 - Load additional public trackers from `https://raw.githubusercontent.com/ngosang/trackerslist/master/trackers_all.txt`.
 - Enable DHT, peer exchange, and local service discovery where supported.
 - Ask the user for a download folder and a short final install folder such as `D:\Sky`.
-- Verify every downloaded file against manifest SHA256 hashes before extraction.
+- Verify every raw archive block before it reaches the decoder, while validation and extraction run as one pipeline.
 - Extract multi-volume 7-Zip archives directly into the selected install folder.
 - Keep extraction temp work on the same drive as the install folder.
 - Show progress, cancellation, retry, and clear errors.
@@ -20,7 +20,7 @@ InstallerApp/
   src/
     app/          CLI harness now; future Windows UI host
     downloader/   Torrent downloader interface and libtorrent backend
-    extractor/    7-Zip process wrapper and same-disk temp rules
+    extractor/    verified 7-Zip SDK pipeline plus command-line fallback
     logging/      File logging
     manifest/     JSON parser and manifest validation
     paths/        Folder validation and Skyrim path safety rules
@@ -41,8 +41,8 @@ InstallerApp/
 4. Load public trackers. If this fails and the manifest allows it, continue.
 5. Start libtorrent with the selected download folder, DHT, PEX, LSD, and tracker list.
 6. Report progress, speeds, peer count, DHT status, tracker count, and errors.
-7. Recheck/complete the torrent, then verify file size and SHA256 from the manifest.
-8. Extract the first archive volume, such as `modpack.7z.001`, with 7-Zip:
+7. For a chunked packer manifest, expose all volumes as one seekable virtual stream. A single background reader validates bounded blocks and queues only verified data for the 7-Zip SDK decoder.
+8. For a legacy manifest or unavailable SDK component, verify the complete manifest first and extract the first archive volume with the command-line fallback:
 
 ```bat
 7z.exe x "D:\Downloads\modpack.7z.001" -o"D:\Sky" -y -w"D:\Sky\.install_temp"
@@ -57,7 +57,8 @@ InstallerApp/
 - Tracker loading stays behind `ITrackerProvider`.
 - Path validation stays behind `IPathValidator`.
 - Verification never trusts torrent completion alone.
-- Extraction never runs before manifest verification passes.
+- The SDK decoder never receives a block before its manifest SHA256 passes.
+- The legacy command-line extractor never runs before the separate manifest verification pass succeeds.
 
 ## Libtorrent
 

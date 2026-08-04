@@ -7,8 +7,8 @@ Native Windows installer for local modlist release folders produced by `PackerAp
 - CMake C++ project structure.
 - Manifest JSON parser and validator.
 - Skyrim-safe path validation.
-- SHA256 verifier for manifest files.
-- 7-Zip wrapper that extracts directly to the install folder and uses same-disk temp.
+- SHA256 verifier for legacy manifests and chunked packer manifests.
+- Asynchronous verified-block pipeline into the 7-Zip SDK, with the command-line extractor retained as fallback.
 - Dependency-free tests.
 - Example manifest.
 
@@ -32,17 +32,18 @@ The `Install` button runs the install pipeline on a background thread:
 
 - load `data\package\manifest.json`
 - validate unpack and install folders
+- resolve the Windows Documents known folder and create missing `My Games\Skyrim Special Edition` and `My Games\Fallout4` folders
 - check the manifest's unpacked payload size plus extraction overhead against free space
-- verify archive file sizes and SHA256 hashes from the manifest
-- show validation progress, speed, ETA, and elapsed time
-- auto-select sequential HDD validation or parallel SSD validation
+- for chunked packer manifests, read each archive block once, verify it asynchronously, and expose it to the 7-Zip SDK only after SHA256 succeeds
+- show simultaneous validation and extraction percentages, validation speed, ETA, and elapsed time
+- retain separate sequential HDD or parallel SSD validation followed by command-line extraction for legacy manifests or unavailable SDK components
 - look for the archive named by the manifest in `data\downloads`
 - check unpack free space again before extraction; same-volume installs do not reserve a second full copy
 - show live unpack percentage, speed, and ETA in the progress bar and status line
 - refresh unpack elapsed time every second, count ETA down between percentage changes, and map split archives across the full unpack progress range
 - show live install percentage, speed, ETA, and elapsed time in the status line
 - install from the unpack folder into the final install folder, using same-drive move/cut semantics instead of copying when both folders are on the same drive
-- embed 7-Zip inside the installer exe and extract it to `data\tools\7zip` when needed
+- embed the 7-Zip command-line executable, SDK library, and license inside the installer exe and extract them to `data\tools\7zip` when needed
 - stream full 7-Zip diagnostics to `dist\data\logs` while keeping only a small in-memory tail for the GUI
 - run 7-Zip inside a memory-limited child process so oversized archives fail cleanly instead of exhausting system RAM
 - extract with bundled 7-Zip into the selected install folder
@@ -75,6 +76,8 @@ InstallerApp\dist\
       YourPack.7z.002
     tools\
       7zip\
+      webview2\
+        MicrosoftEdgeWebview2Setup.exe
     ui\
       index.html
       style.css
@@ -91,7 +94,7 @@ cd InstallerApp
 .\scripts\build-release.ps1
 ```
 
-The script restores the WebView2 SDK if needed, configures xmake for release, runs tests, copies local UI assets, and copies the GUI exe into `dist\modlist-installer.exe`.
+The script restores the WebView2 SDK if needed, configures xmake for release, runs tests, and copies the GUI exe, local UI assets, and signed WebView2 Evergreen Bootstrapper into `dist`.
 
 ## Change CSS
 
@@ -139,6 +142,9 @@ MyPack/
     downloads/
       MyPack.7z.001
       MyPack.7z.002
+    tools/
+      webview2/
+        MicrosoftEdgeWebview2Setup.exe
     ui/
       index.html
       style.css
@@ -152,4 +158,8 @@ Run from that folder:
 modlist-installer.exe
 ```
 
-The GUI requires `data\package\manifest.json`, loads UI from `data\ui`, uses archive files from `data\downloads`, uses the manifest's `unpacked_size` for space checks, and verifies SHA256 before extraction. If the manifest is missing, invalid, or the hashes fail, install stops and shows a validation failure message.
+The GUI requires `data\package\manifest.json`, loads UI from `data\ui`, uses archive files from `data\downloads`, and uses the manifest's `unpacked_size` for space checks. Chunked packer manifests use a bounded verified-block cache: validation runs ahead of extraction, and unverified bytes never reach 7-Zip. Legacy manifests use the original separate verification pass. If the manifest is missing, invalid, or any hash fails, installation stops and shows a validation failure message.
+
+The themed UI requires Microsoft Edge WebView2 Runtime. If it is unavailable, the native launcher shows a warning and runs `data\tools\webview2\MicrosoftEdgeWebview2Setup.exe /silent /install`. The Evergreen Bootstrapper requires an internet connection; if installation fails, the standard native fallback remains available.
+
+The SDK component is from [7-Zip](https://www.7-zip.org/) and is distributed with its original license in `resources\7zip-License.txt` and `data\tools\7zip\License.txt`.

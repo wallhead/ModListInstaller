@@ -1,4 +1,5 @@
 #include "app/PackageDiscovery.h"
+#include "extractor/PipelinedSevenZipExtractor.h"
 #include "extractor/SevenZipExtractor.h"
 #include "manifest/Json.h"
 #include "manifest/Manifest.h"
@@ -9,8 +10,18 @@
 
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
+#include <sstream>
 #include <stdexcept>
+#include <vector>
+
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 
 using namespace modlist;
 
@@ -97,6 +108,28 @@ void TestPackerManifestLoader() {
   Expect(manifest.value().extract.firstArchivePart == "MyPack.7z.001", "Packer manifest archive mismatch");
   Expect(manifest.value().archiveName == "MyPack", "Packer manifest archive name mismatch");
   Expect(manifest.value().unpackedSize == 7, "Packer manifest unpacked size mismatch");
+  Expect(manifest.value().hashChunkSize == 67108864, "Packer manifest chunk size mismatch");
+  Expect(manifest.value().files[0].chunkSha256.size() == 1,
+         "Packer manifest chunk hash should be retained");
+  Expect(manifest.value().files[0].chunkSha256[0] == Sha256::HexDigest("abc"),
+         "Packer manifest chunk hash mismatch");
+}
+
+void TestPackerManifestRejectsInvalidChunks() {
+  ManifestLoader loader;
+  std::string missingChunk = PackerManifestJson(Sha256::HexDigest("abc"));
+  const std::string chunkLine = "          \"" + Sha256::HexDigest("abc") + "\"\n";
+  const auto chunk = missingChunk.find(chunkLine);
+  missingChunk.erase(chunk, chunkLine.size());
+  Expect(!loader.LoadFromString(missingChunk).ok(),
+         "Packer manifest with a wrong chunk count should fail");
+
+  std::string invalidHash = PackerManifestJson(Sha256::HexDigest("abc"));
+  const auto chunks = invalidHash.find("\"chunks\"");
+  const auto hash = invalidHash.find(Sha256::HexDigest("abc"), chunks);
+  invalidHash.replace(hash, 64, std::string(64, 'z'));
+  Expect(!loader.LoadFromString(invalidHash).ok(),
+         "Packer manifest with an invalid chunk SHA256 should fail");
 }
 
 void TestManifestRejectsUnsafeArchiveName() {
@@ -184,6 +217,197 @@ void TestExtractorCommand() {
          "7-Zip command should use same-disk temp folder");
 }
 
+void TestUnicodeManifestPathSafety() {
+#ifdef _WIN32
+  Expect(IsSafeManifestRelativePath(
+             std::filesystem::path(L"mods\\Поддержка сборки\\файл.txt")),
+         "Unicode Windows archive paths should be safe without narrow conversion");
+#endif
+}
+
+#ifdef _WIN32
+std::wstring QuoteCommandArgument(const std::filesystem::path& path) {
+  return L"\"" + path.wstring() + L"\"";
+}
+
+bool RunProcess(const std::filesystem::path& executable,
+                const std::wstring& arguments,
+                const std::filesystem::path& workingDirectory) {
+  std::wstring command = QuoteCommandArgument(executable) + L" " + arguments;
+  STARTUPINFOW startup{};
+  startup.cb = sizeof(startup);
+  PROCESS_INFORMATION process{};
+  if (!CreateProcessW(nullptr, command.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW,
+                      nullptr, workingDirectory.c_str(), &startup, &process)) {
+    return false;
+  }
+  WaitForSingleObject(process.hProcess, INFINITE);
+  DWORD exitCode = 1;
+  GetExitCodeProcess(process.hProcess, &exitCode);
+  CloseHandle(process.hThread);
+  CloseHandle(process.hProcess);
+  return exitCode == 0;
+}
+
+std::string DigestToHex(const std::array<uint8_t, 32>& digest) {
+  std::ostringstream out;
+  out << std::hex << std::setfill('0');
+  for (const auto byte : digest) {
+    out << std::setw(2) << static_cast<unsigned int>(byte);
+  }
+  return out.str();
+}
+
+std::vector<std::string> ChunkHashes(const std::filesystem::path& path, uint64_t chunkSize) {
+  std::ifstream input(path, std::ios::binary);
+  std::vector<std::string> hashes;
+  std::vector<uint8_t> buffer(256 * 1024);
+  while (input) {
+    Sha256 hash;
+    uint64_t remaining = chunkSize;
+    uint64_t chunkBytes = 0;
+    while (remaining > 0 && input) {
+      const auto request = static_cast<std::streamsize>(
+          std::min<uint64_t>(remaining, buffer.size()));
+      input.read(reinterpret_cast<char*>(buffer.data()), request);
+      const auto read = input.gcount();
+      if (read <= 0) {
+        break;
+      }
+      hash.Update(buffer.data(), static_cast<size_t>(read));
+      remaining -= static_cast<uint64_t>(read);
+      chunkBytes += static_cast<uint64_t>(read);
+    }
+    if (chunkBytes > 0) {
+      hashes.push_back(DigestToHex(hash.Final()));
+    }
+  }
+  return hashes;
+}
+
+void TestPipelinedExtractor() {
+  const auto root = std::filesystem::temp_directory_path() / "modlist_pipeline_integration";
+  std::filesystem::remove_all(root);
+  const auto source = root / "source";
+  const auto archives = root / "archives";
+  const auto output = root / "output";
+  std::filesystem::create_directories(source);
+  std::filesystem::create_directories(archives);
+
+  const auto payload = source / "payload.bin";
+  {
+    std::ofstream file(payload, std::ios::binary | std::ios::trunc);
+    uint32_t state = 0x12345678u;
+    std::vector<uint8_t> bytes(1024 * 1024);
+    for (size_t block = 0; block < 8; ++block) {
+      for (auto& byte : bytes) {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        byte = static_cast<uint8_t>(state);
+      }
+      file.write(reinterpret_cast<const char*>(bytes.data()),
+                 static_cast<std::streamsize>(bytes.size()));
+    }
+  }
+
+  const auto sevenZip = std::filesystem::current_path() / "resources" / "7z.exe";
+  const auto archive = archives / "pipeline.7z";
+  const std::wstring arguments = L"a " + QuoteCommandArgument(archive) + L" " +
+      QuoteCommandArgument(payload.filename()) + L" -mx=1 -v1m";
+  Expect(RunProcess(sevenZip, arguments, source), "Unable to create split integration archive");
+
+  std::vector<std::filesystem::path> parts;
+  for (const auto& entry : std::filesystem::directory_iterator(archives)) {
+    if (entry.is_regular_file()) {
+      parts.push_back(entry.path());
+    }
+  }
+  std::sort(parts.begin(), parts.end());
+  Expect(parts.size() > 1, "Integration archive should contain multiple volumes");
+
+  Manifest manifest;
+  manifest.version = "modlist-manifest-chunks-v1";
+  manifest.archiveName = "pipeline";
+  manifest.hashChunkSize = 256 * 1024;
+  manifest.unpackedSize = std::filesystem::file_size(payload);
+  for (const auto& part : parts) {
+    ManifestFile file;
+    file.path = part.filename();
+    file.size = std::filesystem::file_size(part);
+    const auto fullHash = Sha256::FileHexDigest(part);
+    Expect(fullHash.ok(), "Unable to hash integration archive volume");
+    file.sha256 = fullHash.value();
+    file.chunkSha256 = ChunkHashes(part, manifest.hashChunkSize);
+    manifest.files.push_back(std::move(file));
+  }
+  manifest.extract.firstArchivePart = manifest.files.front().path;
+
+  PipelinedSevenZipExtractor extractor;
+  const auto sdkCache = root / "sdk-cache";
+  const auto library = extractor.LocateLibrary(sdkCache);
+  Expect(library.ok(), library.error().c_str());
+  Expect(library.value() == sdkCache / "data" / "tools" / "7zip" / "7z.dll",
+         "Pipeline test should use the embedded 7-Zip SDK library");
+  Expect(std::filesystem::is_regular_file(
+             sdkCache / "data" / "tools" / "7zip" / "License.txt"),
+         "Pipeline should extract the embedded 7-Zip license");
+  PipelinedExtractionConfig config;
+  config.sevenZipLibrary = library.value();
+  config.archiveFolder = archives;
+  config.installFolder = output;
+  config.manifest = &manifest;
+  PipelineExtractionProgress lastProgress;
+  std::vector<bool> reportedArchives(parts.size(), false);
+  std::vector<bool> extractedArchives(parts.size(), false);
+  const auto result = extractor.Extract(config, [&](const auto& progress) {
+    lastProgress = progress;
+    if (progress.validationArchiveIndex > 0 &&
+        progress.validationArchiveIndex <= reportedArchives.size()) {
+      reportedArchives[progress.validationArchiveIndex - 1] = true;
+    }
+    if (progress.extractionArchiveIndex > 0 &&
+        progress.extractionArchiveIndex <= extractedArchives.size()) {
+      extractedArchives[progress.extractionArchiveIndex - 1] = true;
+    }
+  });
+  Expect(result.ok, result.message.c_str());
+  Expect(lastProgress.validatedBytes == lastProgress.validationTotalBytes,
+         "Pipeline should validate every archive byte");
+  Expect(std::all_of(reportedArchives.begin(), reportedArchives.end(), [](bool reported) {
+           return reported;
+         }),
+         "Pipeline progress should identify every validated archive volume");
+  Expect(std::all_of(extractedArchives.begin(), extractedArchives.end(), [](bool reported) {
+           return reported;
+         }),
+         "Pipeline progress should identify every archive volume read by 7-Zip");
+  const auto sourceHash = Sha256::FileHexDigest(payload);
+  const auto outputHash = Sha256::FileHexDigest(output / payload.filename());
+  Expect(sourceHash.ok() && outputHash.ok() && sourceHash.value() == outputHash.value(),
+         "Pipelined extraction payload mismatch");
+
+  const auto corruptedPart = parts[1];
+  {
+    std::fstream file(corruptedPart, std::ios::binary | std::ios::in | std::ios::out);
+    file.seekg(137);
+    char value = 0;
+    file.read(&value, 1);
+    value ^= static_cast<char>(0x5a);
+    file.seekp(137);
+    file.write(&value, 1);
+  }
+  PipelinedExtractionConfig corruptedConfig = config;
+  corruptedConfig.installFolder = root / "corrupted-output";
+  const auto corruptedResult = extractor.Extract(corruptedConfig);
+  Expect(!corruptedResult.ok, "Pipelined extraction should reject a corrupted volume");
+  Expect(corruptedResult.message.find("SHA256 mismatch") != std::string::npos,
+         "Pipelined corruption failure should identify the SHA256 mismatch");
+  std::filesystem::remove_all(root);
+}
+
+#endif
+
 void TestPackageDiscovery() {
   const auto root = std::filesystem::temp_directory_path() / "modlist_installer_package_tests";
   std::filesystem::remove_all(root);
@@ -255,14 +479,19 @@ int main() {
     TestSha256();
     TestManifestLoader();
     TestPackerManifestLoader();
+    TestPackerManifestRejectsInvalidChunks();
     TestManifestRejectsUnsafeArchiveName();
     TestPackerManifestInfersArchiveName();
     TestArchiveInstallFolder();
     TestManifestRejectsTraversal();
+    TestUnicodeManifestPathSafety();
     TestJsonUnicodeEscapes();
     TestTrackerParsing();
     TestVerifier();
     TestExtractorCommand();
+#ifdef _WIN32
+    TestPipelinedExtractor();
+#endif
     TestPackageDiscovery();
     TestPackageDiscoveryWithoutTorrent();
     TestInstallSpacePlanning();

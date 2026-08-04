@@ -10,10 +10,12 @@ out/
 *.ilk
 *.exe
 !dist/modlist-installer.exe
+!dist/data/tools/webview2/MicrosoftEdgeWebview2Setup.exe
+!resources/webview2/MicrosoftEdgeWebview2Setup.exe
 dist/data/logs/
 dist/data/downloads/
-dist/data/tools/
 *.dll
+!resources/7z.dll
 *.lib
 *.exp
 dist/ui/

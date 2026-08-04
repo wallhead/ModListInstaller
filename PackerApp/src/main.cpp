@@ -1456,6 +1456,26 @@ bool PrepareInstallerSetup(HWND hwnd, const PackerConfig& config) {
     PostLog(hwnd, L"Unable to prepare setup: data\\ui was not found beside modlist-packer.exe.");
     return false;
   }
+
+  const auto sourceTools = packerFolder / "data" / "tools";
+  const auto targetTools = DataFolder(config) / "tools";
+  if (config.copyInstaller && std::filesystem::exists(sourceTools, ec) &&
+      std::filesystem::is_directory(sourceTools, ec)) {
+    std::filesystem::remove_all(targetTools, ec);
+    if (ec) {
+      PostLog(hwnd, L"Unable to replace installer tools: " + Widen(ec.message()));
+      return false;
+    }
+    std::filesystem::copy(sourceTools, targetTools, std::filesystem::copy_options::recursive, ec);
+    if (ec) {
+      PostLog(hwnd, L"Unable to copy installer tools: " + Widen(ec.message()));
+      return false;
+    }
+    PostLog(hwnd, L"Installer tools copied: " + targetTools.wstring());
+  } else if (config.copyInstaller) {
+    PostLog(hwnd, L"Unable to prepare setup: data\\tools was not found beside modlist-packer.exe.");
+    return false;
+  }
   return true;
 }
 

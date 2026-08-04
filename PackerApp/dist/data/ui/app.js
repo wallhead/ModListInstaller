@@ -103,8 +103,9 @@
     dom.messageTitle.textContent = title || "";
     dom.messageText.textContent = message || "";
     dom.messageText.hidden = !message;
-    dom.messageCancel.hidden = messageAction !== "overwrite";
-    dom.messageOk.textContent = messageAction === "overwrite" ? "Перезаписать" : "OK";
+    dom.messageCancel.hidden = messageAction !== "cleanup";
+    dom.messageCancel.textContent = messageAction === "cleanup" ? "Нет" : "Отмена";
+    dom.messageOk.textContent = messageAction === "cleanup" ? "Да" : "OK";
     dom.messageModal.hidden = false;
     dom.messageOk.focus();
   }
@@ -160,16 +161,16 @@
     const action = messageAction;
     messageAction = "";
     dom.messageModal.hidden = true;
-    if (action === "overwrite") {
-      send("confirmOverwrite");
+    if (action === "cleanup") {
+      send("confirmFolderCleanup");
     }
   });
   dom.messageCancel.addEventListener("click", () => {
     const action = messageAction;
     messageAction = "";
     dom.messageModal.hidden = true;
-    if (action === "overwrite") {
-      send("cancelOverwrite");
+    if (action === "cleanup") {
+      send("cancelFolderCleanup");
     }
   });
   dom.installFolder.addEventListener("change", () => send("setPath", { name: "installFolder", value: dom.installFolder.value }));
@@ -196,8 +197,8 @@
       window.installerUi.setOption(message.name, message.value);
     } else if (message.type === "error") {
       showError(message.title, message.message);
-    } else if (message.type === "overwriteConfirm") {
-      showMessageModal(message.title, message.message, "overwrite");
+    } else if (message.type === "cleanupConfirm") {
+      showMessageModal(message.title, message.message, "cleanup");
     } else if (message.type === "button") {
       setButtonEnabled(message.name, message.enabled);
     } else if (message.type === "installComplete") {

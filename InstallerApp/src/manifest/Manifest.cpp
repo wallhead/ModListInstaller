@@ -86,6 +86,65 @@ Result<ManifestFile> ParseFile(const JsonValue& json, size_t index) {
   return Result<ManifestFile>::Ok(std::move(file));
 }
 
+Result<uint64_t> ParsePackerChunkSize(const JsonValue& root) {
+  const JsonValue* hash = root.Find("hash");
+  if (auto required = RequireObject(hash, "hash"); !required.ok()) {
+    return Result<uint64_t>::Error(required.error());
+  }
+  const JsonValue* algorithm = hash->Find("algorithm");
+  if (auto required = RequireString(algorithm, "hash.algorithm"); !required.ok()) {
+    return Result<uint64_t>::Error(required.error());
+  }
+  std::string normalizedAlgorithm = algorithm->AsString();
+  std::transform(normalizedAlgorithm.begin(), normalizedAlgorithm.end(),
+                 normalizedAlgorithm.begin(), [](unsigned char c) {
+                   return static_cast<char>(std::tolower(c));
+                 });
+  if (normalizedAlgorithm != "sha256") {
+    return Result<uint64_t>::Error("Manifest hash algorithm must be sha256");
+  }
+  const JsonValue* chunkSize = hash->Find("chunk_size");
+  if (chunkSize == nullptr || !chunkSize->IsNumber()) {
+    return Result<uint64_t>::Error("Manifest hash chunk_size must be a positive number");
+  }
+  const double value = chunkSize->AsNumber();
+  const auto parsed = static_cast<uint64_t>(value);
+  if (value <= 0 || static_cast<double>(parsed) != value) {
+    return Result<uint64_t>::Error("Manifest hash chunk_size must be a positive integer");
+  }
+  return Result<uint64_t>::Ok(parsed);
+}
+
+Result<void> ParsePackerChunks(const JsonValue& json,
+                               size_t fileIndex,
+                               uint64_t chunkSize,
+                               ManifestFile& file) {
+  const JsonValue* chunks = json.Find("chunks");
+  if (chunks == nullptr || !chunks->IsArray()) {
+    return Result<void>::Error("Manifest field 'files[].chunks' must be an array");
+  }
+  const uint64_t expectedCount =
+      file.size / chunkSize + (file.size % chunkSize == 0 ? 0 : 1);
+  if (chunks->AsArray().size() != expectedCount) {
+    return Result<void>::Error(
+        "Manifest chunk count mismatch for file entry " + std::to_string(fileIndex));
+  }
+  file.chunkSha256.reserve(chunks->AsArray().size());
+  for (const auto& value : chunks->AsArray()) {
+    if (!value.IsString() || !IsHexSha256(value.AsString())) {
+      return Result<void>::Error(
+          "Manifest chunk SHA256 must be 64 hexadecimal characters for file entry " +
+          std::to_string(fileIndex));
+    }
+    auto chunkHash = value.AsString();
+    std::transform(chunkHash.begin(), chunkHash.end(), chunkHash.begin(), [](unsigned char c) {
+      return static_cast<char>(std::tolower(c));
+    });
+    file.chunkSha256.push_back(std::move(chunkHash));
+  }
+  return Result<void>::Ok();
+}
+
 bool EndsWithInsensitive(std::string value, const std::string& suffix) {
   std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
     return static_cast<char>(std::tolower(c));
@@ -147,6 +206,12 @@ Result<Manifest> ParsePackerManifest(const JsonValue& root) {
   manifest.torrent.type = TorrentSourceType::TorrentFile;
   manifest.torrent.source = "package";
 
+  auto chunkSize = ParsePackerChunkSize(root);
+  if (!chunkSize.ok()) {
+    return Result<Manifest>::Error(chunkSize.error());
+  }
+  manifest.hashChunkSize = chunkSize.value();
+
   const JsonValue* files = root.Find("files");
   if (files == nullptr || !files->IsArray() || files->AsArray().empty()) {
     return Result<Manifest>::Error("Manifest field 'files' must be a non-empty array");
@@ -155,6 +220,11 @@ Result<Manifest> ParsePackerManifest(const JsonValue& root) {
     auto file = ParseFile(files->AsArray()[i], i);
     if (!file.ok()) {
       return Result<Manifest>::Error(file.error());
+    }
+    if (auto chunks = ParsePackerChunks(
+            files->AsArray()[i], i, manifest.hashChunkSize, file.value());
+        !chunks.ok()) {
+      return Result<Manifest>::Error(chunks.error());
     }
     manifest.files.push_back(std::move(file.value()));
   }
@@ -351,8 +421,13 @@ bool IsSafeManifestRelativePath(const std::filesystem::path& path) {
     return false;
   }
   for (const auto& part : path) {
-    const std::string text = part.string();
+#ifdef _WIN32
+    const std::wstring text = part.native();
+    if (text == L".." || text == L"." || text.empty()) {
+#else
+    const std::string text = part.native();
     if (text == ".." || text == "." || text.empty()) {
+#endif
       return false;
     }
   }
