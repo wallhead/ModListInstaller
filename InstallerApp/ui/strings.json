@@ -1,7 +1,7 @@
 {
   "window_title": "Modlist Installer Beta",
   "app_title": "Modlist Installer Beta",
-  "app_version": "Modlist Installer v0.3.0 by WallHead",
+  "app_version": "Modlist Installer v0.3.1 by WallHead",
   "unpack_note": "Распаковка должна происходить по короткому пути. После распаковки установщик перенесет все файлы в папку установки.",
   "unpack_drive_label": "Диск для распаковки",
   "install_folder_label": "Папка установки",

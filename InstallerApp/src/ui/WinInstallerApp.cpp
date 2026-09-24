@@ -3162,7 +3162,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
       const auto finalFolder = FinalInstallFolder(std::filesystem::path(GetText(g_installEdit)));
       modlist::NativeInstallerViewState state;
       state.title = UiText("app_title", L"Modlist Installer Beta");
-      state.version = UiText("app_version", L"Modlist Installer v0.3.0 by WallHead");
+      state.version = UiText("app_version", L"Modlist Installer v0.3.1 by WallHead");
       state.unpackNote = UiText(
           "unpack_note",
           L"Распаковка должна происходить по короткому пути. После распаковки установщик перенесет все файлы в папку установки.");

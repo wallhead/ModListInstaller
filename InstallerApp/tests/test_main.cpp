@@ -285,6 +285,31 @@ std::vector<std::string> ChunkHashes(const std::filesystem::path& path, uint64_t
   return hashes;
 }
 
+void TestPipelineDoesNotForcePerFileFlush() {
+  const std::vector<std::filesystem::path> candidates = {
+      std::filesystem::path(__FILE__).parent_path().parent_path() / "src" /
+          "extractor" / "PipelinedSevenZipExtractor.cpp",
+      std::filesystem::current_path() / "src" / "extractor" /
+          "PipelinedSevenZipExtractor.cpp",
+      std::filesystem::current_path() / ".." / "src" / "extractor" /
+          "PipelinedSevenZipExtractor.cpp",
+      std::filesystem::current_path() / ".." / ".." / "src" / "extractor" /
+          "PipelinedSevenZipExtractor.cpp",
+  };
+  std::string source;
+  for (const auto& candidate : candidates) {
+    std::ifstream input(candidate, std::ios::binary);
+    if (input) {
+      source.assign(std::istreambuf_iterator<char>(input),
+                    std::istreambuf_iterator<char>());
+      break;
+    }
+  }
+  Expect(!source.empty(), "Unable to locate the pipelined extractor source");
+  Expect(source.find("FlushFileBuffers(handle_)") == std::string::npos,
+         "Pipeline must not force a durable disk flush after every extracted file");
+}
+
 void TestPipelinedExtractor() {
   const auto root = std::filesystem::temp_directory_path() / "modlist_pipeline_integration";
   std::filesystem::remove_all(root);
@@ -311,10 +336,20 @@ void TestPipelinedExtractor() {
     }
   }
 
+  const auto smallFiles = source / "small-files";
+  std::filesystem::create_directories(smallFiles);
+  constexpr size_t smallFileCount = 512;
+  for (size_t index = 0; index < smallFileCount; ++index) {
+    std::ofstream file(smallFiles / ("file-" + std::to_string(index) + ".txt"),
+                       std::ios::binary | std::ios::trunc);
+    file << "small-file-" << index;
+  }
+
   const auto sevenZip = std::filesystem::current_path() / "resources" / "7z.exe";
   const auto archive = archives / "pipeline.7z";
   const std::wstring arguments = L"a " + QuoteCommandArgument(archive) + L" " +
-      QuoteCommandArgument(payload.filename()) + L" -mx=1 -v1m";
+      QuoteCommandArgument(payload.filename()) + L" " +
+      QuoteCommandArgument(smallFiles.filename()) + L" -mx=1 -v1m";
   Expect(RunProcess(sevenZip, arguments, source), "Unable to create split integration archive");
 
   std::vector<std::filesystem::path> parts;
@@ -386,6 +421,16 @@ void TestPipelinedExtractor() {
   const auto outputHash = Sha256::FileHexDigest(output / payload.filename());
   Expect(sourceHash.ok() && outputHash.ok() && sourceHash.value() == outputHash.value(),
          "Pipelined extraction payload mismatch");
+  for (size_t index = 0; index < smallFileCount; ++index) {
+    const auto path = output / smallFiles.filename() /
+        ("file-" + std::to_string(index) + ".txt");
+    std::ifstream file(path, std::ios::binary);
+    std::ostringstream contents;
+    contents << file.rdbuf();
+    Expect(file.good() || file.eof(), "Pipelined extraction omitted a small file");
+    Expect(contents.str() == "small-file-" + std::to_string(index),
+           "Pipelined extraction small-file payload mismatch");
+  }
 
   const auto corruptedPart = parts[1];
   {
@@ -490,6 +535,7 @@ int main() {
     TestVerifier();
     TestExtractorCommand();
 #ifdef _WIN32
+    TestPipelineDoesNotForcePerFileFlush();
     TestPipelinedExtractor();
 #endif
     TestPackageDiscovery();

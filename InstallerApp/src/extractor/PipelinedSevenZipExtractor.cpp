@@ -971,7 +971,6 @@ public:
 
   void Close() {
     if (handle_ != INVALID_HANDLE_VALUE) {
-      FlushFileBuffers(handle_);
       CloseHandle(handle_);
       handle_ = INVALID_HANDLE_VALUE;
     }
