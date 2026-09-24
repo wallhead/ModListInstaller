@@ -1,5 +1,5 @@
 set_project("ModlistInstaller")
-set_version("0.3.1")
+set_version("0.3.2")
 
 add_rules("mode.debug", "mode.release")
 set_languages("c++20")
@@ -47,6 +47,7 @@ target("installer_core")
         "src/logging/Logger.cpp",
         "src/manifest/Json.cpp",
         "src/manifest/Manifest.cpp",
+        "src/paths/WindowsFileMove.cpp",
         "src/paths/PathValidator.cpp",
         "src/tracker/TrackerProvider.cpp",
         "src/verifier/Sha256.cpp",

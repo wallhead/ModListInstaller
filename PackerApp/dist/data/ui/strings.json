@@ -1,7 +1,7 @@
 {
   "window_title": "Modlist Installer Beta",
   "app_title": "Modlist Installer Beta",
-  "app_version": "Modlist Installer v0.3.1 by WallHead",
+  "app_version": "Modlist Installer v0.3.2 by WallHead",
   "unpack_note": "Распаковка должна происходить по короткому пути. После распаковки установщик перенесет все файлы в папку установки.",
   "unpack_drive_label": "Диск для распаковки",
   "install_folder_label": "Папка установки",
@@ -34,6 +34,8 @@
   "cleanup_question": "Очистить указанные папки и продолжить установку?",
   "validation_error_title": "Ошибка проверки",
   "validation_error_message": "Проверка завершилась ошибкой. Перехешируйте торрент файлы.",
+  "install_files_failed_title": "Ошибка копирования",
+  "install_files_failed_message": "Программе не удалось скопировать файлы. Пожалуйста, скопируйте их из:\n\n{source}\n\nв:\n\n{target}",
   "install_complete_message": "Установка завершена!",
   "path_error_title": "Ошибка пути",
   "documents_error_title": "Ошибка папки документов",

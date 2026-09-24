@@ -6,6 +6,7 @@ add_library(installer_core
   logging/Logger.cpp
   manifest/Json.cpp
   manifest/Manifest.cpp
+  paths/WindowsFileMove.cpp
   paths/PathValidator.cpp
   tracker/TrackerProvider.cpp
   verifier/Sha256.cpp

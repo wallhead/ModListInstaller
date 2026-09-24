@@ -5,6 +5,7 @@
 #include "extractor/SevenZipExtractor.h"
 #include "manifest/Manifest.h"
 #include "paths/PathValidator.h"
+#include "paths/WindowsFileMove.h"
 #include "resource.h"
 #include "ui/NativeInstallerView.h"
 #include "ui/NativeStrings.h"
@@ -65,6 +66,12 @@ constexpr UINT kProgressMessage = WM_APP + 2;
 constexpr UINT kWorkerFinishedMessage = WM_APP + 3;
 constexpr UINT kStatusMessage = WM_APP + 4;
 constexpr UINT kValidationFailedMessage = WM_APP + 5;
+constexpr UINT kInstallFilesFailedMessage = WM_APP + 6;
+
+struct ManualInstallRequiredData {
+  std::filesystem::path source;
+  std::filesystem::path target;
+};
 
 enum class WizardPage {
   Welcome,
@@ -357,6 +364,16 @@ void PostStatus(HWND hwnd, std::wstring text) {
 
 void PostValidationFailed(HWND hwnd) {
   PostMessageW(hwnd, kValidationFailedMessage, 0, 0);
+}
+
+void PostManualInstallRequired(HWND hwnd,
+                               const std::filesystem::path& source,
+                               const std::filesystem::path& target) {
+  auto* data = new ManualInstallRequiredData{source, target};
+  if (!PostMessageW(hwnd, kInstallFilesFailedMessage, 0,
+                    reinterpret_cast<LPARAM>(data))) {
+    delete data;
+  }
 }
 
 std::wstring PathToDisplay(const std::filesystem::path& path) {
@@ -2233,8 +2250,10 @@ void UpdateInstallProgress(InstallProgress& progress, uintmax_t bytes, bool forc
   PostStatus(progress.hwnd, status.str());
 }
 
-bool MoveWholeEntry(const std::filesystem::path& source,
+bool MoveWholeEntry(HWND hwnd,
+                    const std::filesystem::path& source,
                     const std::filesystem::path& target,
+                    bool& manualRecoveryRequired,
                     std::wstring& error) {
   if (g_stopRequested.load()) {
     error = L"Установка остановлена пользователем";
@@ -2247,13 +2266,28 @@ bool MoveWholeEntry(const std::filesystem::path& source,
     return false;
   }
 
-  DWORD flags = MOVEFILE_WRITE_THROUGH;
-  if (!std::filesystem::is_directory(source, ec)) {
-    flags |= MOVEFILE_REPLACE_EXISTING;
+  const bool isDirectory = std::filesystem::is_directory(source, ec);
+  if (ec) {
+    error = L"Невозможно проверить источник установки: " + Widen(ec.message());
+    return false;
   }
-  if (!MoveFileExW(source.wstring().c_str(), target.wstring().c_str(), flags)) {
+
+  constexpr uint32_t kMoveAttempts = 3;
+  constexpr auto kMoveRetryDelay = std::chrono::seconds(20);
+  const auto result = modlist::MovePathWithRetry(
+      source, target, !isDirectory, kMoveAttempts, kMoveRetryDelay,
+      [hwnd, &source, &target](uint32_t attempt, uint32_t maxAttempts,
+                              unsigned long windowsError) {
+        PostLog(hwnd, L"Невозможно переместить " + PathToDisplay(source) + L" в " +
+                          PathToDisplay(target) + L" (Windows error " +
+                          std::to_wstring(windowsError) + L"). Повторная попытка " +
+                          std::to_wstring(attempt + 1) + L"/" +
+                          std::to_wstring(maxAttempts) + L" через 20 секунд.");
+      });
+  if (!result.ok) {
+    manualRecoveryRequired = true;
     error = L"Невозможно переместить " + PathToDisplay(source) + L" в " + PathToDisplay(target) +
-            L" (Windows error " + std::to_wstring(GetLastError()) + L").";
+            L" (Windows error " + std::to_wstring(result.error) + L").";
     return false;
   }
   return true;
@@ -2321,6 +2355,7 @@ bool InstallEntry(HWND hwnd,
                   const std::filesystem::path& target,
                   bool sameDrive,
                   InstallProgress& progress,
+                  bool& manualRecoveryRequired,
                   std::wstring& error) {
   if (g_stopRequested.load()) {
     error = L"Установка остановлена пользователем";
@@ -2332,7 +2367,7 @@ bool InstallEntry(HWND hwnd,
     if (!movedBytes.has_value()) {
       return false;
     }
-    if (!MoveWholeEntry(source, target, error)) {
+    if (!MoveWholeEntry(hwnd, source, target, manualRecoveryRequired, error)) {
       return false;
     }
     UpdateInstallProgress(progress, *movedBytes, true);
@@ -2354,7 +2389,8 @@ bool InstallEntry(HWND hwnd,
         error = L"Установка остановлена пользователем";
         return false;
       }
-      if (!InstallEntry(hwnd, entry, target / entry.filename(), sameDrive, progress, error)) {
+      if (!InstallEntry(hwnd, entry, target / entry.filename(), sameDrive, progress,
+                        manualRecoveryRequired, error)) {
         return false;
       }
     }
@@ -2371,7 +2407,7 @@ bool InstallEntry(HWND hwnd,
     if (!movedBytes.has_value()) {
       return false;
     }
-    if (!MoveWholeEntry(source, target, error)) {
+    if (!MoveWholeEntry(hwnd, source, target, manualRecoveryRequired, error)) {
       return false;
     }
     UpdateInstallProgress(progress, *movedBytes, true);
@@ -2379,6 +2415,9 @@ bool InstallEntry(HWND hwnd,
   }
 
   if (!CopyFileWithProgress(source, target, progress, error)) {
+    if (!g_stopRequested.load()) {
+      manualRecoveryRequired = true;
+    }
     return false;
   }
   std::filesystem::remove(source, ec);
@@ -2422,6 +2461,7 @@ bool InstallExtractedFiles(HWND hwnd, const std::filesystem::path& unpackFolder,
 
   InstallProgress installProgress;
   installProgress.hwnd = hwnd;
+  bool manualRecoveryRequired = false;
   std::wstring error;
   std::vector<std::filesystem::path> entries;
   if (!ReadDirectoryEntries(unpackFolder, entries, error)) {
@@ -2462,8 +2502,12 @@ bool InstallExtractedFiles(HWND hwnd, const std::filesystem::path& unpackFolder,
       }
     } else {
       const auto target = installFolder / entry.filename();
-      if (!InstallEntry(hwnd, entry, target, sameDrive, installProgress, error)) {
+      if (!InstallEntry(hwnd, entry, target, sameDrive, installProgress,
+                        manualRecoveryRequired, error)) {
         PostLog(hwnd, error);
+        if (manualRecoveryRequired) {
+          PostManualInstallRequired(hwnd, unpackFolder, installFolder);
+        }
         return false;
       }
     }
@@ -3162,7 +3206,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
       const auto finalFolder = FinalInstallFolder(std::filesystem::path(GetText(g_installEdit)));
       modlist::NativeInstallerViewState state;
       state.title = UiText("app_title", L"Modlist Installer Beta");
-      state.version = UiText("app_version", L"Modlist Installer v0.3.1 by WallHead");
+      state.version = UiText("app_version", L"Modlist Installer v0.3.2 by WallHead");
       state.unpackNote = UiText(
           "unpack_note",
           L"Распаковка должна происходить по короткому пути. После распаковки установщик перенесет все файлы в папку установки.");
@@ -3324,6 +3368,18 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
                   UiText("validation_error_message",
                          L"Проверка завершилась ошибкой. Перехешируйте торрент файлы."));
       return 0;
+    case kInstallFilesFailedMessage: {
+      std::unique_ptr<ManualInstallRequiredData> data(
+          reinterpret_cast<ManualInstallRequiredData*>(lParam));
+      SendUiError(
+          UiText("install_files_failed_title", L"Ошибка копирования"),
+          g_strings.Format(
+              "install_files_failed_message",
+              L"Программе не удалось скопировать файлы. Пожалуйста, скопируйте их из:\n\n{source}\n\nв:\n\n{target}",
+              {{L"source", PathToDisplay(data->source)},
+               {L"target", PathToDisplay(data->target)}}));
+      return 0;
+    }
     case kWorkerFinishedMessage: {
       SetControlsRunning(hwnd, false);
       if (wParam != 0 && !g_closeAfterWorker) {

@@ -3,6 +3,7 @@
 #include "extractor/SevenZipExtractor.h"
 #include "manifest/Json.h"
 #include "manifest/Manifest.h"
+#include "paths/WindowsFileMove.h"
 #include "paths/PathValidator.h"
 #include "tracker/TrackerProvider.h"
 #include "verifier/Sha256.h"
@@ -10,6 +11,7 @@
 
 #include <filesystem>
 #include <fstream>
+#include <chrono>
 #include <iomanip>
 #include <iostream>
 #include <sstream>
@@ -310,6 +312,90 @@ void TestPipelineDoesNotForcePerFileFlush() {
          "Pipeline must not force a durable disk flush after every extracted file");
 }
 
+void TestWindowsMoveRetriesTransientLock() {
+  const auto root = std::filesystem::temp_directory_path() / "modlist_move_retry";
+  std::filesystem::remove_all(root);
+  const auto source = root / "source";
+  const auto target = root / "target";
+  std::filesystem::create_directories(source);
+  const auto lockedFile = source / "locked.txt";
+  {
+    std::ofstream output(lockedFile, std::ios::binary | std::ios::trunc);
+    output << "locked during first move attempt";
+  }
+
+  HANDLE lock = CreateFileW(
+      lockedFile.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+      FILE_ATTRIBUTE_NORMAL, nullptr);
+  Expect(lock != INVALID_HANDLE_VALUE, "Unable to create a transient move lock");
+
+  bool retryObserved = false;
+  const auto result = MovePathWithRetry(
+      source, target, false, 3, std::chrono::milliseconds(1),
+      [&](uint32_t attempt, uint32_t maxAttempts, unsigned long error) {
+        retryObserved = true;
+        Expect(attempt == 1, "Unexpected move retry attempt number");
+        Expect(maxAttempts == 3, "Unexpected move retry limit");
+        Expect(IsTransientMoveError(error), "Move retry reported a non-transient error");
+        CloseHandle(lock);
+        lock = INVALID_HANDLE_VALUE;
+      });
+
+  if (lock != INVALID_HANDLE_VALUE) {
+    CloseHandle(lock);
+  }
+  Expect(retryObserved, "Locked directory move did not request a retry");
+  Expect(result.ok, "Directory move did not recover after the lock was released");
+  Expect(result.attempts == 2, "Directory move used an unexpected number of attempts");
+  Expect(std::filesystem::exists(target / "locked.txt"),
+         "Retried directory move did not preserve its contents");
+  Expect(!std::filesystem::exists(source),
+         "Retried directory move left the source folder behind");
+  std::filesystem::remove_all(root);
+}
+
+void TestInstallMoveFailureProvidesManualRecoveryPaths() {
+  const std::vector<std::filesystem::path> sourceCandidates = {
+      std::filesystem::path(__FILE__).parent_path().parent_path() / "src" / "ui" /
+          "WinInstallerApp.cpp",
+      std::filesystem::current_path() / "src" / "ui" / "WinInstallerApp.cpp",
+  };
+  std::string source;
+  for (const auto& candidate : sourceCandidates) {
+    std::ifstream input(candidate, std::ios::binary);
+    if (input) {
+      source.assign(std::istreambuf_iterator<char>(input),
+                    std::istreambuf_iterator<char>());
+      break;
+    }
+  }
+  Expect(!source.empty(), "Unable to locate the native installer source");
+  Expect(source.find("PostManualInstallRequired(hwnd, unpackFolder, installFolder)") !=
+             std::string::npos,
+         "Move failure must post manual recovery paths to the UI");
+
+  const std::vector<std::filesystem::path> stringCandidates = {
+      std::filesystem::path(__FILE__).parent_path().parent_path() / "ui" / "strings.json",
+      std::filesystem::current_path() / "ui" / "strings.json",
+  };
+  std::string strings;
+  for (const auto& candidate : stringCandidates) {
+    std::ifstream input(candidate, std::ios::binary);
+    if (input) {
+      strings.assign(std::istreambuf_iterator<char>(input),
+                     std::istreambuf_iterator<char>());
+      break;
+    }
+  }
+  Expect(!strings.empty(), "Unable to locate the native UI text catalogue");
+  Expect(strings.find("install_files_failed_message") != std::string::npos,
+         "UI text catalogue is missing the manual recovery message");
+  Expect(strings.find("{source}") != std::string::npos,
+         "Manual recovery message is missing the unpack-folder placeholder");
+  Expect(strings.find("{target}") != std::string::npos,
+         "Manual recovery message is missing the destination-folder placeholder");
+}
+
 void TestPipelinedExtractor() {
   const auto root = std::filesystem::temp_directory_path() / "modlist_pipeline_integration";
   std::filesystem::remove_all(root);
@@ -535,6 +621,8 @@ int main() {
     TestVerifier();
     TestExtractorCommand();
 #ifdef _WIN32
+    TestWindowsMoveRetriesTransientLock();
+    TestInstallMoveFailureProvidesManualRecoveryPaths();
     TestPipelineDoesNotForcePerFileFlush();
     TestPipelinedExtractor();
 #endif
