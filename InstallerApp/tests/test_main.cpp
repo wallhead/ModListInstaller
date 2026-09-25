@@ -162,6 +162,18 @@ void TestArchiveInstallFolder() {
          "Archive should install into a named folder below the selected root");
 }
 
+void TestAutomaticUnpackFolder() {
+  const auto folder = AutomaticUnpackFolder(
+      std::filesystem::path(L"D:\\Folder1\\folder2\\folder3"));
+  Expect(folder.lexically_normal() ==
+             std::filesystem::path(L"D:\\Unpacking").lexically_normal(),
+         "Automatic unpack folder should be at the selected install drive root");
+  Expect(AutomaticUnpackFolder(std::filesystem::path(L"relative\\folder")).empty(),
+         "Relative install paths must not produce an automatic unpack folder");
+  Expect(AutomaticUnpackFolder(std::filesystem::path(L"D:relative\\folder")).empty(),
+         "Drive-relative install paths must not produce an automatic unpack folder");
+}
+
 void TestManifestRejectsTraversal() {
   ManifestLoader loader;
   std::string json = ValidManifestJson(Sha256::HexDigest("abc"));
@@ -354,6 +366,194 @@ void TestWindowsMoveRetriesTransientLock() {
   std::filesystem::remove_all(root);
 }
 
+void TestWindowsMoveFallsBackToIndividualLockedEntry() {
+  const auto root = std::filesystem::temp_directory_path() / "modlist_move_fallback";
+  std::filesystem::remove_all(root);
+  const auto source = root / "source";
+  const auto nested = source / "mods" / "example";
+  const auto target = root / "target";
+  std::filesystem::create_directories(nested);
+  const auto lockedFile = nested / "locked.txt";
+  {
+    std::ofstream output(lockedFile, std::ios::binary | std::ios::trunc);
+    output << "locked while directory fallback begins";
+  }
+
+  HANDLE lock = CreateFileW(
+      lockedFile.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+      FILE_ATTRIBUTE_NORMAL, nullptr);
+  Expect(lock != INVALID_HANDLE_VALUE, "Unable to create a directory fallback lock");
+
+  bool fallbackObserved = false;
+  bool fileRetryObserved = false;
+  MoveTreeOptions options;
+  options.maxAttempts = 3;
+  options.retryDelay = std::chrono::milliseconds(1);
+  options.directoryFallbackCallback =
+      [&](const std::filesystem::path&, const std::filesystem::path&, unsigned long error) {
+        fallbackObserved = true;
+        Expect(IsTransientMoveError(error),
+               "Directory fallback reported a non-transient error");
+      };
+  options.retryCallback =
+      [&](const std::filesystem::path& retrySource, const std::filesystem::path&,
+          uint32_t attempt, uint32_t maxAttempts, unsigned long error) {
+        if (retrySource == lockedFile) {
+          fileRetryObserved = true;
+          Expect(attempt == 1, "Unexpected locked-file retry attempt number");
+          Expect(maxAttempts == 3, "Unexpected locked-file retry limit");
+          Expect(IsTransientMoveError(error),
+                 "Locked-file retry reported a non-transient error");
+          CloseHandle(lock);
+          lock = INVALID_HANDLE_VALUE;
+        }
+      };
+
+  const auto result = MovePathTreeWithRetry(source, target, options);
+  if (lock != INVALID_HANDLE_VALUE) {
+    CloseHandle(lock);
+  }
+  Expect(fallbackObserved, "Locked descendant did not trigger directory fallback");
+  Expect(fileRetryObserved, "Directory fallback did not isolate the locked file");
+  Expect(result.ok, "Directory fallback did not recover after the file lock was released");
+  Expect(result.usedDirectoryFallback,
+         "Directory fallback result did not report its recovery path");
+  Expect(std::filesystem::exists(target / "mods" / "example" / "locked.txt"),
+         "Directory fallback did not preserve the locked file");
+  Expect(!std::filesystem::exists(source),
+         "Directory fallback left the source directory behind");
+  std::filesystem::remove_all(root);
+}
+
+void TestPathValidatorRejectsFolderWithoutDeleteAccess() {
+  const auto root = std::filesystem::temp_directory_path() / "modlist_delete_probe";
+  std::filesystem::remove_all(root);
+  std::filesystem::create_directories(root);
+  const auto probeFolder =
+      root / (".modlist_access_probe_" + std::to_string(GetCurrentProcessId()));
+  std::filesystem::create_directories(probeFolder);
+  const auto probe = probeFolder / "probe.tmp";
+  {
+    std::ofstream output(probe, std::ios::binary | std::ios::trunc);
+    output << "pre-existing probe";
+  }
+
+  HANDLE lock = CreateFileW(
+      probe.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+      OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+  Expect(lock != INVALID_HANDLE_VALUE, "Unable to lock the path-validation probe");
+
+  PathValidator validator;
+  const auto result = validator.ValidateInstallFolder(root);
+  CloseHandle(lock);
+  Expect(!result.ok,
+         "Path validator accepted a folder where its probe could not be deleted");
+  std::filesystem::remove_all(root);
+}
+
+void TestPathValidatorAcceptsFolderWithDeleteAccess() {
+  const auto root =
+      std::filesystem::temp_directory_path() / "modlist_delete_probe_allowed";
+  std::filesystem::remove_all(root);
+
+  PathValidator validator;
+  const auto result = validator.ValidateInstallFolder(root);
+  Expect(result.ok,
+         "Path validator rejected a folder with create, rename, and delete access");
+  for (const auto& entry : std::filesystem::directory_iterator(root)) {
+    const auto name = entry.path().filename().wstring();
+    Expect(!name.starts_with(L".modlist_access_probe"),
+           "Path validator left an access-probe artifact behind");
+  }
+  std::filesystem::remove_all(root);
+}
+
+void TestWindowsMoveAcceptsLockedEmptySourceAfterFilesMove() {
+  const auto root =
+      std::filesystem::temp_directory_path() / "modlist_empty_source_lock";
+  std::filesystem::remove_all(root);
+  const auto source = root / "source";
+  const auto target = root / "target";
+  std::filesystem::create_directories(source);
+  {
+    std::ofstream output(source / "payload.txt", std::ios::binary | std::ios::trunc);
+    output << "payload";
+  }
+
+  HANDLE directoryLock = CreateFileW(
+      source.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+      OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+  Expect(directoryLock != INVALID_HANDLE_VALUE,
+         "Unable to lock the source directory during fallback");
+
+  bool cleanupWarningObserved = false;
+  MoveTreeOptions options;
+  options.maxAttempts = 3;
+  options.retryDelay = std::chrono::milliseconds(1);
+  options.sourceCleanupFailureCallback =
+      [&](const std::filesystem::path& cleanupPath, unsigned long error) {
+        cleanupWarningObserved = true;
+        Expect(cleanupPath == source, "Cleanup warning reported the wrong directory");
+        Expect(IsTransientMoveError(error),
+               "Cleanup warning reported a non-transient directory error");
+      };
+
+  const auto result = MovePathTreeWithRetry(source, target, options);
+  CloseHandle(directoryLock);
+  Expect(result.ok, "Moved files were treated as failed because an empty source was locked");
+  Expect(cleanupWarningObserved, "Locked empty source directory was not reported");
+  Expect(std::filesystem::exists(target / "payload.txt"),
+         "Fallback omitted the payload before source cleanup");
+  Expect(std::filesystem::is_empty(source),
+         "Locked source directory retained files after fallback");
+  std::filesystem::remove_all(root);
+}
+
+void TestWindowsMoveAcceptsLockedEmptyNestedSourceAfterFilesMove() {
+  const auto root =
+      std::filesystem::temp_directory_path() / "modlist_empty_nested_source_lock";
+  std::filesystem::remove_all(root);
+  const auto source = root / "source";
+  const auto nestedSource = source / "mods" / "example";
+  const auto target = root / "target";
+  std::filesystem::create_directories(nestedSource);
+  std::filesystem::create_directories(target);
+  {
+    std::ofstream output(nestedSource / "payload.txt",
+                         std::ios::binary | std::ios::trunc);
+    output << "payload";
+  }
+
+  HANDLE directoryLock = CreateFileW(
+      nestedSource.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+      nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+  Expect(directoryLock != INVALID_HANDLE_VALUE,
+         "Unable to lock the nested source directory during fallback");
+
+  bool cleanupWarningObserved = false;
+  MoveTreeOptions options;
+  options.maxAttempts = 3;
+  options.retryDelay = std::chrono::milliseconds(1);
+  options.sourceCleanupFailureCallback =
+      [&](const std::filesystem::path&, unsigned long) {
+        cleanupWarningObserved = true;
+      };
+
+  const auto result = MovePathTreeWithRetry(source, target, options);
+  CloseHandle(directoryLock);
+  Expect(result.ok,
+         "An empty locked nested directory made a completed move fail");
+  Expect(cleanupWarningObserved,
+         "Locked empty nested source directory was not reported");
+  Expect(std::filesystem::exists(target / "mods" / "example" / "payload.txt"),
+         "Nested fallback omitted the payload");
+  Expect(std::filesystem::exists(source / "mods" / "example"),
+         "Test did not preserve the locked empty nested directory");
+  Expect(std::filesystem::is_empty(source / "mods" / "example"),
+         "Locked nested source retained payload files");
+  std::filesystem::remove_all(root);
+}
+
 void TestInstallMoveFailureProvidesManualRecoveryPaths() {
   const std::vector<std::filesystem::path> sourceCandidates = {
       std::filesystem::path(__FILE__).parent_path().parent_path() / "src" / "ui" /
@@ -394,6 +594,38 @@ void TestInstallMoveFailureProvidesManualRecoveryPaths() {
          "Manual recovery message is missing the unpack-folder placeholder");
   Expect(strings.find("{target}") != std::string::npos,
          "Manual recovery message is missing the destination-folder placeholder");
+}
+
+void TestInstallerHidesManualUnpackControls() {
+  const auto sourceRoot = std::filesystem::path(__FILE__).parent_path().parent_path();
+  const auto loadSource = [&](const std::filesystem::path& relative) {
+    const std::vector<std::filesystem::path> candidates = {
+        sourceRoot / relative,
+        std::filesystem::current_path() / relative,
+    };
+    for (const auto& candidate : candidates) {
+      std::ifstream input(candidate, std::ios::binary);
+      if (input) {
+        return std::string(std::istreambuf_iterator<char>(input),
+                           std::istreambuf_iterator<char>());
+      }
+    }
+    return std::string{};
+  };
+
+  const auto appSource = loadSource("src/ui/WinInstallerApp.cpp");
+  const auto viewSource = loadSource("src/ui/NativeInstallerView.cpp");
+  Expect(!appSource.empty() && !viewSource.empty(),
+         "Unable to locate native installer UI sources");
+  Expect(appSource.find("AutomaticUnpackFolder(") != std::string::npos,
+         "Installer does not derive staging from the selected install root");
+  Expect(appSource.find("ShowControl(hwnd, kDrivePickerButton, true)") ==
+             std::string::npos,
+         "Manual unpack-drive picker is still shown");
+  Expect(viewSource.find("state.unpackDriveLabel") == std::string::npos,
+         "Native view still paints the unpack-drive label");
+  Expect(viewSource.find("state.unpackTarget") == std::string::npos,
+         "Native view still paints the manual unpack target");
 }
 
 void TestPipelinedExtractor() {
@@ -614,6 +846,7 @@ int main() {
     TestManifestRejectsUnsafeArchiveName();
     TestPackerManifestInfersArchiveName();
     TestArchiveInstallFolder();
+    TestAutomaticUnpackFolder();
     TestManifestRejectsTraversal();
     TestUnicodeManifestPathSafety();
     TestJsonUnicodeEscapes();
@@ -622,7 +855,13 @@ int main() {
     TestExtractorCommand();
 #ifdef _WIN32
     TestWindowsMoveRetriesTransientLock();
+    TestWindowsMoveFallsBackToIndividualLockedEntry();
+    TestPathValidatorRejectsFolderWithoutDeleteAccess();
+    TestPathValidatorAcceptsFolderWithDeleteAccess();
+    TestWindowsMoveAcceptsLockedEmptySourceAfterFilesMove();
+    TestWindowsMoveAcceptsLockedEmptyNestedSourceAfterFilesMove();
     TestInstallMoveFailureProvidesManualRecoveryPaths();
+    TestInstallerHidesManualUnpackControls();
     TestPipelineDoesNotForcePerFileFlush();
     TestPipelinedExtractor();
 #endif

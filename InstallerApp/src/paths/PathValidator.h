@@ -22,6 +22,8 @@ struct InstallSpacePlan {
 
 uintmax_t ExtractionSpaceRequirement(uintmax_t unpackedBytes);
 InstallSpacePlan PlanInstallSpace(uintmax_t unpackedBytes, bool sameVolume);
+std::filesystem::path AutomaticUnpackFolder(
+    const std::filesystem::path& selectedInstallRoot);
 
 class IPathValidator {
 public:

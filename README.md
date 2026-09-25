@@ -18,7 +18,7 @@ PackerApp/dist/modlist-packer.exe
 Ready-to-use versioned release archives are written to:
 
 ```text
-Release/ModlistInstaller-v0.3.2.zip
+Release/ModlistInstaller-v0.3.3.zip
 ```
 
 Extract the zip and run `modlist-packer.exe`. The archive contains the portable packer, the installer exe beside it, and the editable native CSS theme ready for release-folder creation.
@@ -51,18 +51,18 @@ The installer looks for `data\package\manifest.json` beside the exe and archive 
 - No WebView2, Edge, Electron, .NET, dev server, or remote UI assets.
 - Runtime CSS theme variables control colors, typography, spacing, and core dimensions.
 - Runtime JSON strings control the visible labels, buttons, dialogs, and primary messages.
-- Single-screen installer UI with unpack drive, install root, final archive-named path, progress, status, and log output.
+- Single-screen installer UI with install root, final archive-named path, progress, status, and log output.
 - One-read asynchronous SHA256 validation/extraction for chunked packer manifests: a background reader verifies blocks before an embedded 7-Zip SDK decoder can consume them.
 - Legacy manifests retain the separate full SHA256 pass and command-line 7-Zip extraction path.
 - Archive discovery in `data\downloads`, using the archive filename from `data\package\manifest.json`.
-- Unpack drive selection automatically resolves to `<drive>:\Unpacked`.
+- The selected install root automatically resolves staging to `<drive>:\Unpacking` on the same volume.
 - Unpacked payload size recorded in new manifests for accurate free-space checks.
 - Same-volume installs reserve extraction space once; cross-volume installs also check the destination for the full payload.
 - Existing files in the unpack or final install folder require explicit confirmation before their contents are permanently removed and installation restarts.
 - Before installation, the installer uses the Windows Documents known folder and ensures `My Games\Skyrim Special Edition` and `My Games\Fallout4` exist.
 - Live validation, extraction, and install progress with status text.
 - Same-drive installs use move/cut semantics automatically when possible.
-- Successful installs remove the empty `<drive>:\Unpacked` staging folder.
+- Successful installs remove the empty `<drive>:\Unpacking` staging folder.
 - Embedded 7-Zip command-line and SDK extraction components under `data\tools\7zip`.
 - Full diagnostics under `data\logs`.
 
@@ -73,10 +73,10 @@ The installer looks for `data\package\manifest.json` beside the exe and archive 
 3. Put the manifest at `data\package\manifest.json`.
 4. Keep the editable native theme and text at `data\ui\style.css` and `data\ui\strings.json`; built-in defaults are used if either file is missing or invalid.
 5. Run `modlist-installer.exe`.
-6. Select an unpack drive and install root. The installer creates `<install root>\<archive_name>`.
+6. Select an install root. The installer stages in `<drive>:\Unpacking` and creates `<install root>\<archive_name>`.
 7. Press `Install`.
 
-If `<drive>:\Unpacked` or the final `<install root>\<archive_name>` folder contains files, the installer offers to permanently clear the affected folders before installing. The install root itself may contain other folders. The packer removes older outputs for the selected archive name before building, and rejects source and release folders that overlap.
+If `<drive>:\Unpacking` or the final `<install root>\<archive_name>` folder contains files, the installer offers to permanently clear the affected folders before installing. The install root itself may contain other folders. The packer removes older outputs for the selected archive name before building, and rejects source and release folders that overlap.
 
 ## Build
 

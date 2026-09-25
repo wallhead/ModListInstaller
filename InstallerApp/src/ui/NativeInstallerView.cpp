@@ -362,8 +362,7 @@ NativeInstallerLayout NativeInstallerView::CalculateLayout(HWND hwnd) const {
   const float right = width - theme_.contentPadding;
   const float fieldLeft = left + theme_.labelWidth;
   const float noteTop = theme_.headerHeight + 16.0f;
-  const float driveTop = noteTop + 48.0f;
-  const float installTop = driveTop + theme_.controlHeight + 12.0f;
+  const float installTop = noteTop + 48.0f;
   const float finalTop = installTop + theme_.controlHeight + 12.0f;
   const float statusTop = finalTop + 50.0f;
   const float progressTop = statusTop + 30.0f;
@@ -371,8 +370,7 @@ NativeInstallerLayout NativeInstallerView::CalculateLayout(HWND hwnd) const {
   const float footerTop = height - theme_.footerHeight;
 
   NativeInstallerLayout layout;
-  layout.driveCombo = D2D1::RectF(fieldLeft, driveTop, fieldLeft + 126.0f,
-                                  driveTop + theme_.controlHeight);
+  layout.driveCombo = {};
   layout.installFrame = D2D1::RectF(fieldLeft, installTop, right - 100.0f,
                                     installTop + theme_.controlHeight);
   layout.installEdit = Inset(layout.installFrame, 1.0f);
@@ -458,15 +456,6 @@ void NativeInstallerView::Paint(HWND hwnd, const NativeInstallerViewState& state
   DrawText(target_.Get(), state.unpackNote,
            D2D1::RectF(left, noteTop, right, noteTop + 38.0f), bodyFormat_.Get(),
            muted.Get(), DWRITE_TEXT_ALIGNMENT_LEADING, true);
-
-  DrawText(target_.Get(), state.unpackDriveLabel,
-           D2D1::RectF(left, layout.driveCombo.top, fieldLeft - 12.0f,
-                       layout.driveCombo.bottom),
-           labelFormat_.Get(), text.Get());
-  DrawText(target_.Get(), state.unpackTarget,
-           D2D1::RectF(layout.driveCombo.right + 12.0f, layout.driveCombo.top,
-                       right, layout.driveCombo.bottom),
-           bodyFormat_.Get(), muted.Get());
 
   DrawText(target_.Get(), state.installFolderLabel,
            D2D1::RectF(left, layout.installFrame.top, fieldLeft - 12.0f,

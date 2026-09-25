@@ -41,7 +41,7 @@
 
 namespace {
 
-constexpr const wchar_t* kUnpackFolderName = L"Unpacked";
+constexpr const wchar_t* kUnpackFolderName = L"Unpacking";
 
 constexpr int kDownloadEdit = 1003;
 constexpr int kDownloadBrowse = 1004;
@@ -474,14 +474,8 @@ std::wstring ComboText(HWND combo) {
 }
 
 std::filesystem::path SelectedUnpackFolder() {
-  auto drive = ComboText(g_unpackDriveCombo);
-  if (drive.empty()) {
-    return {};
-  }
-  if (!drive.ends_with(L"\\")) {
-    drive += L"\\";
-  }
-  return std::filesystem::path(drive) / kUnpackFolderName;
+  return modlist::AutomaticUnpackFolder(
+      std::filesystem::path(GetText(g_installEdit)));
 }
 
 void UpdateUnpackTargetLabel() {
@@ -496,12 +490,6 @@ void UpdateUnpackTargetLabel() {
   } else {
     SetText(g_unpackTargetLabel, folder.wstring());
     SendUiPath(L"unpackTarget", folder.wstring());
-  }
-  if (g_mainWindow != nullptr) {
-    const std::wstring drive = ComboText(g_unpackDriveCombo);
-    const auto chooseText = UiText("button_choose", L"Выберите");
-    SetWindowTextW(GetDlgItem(g_mainWindow, kDrivePickerButton),
-                   drive.empty() ? chooseText.c_str() : drive.c_str());
   }
 }
 
@@ -1283,7 +1271,6 @@ void Layout(HWND hwnd) {
     MoveWindow(control, rect.left, rect.top, rect.right - rect.left,
                rect.bottom - rect.top, TRUE);
   };
-  move(GetDlgItem(hwnd, kDrivePickerButton), layout.driveCombo);
   move(g_installEdit, layout.installEdit);
   move(GetDlgItem(hwnd, kInstallBrowse), layout.browseButton);
   move(g_logEdit, layout.logEdit);
@@ -1789,7 +1776,7 @@ void ShowWizardPage(HWND hwnd, WizardPage page) {
   ShowControl(hwnd, kDownloadBrowse, false);
   ShowControl(g_unpackDriveLabel, false);
   ShowControl(g_unpackDriveCombo, false);
-  ShowControl(hwnd, kDrivePickerButton, true);
+  ShowControl(hwnd, kDrivePickerButton, false);
   ShowControl(g_unpackTargetLabel, false);
   ShowControl(g_installLabel, false);
   ShowControl(hwnd, kInstallEdit, true);
@@ -1806,7 +1793,7 @@ void ShowWizardPage(HWND hwnd, WizardPage page) {
   ShowControl(g_previousButton, false);
   ShowControl(g_nextButton, false);
 
-  EnableWindow(GetDlgItem(hwnd, kDrivePickerButton), !running);
+  EnableWindow(GetDlgItem(hwnd, kDrivePickerButton), FALSE);
   EnableWindow(GetDlgItem(hwnd, kInstallBrowse), !running);
   EnableWindow(g_installEdit, !running);
   EnableWindow(GetDlgItem(hwnd, kOpenLogButton), true);
@@ -2266,27 +2253,45 @@ bool MoveWholeEntry(HWND hwnd,
     return false;
   }
 
-  const bool isDirectory = std::filesystem::is_directory(source, ec);
-  if (ec) {
-    error = L"Невозможно проверить источник установки: " + Widen(ec.message());
-    return false;
-  }
-
   constexpr uint32_t kMoveAttempts = 3;
   constexpr auto kMoveRetryDelay = std::chrono::seconds(20);
-  const auto result = modlist::MovePathWithRetry(
-      source, target, !isDirectory, kMoveAttempts, kMoveRetryDelay,
-      [hwnd, &source, &target](uint32_t attempt, uint32_t maxAttempts,
-                              unsigned long windowsError) {
-        PostLog(hwnd, L"Невозможно переместить " + PathToDisplay(source) + L" в " +
-                          PathToDisplay(target) + L" (Windows error " +
+  modlist::MoveTreeOptions options;
+  options.maxAttempts = kMoveAttempts;
+  options.retryDelay = kMoveRetryDelay;
+  options.cancelRequested = [] { return g_stopRequested.load(); };
+  options.retryCallback =
+      [hwnd](const std::filesystem::path& retrySource,
+             const std::filesystem::path& retryTarget,
+             uint32_t attempt, uint32_t maxAttempts, unsigned long windowsError) {
+        PostLog(hwnd, L"Невозможно переместить " + PathToDisplay(retrySource) + L" в " +
+                          PathToDisplay(retryTarget) + L" (Windows error " +
                           std::to_wstring(windowsError) + L"). Повторная попытка " +
                           std::to_wstring(attempt + 1) + L"/" +
                           std::to_wstring(maxAttempts) + L" через 20 секунд.");
-      });
+      };
+  options.directoryFallbackCallback =
+      [hwnd](const std::filesystem::path& fallbackSource,
+             const std::filesystem::path&, unsigned long windowsError) {
+        PostLog(hwnd, L"Не удалось переместить папку целиком (Windows error " +
+                          std::to_wstring(windowsError) + L"): " +
+                          PathToDisplay(fallbackSource) +
+                          L". Файлы будут перемещены по отдельности.");
+      };
+  options.sourceCleanupFailureCallback =
+      [hwnd](const std::filesystem::path& cleanupSource, unsigned long windowsError) {
+        PostLog(hwnd, L"Все файлы перемещены, но не удалось удалить пустую исходную папку: " +
+                          PathToDisplay(cleanupSource) + L" (Windows error " +
+                          std::to_wstring(windowsError) + L").");
+      };
+  const auto result = modlist::MovePathTreeWithRetry(source, target, options);
   if (!result.ok) {
+    if (g_stopRequested.load()) {
+      error = L"Установка остановлена пользователем";
+      return false;
+    }
     manualRecoveryRequired = true;
-    error = L"Невозможно переместить " + PathToDisplay(source) + L" в " + PathToDisplay(target) +
+    error = L"Невозможно переместить " + PathToDisplay(result.source) + L" в " +
+            PathToDisplay(result.target) +
             L" (Windows error " + std::to_wstring(result.error) + L").";
     return false;
   }
@@ -2362,7 +2367,13 @@ bool InstallEntry(HWND hwnd,
     return false;
   }
   std::error_code ec;
-  if (sameDrive && !std::filesystem::exists(target, ec)) {
+  const bool targetExists = std::filesystem::exists(target, ec);
+  if (ec) {
+    manualRecoveryRequired = true;
+    error = L"Невозможно проверить папку назначения: " + Widen(ec.message());
+    return false;
+  }
+  if (sameDrive && !targetExists) {
     const auto movedBytes = EstimateInstallBytes(source, error);
     if (!movedBytes.has_value()) {
       return false;
@@ -2693,8 +2704,8 @@ bool ValidateFolders(const SpaceRequirements& requirements = {},
         }
       }
     }
-  } else {
-    addError(L"Диск для распаковки не выбран.");
+  } else if (!installText.empty()) {
+    addError(L"Не удалось определить диск для распаковки из папки установки.");
   }
 
   if (!installText.empty() && !installFolder.empty()) {
@@ -3047,7 +3058,7 @@ void UnpackOnly(HWND hwnd) {
   const auto unpackFolder = SelectedUnpackFolder();
   const auto installFolder = std::filesystem::path(GetText(g_installEdit));
   if (unpackFolder.empty() || installFolder.empty()) {
-    AppendLog(L"Выберите диск для распаковки и папку для установки перед распаковкой.");
+    AppendLog(L"Выберите папку для установки перед распаковкой.");
     return;
   }
 
@@ -3192,7 +3203,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
           AppendLog(L"Package auto-detect: " + Widen(package.error()));
         }
       }
-      AppendLog(L"Выберите диск для распаковки; папка будет создана как <drive>:\\Unpacked.");
+      AppendLog(L"Папка распаковки будет выбрана автоматически в корне диска установки: <drive>:\\Unpacking.");
       Layout(hwnd);
       ShowWizardPage(hwnd, WizardPage::Activity);
       return 0;
@@ -3202,21 +3213,15 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
     case WM_PAINT: {
       PAINTSTRUCT paint{};
       BeginPaint(hwnd, &paint);
-      const auto unpackFolder = SelectedUnpackFolder();
       const auto finalFolder = FinalInstallFolder(std::filesystem::path(GetText(g_installEdit)));
       modlist::NativeInstallerViewState state;
       state.title = UiText("app_title", L"Modlist Installer Beta");
-      state.version = UiText("app_version", L"Modlist Installer v0.3.2 by WallHead");
+      state.version = UiText("app_version", L"Modlist Installer v0.3.3 by WallHead");
       state.unpackNote = UiText(
           "unpack_note",
-          L"Распаковка должна происходить по короткому пути. После распаковки установщик перенесет все файлы в папку установки.");
-      state.unpackDriveLabel = UiText("unpack_drive_label", L"Диск для распаковки");
+          L"Установщик автоматически распакует файлы во временную папку в корне выбранного диска, затем перенесет их в итоговую папку.");
       state.installFolderLabel = UiText("install_folder_label", L"Папка установки");
       state.finalPathLabel = UiText("final_path_label", L"Итоговый путь");
-      state.unpackTarget = unpackFolder.empty()
-                               ? UiText("unpack_target_empty", L"Выберите диск")
-                               : g_strings.Format("unpack_target_format", L"Папка: {path}",
-                                                  {{L"path", unpackFolder.wstring()}});
       state.finalInstallFolder = finalFolder.empty()
                                      ? UiText("final_path_empty", L"Выберите папку установки")
                                      : finalFolder.wstring();
@@ -3327,6 +3332,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
       } else if (id == kDrivePickerButton) {
         ShowDriveMenu(hwnd);
       } else if (id == kInstallEdit && HIWORD(wParam) == EN_CHANGE) {
+        UpdateUnpackTargetLabel();
         InvalidateRect(hwnd, nullptr, FALSE);
       } else if (id == kOpenLogButton) {
         OpenLogFile();

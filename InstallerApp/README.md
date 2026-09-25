@@ -48,9 +48,9 @@ The `Install` button runs the install pipeline on a background thread:
 - run 7-Zip inside a memory-limited child process so oversized archives fail cleanly instead of exhausting system RAM
 - extract with bundled 7-Zip into the selected install folder
 
-The GUI is a single native Direct2D/DirectWrite installer screen with unpack drive, final install folder, progress, and log output.
+The GUI is a single native Direct2D/DirectWrite installer screen with the install root, final install folder, progress, and log output.
 
-The unpack drive selector asks only for a drive letter. The app derives the unpack target as `<drive>:\Unpacked`, for example `X:\Unpacked`.
+The app derives the unpack target from the selected install root and stages at `<drive>:\Unpacking`, for example `X:\Unpacking`. Choosing `D:\Folder1\folder2\folder3` installs into `D:\Folder1\folder2\folder3\<archive_name>` after staging on `D:`.
 
 The unpack and install folders must be empty before installation begins. On different volumes, the installer also requires enough destination space for the full unpacked payload. Manifests without `unpacked_size` remain supported and use the archive size as an approximate compatibility fallback.
 

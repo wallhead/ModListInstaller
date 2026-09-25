@@ -1,6 +1,7 @@
 #include "paths/PathValidator.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cctype>
 #include <cwctype>
 #include <fstream>
@@ -81,16 +82,60 @@ bool CanWriteProbe(const std::filesystem::path& folder) {
   if (ec) {
     return false;
   }
-  const auto probe = folder / ".modlist_write_probe";
+
+#ifdef _WIN32
+  const auto suffix = std::to_string(GetCurrentProcessId());
+#else
+  const auto suffix = std::to_string(
+      std::chrono::steady_clock::now().time_since_epoch().count());
+#endif
+  const auto probeFolder = folder / (".modlist_access_probe_" + suffix);
+  const auto movedProbeFolder = folder / (".modlist_access_probe_moved_" + suffix);
+  std::filesystem::remove_all(probeFolder, ec);
+  if (ec) {
+    return false;
+  }
+  std::filesystem::remove_all(movedProbeFolder, ec);
+  if (ec) {
+    return false;
+  }
+  std::filesystem::create_directory(probeFolder, ec);
+  if (ec) {
+    return false;
+  }
+
+  const auto probe = probeFolder / "probe.tmp";
+  const auto renamedProbe = probeFolder / "probe.renamed";
   {
     std::ofstream out(probe, std::ios::binary);
     if (!out) {
+      std::filesystem::remove_all(probeFolder, ec);
       return false;
     }
     out << "probe";
+    if (!out) {
+      out.close();
+      std::filesystem::remove_all(probeFolder, ec);
+      return false;
+    }
   }
-  std::filesystem::remove(probe, ec);
-  return true;
+  std::filesystem::rename(probe, renamedProbe, ec);
+  if (ec) {
+    std::filesystem::remove_all(probeFolder, ec);
+    return false;
+  }
+  std::filesystem::remove(renamedProbe, ec);
+  if (ec) {
+    std::filesystem::remove_all(probeFolder, ec);
+    return false;
+  }
+  std::filesystem::rename(probeFolder, movedProbeFolder, ec);
+  if (ec) {
+    std::filesystem::remove_all(probeFolder, ec);
+    return false;
+  }
+  std::filesystem::remove(movedProbeFolder, ec);
+  return !ec;
 }
 
 }  // namespace
@@ -112,6 +157,15 @@ InstallSpacePlan PlanInstallSpace(uintmax_t unpackedBytes, bool sameVolume) {
   plan.unpackRequiredBytes = ExtractionSpaceRequirement(unpackedBytes);
   plan.installRequiredBytes = sameVolume ? 0 : unpackedBytes;
   return plan;
+}
+
+std::filesystem::path AutomaticUnpackFolder(
+    const std::filesystem::path& selectedInstallRoot) {
+  if (selectedInstallRoot.empty() || !selectedInstallRoot.has_root_directory()) {
+    return {};
+  }
+  const auto root = selectedInstallRoot.root_path();
+  return root.empty() ? std::filesystem::path{} : root / "Unpacking";
 }
 
 PathValidator::PathValidator(size_t maxRecommendedInstallPathLength)

@@ -1,5 +1,5 @@
 set_project("ModlistInstaller")
-set_version("0.3.2")
+set_version("0.3.3")
 
 add_rules("mode.debug", "mode.release")
 set_languages("c++20")
