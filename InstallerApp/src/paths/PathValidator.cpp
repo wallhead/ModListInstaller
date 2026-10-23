@@ -1,4 +1,5 @@
 #include "paths/PathValidator.h"
+#include "manifest/Manifest.h"
 
 #include <algorithm>
 #include <chrono>
@@ -140,6 +141,42 @@ bool CanWriteProbe(const std::filesystem::path& folder) {
 
 }  // namespace
 
+bool IsSafeArchiveOutputPath(const std::filesystem::path& path) {
+  if (!IsSafeManifestRelativePath(path) || path.native().find('\0') != path.native().npos) {
+    return false;
+  }
+  for (const auto& part : path) {
+    const auto utf8 = part.u8string();
+    if (!IsSafeArchiveFolderName(std::string(
+            reinterpret_cast<const char*>(utf8.data()), utf8.size()))) {
+      return false;
+    }
+  }
+  return true;
+}
+
+Result<ExtractionPathPlan> PlanArchiveExtraction(
+    const std::filesystem::path& finalFolder,
+    const std::filesystem::path& stagingFolder,
+    std::span<const std::filesystem::path> entries) {
+  if (!finalFolder.is_absolute() || !stagingFolder.is_absolute()) {
+    return Result<ExtractionPathPlan>::Error("Extraction folders must be fully qualified absolute paths");
+  }
+  ExtractionPathPlan plan;
+  plan.entryCount = entries.size();
+  for (const auto& relative : entries) {
+    if (!IsSafeArchiveOutputPath(relative)) {
+      return Result<ExtractionPathPlan>::Error("7-Zip archive contains an unsafe output path");
+    }
+    // Windows paths are measured in UTF-16 code units, including the archive folder.
+    const size_t length = (finalFolder / relative).lexically_normal().wstring().size();
+    plan.longestFinalPath = std::max(plan.longestFinalPath, length);
+  }
+  plan.direct = !entries.empty() && plan.longestFinalPath <= kDirectExtractionPathBudget;
+  plan.folder = plan.direct ? finalFolder : stagingFolder;
+  return Result<ExtractionPathPlan>::Ok(std::move(plan));
+}
+
 uintmax_t ExtractionSpaceRequirement(uintmax_t unpackedBytes) {
   if (unpackedBytes == 0) {
     return 0;
@@ -161,7 +198,7 @@ InstallSpacePlan PlanInstallSpace(uintmax_t unpackedBytes, bool sameVolume) {
 
 std::filesystem::path AutomaticUnpackFolder(
     const std::filesystem::path& selectedInstallRoot) {
-  if (selectedInstallRoot.empty() || !selectedInstallRoot.has_root_directory()) {
+  if (!selectedInstallRoot.is_absolute()) {
     return {};
   }
   const auto root = selectedInstallRoot.root_path();

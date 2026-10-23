@@ -204,20 +204,6 @@ bool EndsWithDigits(const std::string& value) {
          });
 }
 
-bool IsSafeOutputPath(const std::filesystem::path& path) {
-  if (!IsSafeManifestRelativePath(path)) {
-    return false;
-  }
-  for (const auto& part : path) {
-    const auto utf8 = part.u8string();
-    const std::string name(reinterpret_cast<const char*>(utf8.data()), utf8.size());
-    if (!IsSafeArchiveFolderName(name)) {
-      return false;
-    }
-  }
-  return true;
-}
-
 std::vector<const ManifestFile*> ArchiveVolumes(const Manifest& manifest) {
   std::vector<const ManifestFile*> volumes;
   const std::string first = manifest.extract.firstArchivePart.generic_string();
@@ -344,6 +330,132 @@ struct VolumeHandle {
   uint64_t size{0};
   HANDLE handle{INVALID_HANDLE_VALUE};
 };
+
+// Metadata inspection needs seekable access to split volumes, without reading the payload.
+class ArchiveHeaderStream final : public IInStream, private ComRefCount {
+public:
+  explicit ArchiveHeaderStream(const PipelinedExtractionConfig& config)
+      : cancelRequested_(config.cancelRequested) {
+    for (const auto* volume : ArchiveVolumes(*config.manifest)) {
+      if (!IsSafeManifestRelativePath(volume->path) ||
+          volume->size > static_cast<uint64_t>(std::numeric_limits<Int64>::max()) - totalSize_) {
+        return;
+      }
+      const auto path = config.archiveFolder / volume->path;
+      std::error_code ec;
+      if (std::filesystem::file_size(path, ec) != volume->size || ec) {
+        return;
+      }
+      files_.emplace_back(path, std::ios::binary);
+      if (!files_.back()) {
+        return;
+      }
+      ends_.push_back(totalSize_ + volume->size);
+      totalSize_ += volume->size;
+    }
+    ready_ = !files_.empty();
+  }
+
+  bool Ready() const { return ready_; }
+  HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void** object) override {
+    if (object == nullptr) {
+      return E_POINTER;
+    }
+    *object = nullptr;
+    if (!EqualInterface(iid, IID_IUnknown) && !EqualInterface(iid, kIidSequentialInStream) &&
+        !EqualInterface(iid, kIidInStream)) {
+      return E_NOINTERFACE;
+    }
+    *object = static_cast<IInStream*>(this);
+    AddRef();
+    return S_OK;
+  }
+  ULONG STDMETHODCALLTYPE AddRef() override { return AddRefImpl(); }
+  ULONG STDMETHODCALLTYPE Release() override { return ReleaseImpl(); }
+
+  HRESULT STDMETHODCALLTYPE Read(void* data, UInt32 size, UInt32* processedSize) override {
+    UInt32 processed = 0;
+    if (processedSize != nullptr) {
+      *processedSize = 0;
+    }
+    while (processed < size && position_ < totalSize_) {
+      if (cancelRequested_ != nullptr && cancelRequested_->load()) {
+        return E_ABORT;
+      }
+      const size_t index = static_cast<size_t>(
+          std::upper_bound(ends_.begin(), ends_.end(), position_) - ends_.begin());
+      const uint64_t start = index == 0 ? 0 : ends_[index - 1];
+      const auto count = static_cast<UInt32>(std::min<uint64_t>(size - processed, ends_[index] - position_));
+      auto& file = files_[index];
+      file.clear();
+      file.seekg(static_cast<std::streamoff>(position_ - start));
+      file.read(static_cast<char*>(data) + processed, count);
+      if (file.gcount() != count) {
+        return E_FAIL;
+      }
+      position_ += count;
+      processed += count;
+      if (processedSize != nullptr) {
+        *processedSize = processed;
+      }
+    }
+    return S_OK;
+  }
+
+  HRESULT STDMETHODCALLTYPE Seek(Int64 offset, UInt32 origin, UInt64* newPosition) override {
+    if (origin > STREAM_SEEK_END) {
+      return STG_E_INVALIDFUNCTION;
+    }
+    const Int64 base = origin == STREAM_SEEK_SET ? 0 :
+        static_cast<Int64>(origin == STREAM_SEEK_CUR ? position_ : totalSize_);
+    if ((offset < 0 && offset < -base) ||
+        (offset > 0 && base > std::numeric_limits<Int64>::max() - offset)) {
+      return HRESULT_FROM_WIN32(ERROR_NEGATIVE_SEEK);
+    }
+    position_ = static_cast<UInt64>(base + offset);
+    if (newPosition != nullptr) {
+      *newPosition = position_;
+    }
+    return S_OK;
+  }
+
+private:
+  std::vector<std::ifstream> files_;
+  std::vector<uint64_t> ends_;
+  const std::atomic_bool* cancelRequested_;
+  uint64_t totalSize_{0};
+  uint64_t position_{0};
+  bool ready_{false};
+};
+
+Result<std::vector<std::filesystem::path>> ReadArchivePaths(
+    IInArchive* archive, const std::atomic_bool* cancelRequested) {
+  using PathsResult = Result<std::vector<std::filesystem::path>>;
+  UInt32 count = 0;
+  if (FAILED(archive->GetNumberOfItems(&count))) {
+    return PathsResult::Error("Unable to read the archive entry count");
+  }
+  std::vector<std::filesystem::path> paths;
+  for (UInt32 index = 0; index < count; ++index) {
+    if (cancelRequested != nullptr && cancelRequested->load()) {
+      return PathsResult::Error("Archive path inspection was cancelled");
+    }
+    PROPVARIANT value{};
+    PropVariantInit(&value);
+    const auto status = archive->GetProperty(index, kPropPath, &value);
+    if (FAILED(status) || value.vt != VT_BSTR || value.bstrVal == nullptr) {
+      PropVariantClear(&value);
+      return PathsResult::Error("7-Zip archive item has no valid path");
+    }
+    const std::filesystem::path path(std::wstring(value.bstrVal, SysStringLen(value.bstrVal)));
+    PropVariantClear(&value);
+    if (!IsSafeArchiveOutputPath(path)) {
+      return PathsResult::Error("7-Zip archive contains an unsafe output path: " + PathToUtf8(path));
+    }
+    paths.push_back(path);
+  }
+  return PathsResult::Ok(std::move(paths));
+}
 
 struct ChunkLocation {
   size_t volumeIndex{0};
@@ -1044,7 +1156,7 @@ public:
     }
     const std::filesystem::path relative(pathProperty.bstrVal);
     PropVariantClear(&pathProperty);
-    if (!IsSafeOutputPath(relative)) {
+    if (!IsSafeArchiveOutputPath(relative)) {
       error_ = "7-Zip archive contains an unsafe output path: " + PathToUtf8(relative);
       return E_FAIL;
     }
@@ -1186,6 +1298,54 @@ Result<std::filesystem::path> PipelinedSevenZipExtractor::LocateLibrary(
       "7z.dll is unavailable: " + embedded.error());
 }
 
+Result<ExtractionPathPlan> PipelinedSevenZipExtractor::PlanExtraction(
+    const PipelinedExtractionConfig& config,
+    const std::filesystem::path& finalFolder,
+    const std::filesystem::path& stagingFolder) const {
+  using PlanResult = Result<ExtractionPathPlan>;
+  if (config.manifest == nullptr || ArchiveVolumes(*config.manifest).empty()) {
+    return PlanResult::Error("No archive volumes are available for path inspection");
+  }
+  HMODULE library = LoadLibraryExW(config.sevenZipLibrary.c_str(), nullptr,
+      LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+  if (library == nullptr) {
+    return PlanResult::Error("Unable to load 7z.dll for archive path inspection");
+  }
+  // Keep the SDK loaded until all its COM objects have been released.
+  struct LibraryGuard {
+    HMODULE module;
+    ~LibraryGuard() { FreeLibrary(module); }
+  } guard{library};
+  const auto createObject = reinterpret_cast<CreateObjectFn>(GetProcAddress(library, "CreateObject"));
+  if (createObject == nullptr) {
+    return PlanResult::Error("7z.dll does not export CreateObject");
+  }
+  IInArchive* rawArchive = nullptr;
+  const auto created = createObject(&kClsid7zFormat, &kIidInArchive,
+                                    reinterpret_cast<void**>(&rawArchive));
+  ComPtr<IInArchive> archive(rawArchive);
+  if (FAILED(created) || !archive) {
+    return PlanResult::Error("Unable to create the archive path inspector");
+  }
+  auto* headerStream = new ArchiveHeaderStream(config);
+  ComPtr<IInStream> stream(headerStream);
+  if (!headerStream->Ready()) {
+    return PlanResult::Error("Unable to open archive volumes for path inspection");
+  }
+  ComPtr<IArchiveOpenCallback> callback(new ArchiveOpenCallback());
+  const UInt64 start = 0;
+  if (FAILED(archive->Open(stream.Get(), &start, callback.Get()))) {
+    archive->Close();
+    return PlanResult::Error("Unable to read archive paths; short staging folder will be used");
+  }
+  auto paths = ReadArchivePaths(archive.Get(), config.cancelRequested);
+  archive->Close();
+  if (!paths.ok()) {
+    return PlanResult::Error(paths.error());
+  }
+  return PlanArchiveExtraction(finalFolder, stagingFolder, paths.value());
+}
+
 ExtractionResult PipelinedSevenZipExtractor::Extract(
     const PipelinedExtractionConfig& config,
     ProgressCallback progressCallback) const {
@@ -1196,13 +1356,6 @@ ExtractionResult PipelinedSevenZipExtractor::Extract(
     result.message = "Manifest does not support pipelined chunk validation";
     return result;
   }
-  std::error_code ec;
-  std::filesystem::create_directories(config.installFolder, ec);
-  if (ec) {
-    result.message = "Unable to create extraction folder: " + ec.message();
-    return result;
-  }
-
   HMODULE library = LoadLibraryExW(
       config.sevenZipLibrary.c_str(), nullptr,
       LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
@@ -1251,12 +1404,36 @@ ExtractionResult PipelinedSevenZipExtractor::Extract(
         ? "7-Zip could not open the verified virtual archive"
         : rawStream->Error();
   } else {
+    if (config.maxOutputPathLength > 0) {
+      const auto paths = ReadArchivePaths(archive.Get(), config.cancelRequested);
+      if (!paths.ok()) {
+        result.message = paths.error();
+        operation = E_FAIL;
+      } else {
+        const auto plan = PlanArchiveExtraction(config.installFolder, config.installFolder, paths.value());
+        if (!plan.ok() || plan.value().longestFinalPath > config.maxOutputPathLength) {
+          result.message = "Archive paths changed or exceed the direct extraction path budget";
+          operation = E_FAIL;
+        }
+      }
+    }
+    std::error_code ec;
+    if (SUCCEEDED(operation)) {
+      std::filesystem::create_directories(config.installFolder, ec);
+      if (ec) {
+        result.message = "Unable to create extraction folder: " + ec.message();
+        operation = E_FAIL;
+      }
+    }
     ISetProperties* rawProperties = nullptr;
-    const HRESULT propertiesInterface = archive->QueryInterface(
-        kIidSetProperties, reinterpret_cast<void**>(&rawProperties));
+    const HRESULT propertiesInterface = SUCCEEDED(operation) ? archive->QueryInterface(
+        kIidSetProperties, reinterpret_cast<void**>(&rawProperties))
+        : operation;
     ComPtr<ISetProperties> properties(rawProperties);
     if (FAILED(propertiesInterface) || !properties) {
-      result.message = "7-Zip SDK does not expose decoder configuration";
+      if (result.message.empty()) {
+        result.message = "7-Zip SDK does not expose decoder configuration";
+      }
       operation = E_NOINTERFACE;
     } else {
       const wchar_t* names[] = {L"mt"};

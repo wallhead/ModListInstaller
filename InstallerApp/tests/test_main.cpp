@@ -172,6 +172,36 @@ void TestAutomaticUnpackFolder() {
          "Relative install paths must not produce an automatic unpack folder");
   Expect(AutomaticUnpackFolder(std::filesystem::path(L"D:relative\\folder")).empty(),
          "Drive-relative install paths must not produce an automatic unpack folder");
+  Expect(AutomaticUnpackFolder(std::filesystem::path(L"\\Games")).empty(),
+         "Root-relative install paths must not produce an automatic unpack folder");
+}
+
+void TestArchiveExtractionPlan() {
+  const std::filesystem::path finalFolder = L"D:\\Games\\Sky";
+  const std::filesystem::path staging = L"D:\\Unpacking";
+  const size_t prefix = finalFolder.wstring().size() + 1;
+  std::vector<std::filesystem::path> entries{
+      std::filesystem::path(std::wstring(240 - prefix, L'a'))};
+  auto plan = PlanArchiveExtraction(finalFolder, staging, entries);
+  Expect(plan.ok() && plan.value().direct && plan.value().folder == finalFolder,
+         "A full extracted path of exactly 240 characters should extract directly");
+  Expect(plan.value().longestFinalPath == 240, "Plan should include the final folder and separator");
+  Expect(!PlanArchiveExtraction(L"\\Games\\Sky", staging, entries).ok(),
+         "Root-relative destinations must not underestimate the full path length");
+  entries.emplace_back(std::wstring(241 - prefix, L'b'));
+  plan = PlanArchiveExtraction(finalFolder, staging, entries);
+  Expect(plan.ok() && !plan.value().direct && plan.value().folder == staging,
+         "Any entry over 240 characters should use staging");
+  entries = {std::filesystem::path(std::wstring(240 - prefix, L'\u0416'))};
+  plan = PlanArchiveExtraction(finalFolder, staging, entries);
+  Expect(plan.ok() && plan.value().direct,
+         "Unicode path length should count UTF-16 units rather than UTF-8 bytes");
+  entries = {"../escape.bin"};
+  Expect(!PlanArchiveExtraction(finalFolder, staging, entries).ok(),
+         "Unsafe archive paths must fail before extraction");
+  entries.clear();
+  plan = PlanArchiveExtraction(finalFolder, staging, entries);
+  Expect(plan.ok() && !plan.value().direct, "An empty listing should use staging");
 }
 
 void TestManifestRejectsTraversal() {
@@ -710,6 +740,48 @@ void TestPipelinedExtractor() {
   config.archiveFolder = archives;
   config.installFolder = output;
   config.manifest = &manifest;
+  const auto unusedStaging = root / "unused-staging";
+  std::filesystem::create_directory(unusedStaging);
+  {
+    std::ofstream sentinel(unusedStaging / "keep.txt");
+    sentinel << "unrelated staging content";
+  }
+  const auto directPlan = extractor.PlanExtraction(config, output, unusedStaging);
+  Expect(directPlan.ok(), directPlan.error().c_str());
+  Expect(directPlan.value().direct && directPlan.value().folder == output,
+         "Real split archive should select direct extraction for a short destination");
+  Expect(!std::filesystem::exists(output), "Inspecting archive paths must not create the destination");
+  auto missingConfig = config;
+  missingConfig.archiveFolder = root / "missing-archives";
+  Expect(!extractor.PlanExtraction(missingConfig, output, root / "Unpacking").ok(),
+         "Unavailable archive metadata must not produce a direct extraction plan");
+  const auto longDestination = root / std::wstring(210, L'x');
+  const auto stagedPlan = extractor.PlanExtraction(config, longDestination, root / "Unpacking");
+  Expect(stagedPlan.ok() && !stagedPlan.value().direct &&
+             stagedPlan.value().folder == root / "Unpacking",
+         "Real archive paths should select staging for a long destination");
+  auto legacyManifest = manifest;
+  legacyManifest.hashChunkSize = 0;
+  for (auto& file : legacyManifest.files) {
+    file.chunkSha256.clear();
+  }
+  auto legacyConfig = config;
+  legacyConfig.manifest = &legacyManifest;
+  const auto legacyPlan = extractor.PlanExtraction(legacyConfig, output, root / "Unpacking");
+  Expect(legacyPlan.ok() && legacyPlan.value().direct,
+         "Path inspection should also support legacy split manifests without chunk hashes");
+  std::atomic_bool cancelled{true};
+  auto cancelledConfig = config;
+  cancelledConfig.cancelRequested = &cancelled;
+  Expect(!extractor.PlanExtraction(cancelledConfig, output, root / "Unpacking").ok(),
+         "Cancelling path inspection must stop installation planning");
+  auto rejectedConfig = config;
+  rejectedConfig.installFolder = longDestination;
+  rejectedConfig.maxOutputPathLength = 240;
+  const auto rejectedResult = extractor.Extract(rejectedConfig);
+  Expect(!rejectedResult.ok && !std::filesystem::exists(longDestination),
+         "Direct extraction must recheck all paths before creating the output folder");
+  config.maxOutputPathLength = 240;
   PipelineExtractionProgress lastProgress;
   std::vector<bool> reportedArchives(parts.size(), false);
   std::vector<bool> extractedArchives(parts.size(), false);
@@ -725,6 +797,14 @@ void TestPipelinedExtractor() {
     }
   });
   Expect(result.ok, result.message.c_str());
+  {
+    std::ifstream sentinel(unusedStaging / "keep.txt");
+    std::string contents((std::istreambuf_iterator<char>(sentinel)), std::istreambuf_iterator<char>());
+    Expect(contents == "unrelated staging content" &&
+               std::distance(std::filesystem::directory_iterator(unusedStaging),
+                             std::filesystem::directory_iterator{}) == 1,
+           "Direct extraction must preserve a populated unused staging folder");
+  }
   Expect(lastProgress.validatedBytes == lastProgress.validationTotalBytes,
          "Pipeline should validate every archive byte");
   Expect(std::all_of(reportedArchives.begin(), reportedArchives.end(), [](bool reported) {
@@ -749,6 +829,16 @@ void TestPipelinedExtractor() {
     Expect(contents.str() == "small-file-" + std::to_string(index),
            "Pipelined extraction small-file payload mismatch");
   }
+
+  auto stagedConfig = config;
+  stagedConfig.installFolder = stagedPlan.value().folder;
+  stagedConfig.maxOutputPathLength = 0;
+  const auto stagedResult = extractor.Extract(stagedConfig);
+  Expect(stagedResult.ok, stagedResult.message.c_str());
+  const auto stagedHash = Sha256::FileHexDigest(stagedConfig.installFolder / payload.filename());
+  Expect(stagedHash.ok() && stagedHash.value() == sourceHash.value(),
+         "Staging fallback should extract the same payload as direct extraction");
+  Expect(!std::filesystem::exists(longDestination), "Staged extraction must leave the final folder untouched");
 
   const auto corruptedPart = parts[1];
   {
@@ -839,6 +929,10 @@ void TestSameVolumeDetection() {
 
 int main() {
   try {
+#ifdef _WIN32
+    Expect(FindResourceW(nullptr, MAKEINTRESOURCEW(1), MAKEINTRESOURCEW(24)) != nullptr,
+           "Windows application manifest must be embedded as resource type 24");
+#endif
     TestSha256();
     TestManifestLoader();
     TestPackerManifestLoader();
@@ -847,6 +941,7 @@ int main() {
     TestPackerManifestInfersArchiveName();
     TestArchiveInstallFolder();
     TestAutomaticUnpackFolder();
+    TestArchiveExtractionPlan();
     TestManifestRejectsTraversal();
     TestUnicodeManifestPathSafety();
     TestJsonUnicodeEscapes();

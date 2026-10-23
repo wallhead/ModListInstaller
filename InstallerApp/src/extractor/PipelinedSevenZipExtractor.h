@@ -3,6 +3,7 @@
 #include "common/Result.h"
 #include "extractor/SevenZipExtractor.h"
 #include "manifest/Manifest.h"
+#include "paths/PathValidator.h"
 
 #include <atomic>
 #include <cstdint>
@@ -32,6 +33,7 @@ struct PipelinedExtractionConfig {
   const Manifest* manifest{nullptr};
   const std::atomic_bool* cancelRequested{nullptr};
   uint32_t decoderThreads{4};
+  size_t maxOutputPathLength{0};
 };
 
 class PipelinedSevenZipExtractor {
@@ -40,6 +42,10 @@ public:
 
   static bool CanUse(const Manifest& manifest);
   Result<std::filesystem::path> LocateLibrary(const std::filesystem::path& appRoot) const;
+  Result<ExtractionPathPlan> PlanExtraction(
+      const PipelinedExtractionConfig& config,
+      const std::filesystem::path& finalFolder,
+      const std::filesystem::path& stagingFolder) const;
   ExtractionResult Extract(
       const PipelinedExtractionConfig& config,
       ProgressCallback progressCallback = {}) const;

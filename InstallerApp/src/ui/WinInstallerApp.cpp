@@ -67,6 +67,14 @@ constexpr UINT kWorkerFinishedMessage = WM_APP + 3;
 constexpr UINT kStatusMessage = WM_APP + 4;
 constexpr UINT kValidationFailedMessage = WM_APP + 5;
 constexpr UINT kInstallFilesFailedMessage = WM_APP + 6;
+constexpr UINT kExtractionPlanMessage = WM_APP + 7;
+
+struct PreparedExtraction {
+  modlist::PackageDiscovery package;
+  std::filesystem::path installFolder;
+  modlist::ExtractionPathPlan plan;
+  std::string inspectionError;
+};
 
 struct ManualInstallRequiredData {
   std::filesystem::path source;
@@ -2443,7 +2451,14 @@ bool InstallExtractedFiles(HWND hwnd, const std::filesystem::path& unpackFolder,
   PostProgress(hwnd, 95);
   PostStatus(hwnd, L"Установка 0%");
   if (IsSameFolder(unpackFolder, installFolder)) {
+    std::error_code ec;
+    std::filesystem::remove_all(modlist::SameDiskTempPath(installFolder), ec);
+    if (ec) {
+      PostLog(hwnd, L"Невозможно удалить временную папку: " + Widen(ec.message()));
+      return false;
+    }
     PostLog(hwnd, L"Папка установки является папкой распаковки; перемещение не требуется");
+    PostLog(hwnd, L"Установка выполнена");
     PostProgress(hwnd, 100);
     PostStatus(hwnd, L"Установка 100%");
     return true;
@@ -2636,6 +2651,8 @@ void RunInstallWorker(HWND hwnd,
     extraction.sevenZipLibrary = pipelineLibrary.value();
     extraction.archiveFolder = ArchiveFolder();
     extraction.installFolder = unpackFolder;
+    extraction.maxOutputPathLength = IsSameFolder(unpackFolder, installFolder)
+        ? modlist::kDirectExtractionPathBudget : 0;
     extraction.manifest = &*manifest;
     extraction.cancelRequested = &g_stopRequested;
     extracted = RunPipelinedExtractionStep(hwnd, extraction, 0, 95);
@@ -2663,7 +2680,8 @@ void RunInstallWorker(HWND hwnd,
 }
 
 bool ValidateFolders(const SpaceRequirements& requirements = {},
-                     bool allowCleanupPrompt = false) {
+                     bool allowCleanupPrompt = false,
+                     const std::filesystem::path& extractionFolder = {}) {
   modlist::PathValidator validator;
   bool ok = true;
   std::vector<std::wstring> errors;
@@ -2680,7 +2698,7 @@ bool ValidateFolders(const SpaceRequirements& requirements = {},
   const auto installText = GetText(g_installEdit);
   const auto selectedInstallRoot = std::filesystem::path(installText);
   const auto installFolder = FinalInstallFolder(selectedInstallRoot);
-  const auto unpackFolder = SelectedUnpackFolder();
+  const auto unpackFolder = extractionFolder.empty() ? SelectedUnpackFolder() : extractionFolder;
   if (!unpackFolder.empty()) {
     const auto result = validator.ValidateInstallFolder(unpackFolder);
     AppendLog(L"Unpack folder: " + PathToDisplay(unpackFolder) + L" - " + Widen(result.message));
@@ -2697,7 +2715,11 @@ bool ValidateFolders(const SpaceRequirements& requirements = {},
         if (allowCleanupPrompt && IsExistingNonEmptyDirectory(unpackFolder)) {
           AppendLog(message);
           cleanupErrors.push_back(message);
-          pendingCleanup.unpackFolder = unpackFolder;
+          if (IsSameFolder(unpackFolder, installFolder)) {
+            pendingCleanup.installFolder = installFolder;
+          } else {
+            pendingCleanup.unpackFolder = unpackFolder;
+          }
           ok = false;
         } else {
           addError(message);
@@ -2754,7 +2776,9 @@ bool ValidateFolders(const SpaceRequirements& requirements = {},
         ok = false;
       }
     } else if (requirements.unpackedBytes > 0) {
-      AppendLog(L"Папки находятся на одном томе: установка будет перемещением и не требует второй полной копии.");
+      AppendLog(IsSameFolder(unpackFolder, installFolder)
+          ? L"Распаковка прямо в папку установки; вторая полная копия не требуется."
+          : L"Папки находятся на одном томе: установка будет перемещением и не требует второй полной копии.");
     }
   }
 
@@ -2877,22 +2901,48 @@ void StartInstall(HWND hwnd) {
   }
   g_archiveFolderName = Widen(manifest->archiveName);
   SendUiState();
-  const auto requirements = EstimateSpaceRequirements(package.value());
-  if (!ValidateFolders(requirements, true)) {
-    if (!g_pendingFolderCleanup.has_value()) {
-      AppendLog(L"Исправьте ошибки перед началом.");
-    }
-    return;
-  }
-
-  const auto unpackFolder = SelectedUnpackFolder();
   const auto installFolder =
       FinalInstallFolder(std::filesystem::path(GetText(g_installEdit)));
+  const auto unpackFolder = modlist::AutomaticUnpackFolder(installFolder);
+  if (installFolder.empty() || unpackFolder.empty()) {
+    SendUiError(UiText("path_error_title", L"Ошибка пути"),
+                L"Выберите полную папку установки на диске.");
+    return;
+  }
   g_stopRequested = false;
   g_workerRunning = true;
   SetControlsRunning(hwnd, true);
   g_closeAfterWorker = false;
-  std::thread(RunInstallWorker, hwnd, std::move(package.value()), unpackFolder, installFolder).detach();
+  PostStatus(hwnd, L"Проверка путей в архиве...");
+  AppendLog(L"Проверка путей всех файлов и папок в архиве перед распаковкой...");
+  std::thread([hwnd, package = std::move(package.value()), manifest = std::move(*manifest),
+               installFolder, unpackFolder]() mutable {
+    auto prepared = std::make_unique<PreparedExtraction>();
+    prepared->package = std::move(package);
+    prepared->installFolder = installFolder;
+    prepared->plan.folder = unpackFolder;
+    modlist::PipelinedSevenZipExtractor inspector;
+    const auto library = inspector.LocateLibrary(ExeFolder());
+    if (library.ok()) {
+      modlist::PipelinedExtractionConfig config;
+      config.sevenZipLibrary = library.value();
+      config.archiveFolder = ArchiveFolder();
+      config.manifest = &manifest;
+      config.cancelRequested = &g_stopRequested;
+      const auto plan = inspector.PlanExtraction(config, installFolder, unpackFolder);
+      if (plan.ok()) {
+        prepared->plan = plan.value();
+      } else {
+        prepared->inspectionError = plan.error();
+      }
+    } else {
+      prepared->inspectionError = library.error();
+    }
+    if (PostMessageW(hwnd, kExtractionPlanMessage, 0,
+                     reinterpret_cast<LPARAM>(prepared.get()))) {
+      prepared.release();
+    }
+  }).detach();
 }
 
 std::optional<std::wstring> ClearFolderContents(const std::filesystem::path& folder,
@@ -3203,7 +3253,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
           AppendLog(L"Package auto-detect: " + Widen(package.error()));
         }
       }
-      AppendLog(L"Папка распаковки будет выбрана автоматически в корне диска установки: <drive>:\\Unpacking.");
+      AppendLog(L"Пути в архиве будут проверены перед распаковкой. Короткие пути: прямо в папку установки; длинные: через <drive>:\\Unpacking.");
       Layout(hwnd);
       ShowWizardPage(hwnd, WizardPage::Activity);
       return 0;
@@ -3216,10 +3266,10 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
       const auto finalFolder = FinalInstallFolder(std::filesystem::path(GetText(g_installEdit)));
       modlist::NativeInstallerViewState state;
       state.title = UiText("app_title", L"Modlist Installer Beta");
-      state.version = UiText("app_version", L"Modlist Installer v0.3.3 by WallHead");
+      state.version = UiText("app_version", L"Modlist Installer v0.3.4 by WallHead");
       state.unpackNote = UiText(
           "unpack_note",
-          L"Установщик автоматически распакует файлы во временную папку в корне выбранного диска, затем перенесет их в итоговую папку.");
+          L"Установщик проверит пути в архиве и распакует файлы прямо в папку установки, если пути достаточно короткие. Иначе он использует временную папку, затем перенесет файлы.");
       state.installFolderLabel = UiText("install_folder_label", L"Папка установки");
       state.finalPathLabel = UiText("final_path_label", L"Итоговый путь");
       state.finalInstallFolder = finalFolder.empty()
@@ -3384,6 +3434,53 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
               L"Программе не удалось скопировать файлы. Пожалуйста, скопируйте их из:\n\n{source}\n\nв:\n\n{target}",
               {{L"source", PathToDisplay(data->source)},
                {L"target", PathToDisplay(data->target)}}));
+      return 0;
+    }
+    case kExtractionPlanMessage: {
+      std::unique_ptr<PreparedExtraction> prepared(reinterpret_cast<PreparedExtraction*>(lParam));
+      g_workerRunning = false;
+      SetControlsRunning(hwnd, false);
+      if (g_closeAfterWorker) {
+        DestroyWindow(hwnd);
+        return 0;
+      }
+      if (g_stopRequested) {
+        SendUiStatus(L"Установка остановлена пользователем");
+        return 0;
+      }
+      const auto currentInstallFolder = FinalInstallFolder(std::filesystem::path(GetText(g_installEdit)));
+      if (!IsSameFolder(currentInstallFolder, prepared->installFolder)) {
+        SendUiError(UiText("path_error_title", L"Ошибка пути"),
+                    L"Папка установки изменилась. Нажмите «Установить» ещё раз.");
+        return 0;
+      }
+      if (!prepared->inspectionError.empty()) {
+        AppendLog(L"Проверка путей: " + Widen(prepared->inspectionError));
+        if (prepared->inspectionError.find("unsafe output path") != std::string::npos) {
+          SendUiError(UiText("path_error_title", L"Ошибка пути"), L"Архив содержит небезопасный путь.");
+          return 0;
+        }
+        AppendLog(L"Не удалось проверить все пути; используется короткая папка распаковки.");
+      } else {
+        AppendLog(L"Проверено путей: " + std::to_wstring(prepared->plan.entryCount) +
+                  L"; самый длинный итоговый путь: " +
+                  std::to_wstring(prepared->plan.longestFinalPath) + L"; лимит: 240.");
+      }
+      AppendLog(prepared->plan.direct
+          ? L"Распаковка прямо в папку установки: " + PathToDisplay(prepared->plan.folder)
+          : L"Распаковка через короткую папку: " + PathToDisplay(prepared->plan.folder));
+      SendUiStatus(L"Проверка папок установки...");
+      const auto requirements = EstimateSpaceRequirements(prepared->package);
+      if (!ValidateFolders(requirements, true, prepared->plan.folder)) {
+        if (!g_workerRunning && !g_pendingFolderCleanup.has_value()) {
+          SendUiStatus(UiText("status_idle", L"Ожидание | Ожидание проверки"));
+        }
+        return 0;
+      }
+      g_workerRunning = true;
+      SetControlsRunning(hwnd, true);
+      std::thread(RunInstallWorker, hwnd, std::move(prepared->package),
+                  prepared->plan.folder, prepared->installFolder).detach();
       return 0;
     }
     case kWorkerFinishedMessage: {

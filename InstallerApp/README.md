@@ -31,7 +31,8 @@ Copy it into `dist`, put `manifest.json` in `dist\data\package`, keep archive pa
 The `Install` button runs the install pipeline on a background thread:
 
 - load `data\package\manifest.json`
-- validate unpack and install folders
+- inspect archive entry paths before extraction and choose the extraction folder
+- validate the chosen extraction and install folders
 - resolve the Windows Documents known folder and create missing `My Games\Skyrim Special Edition` and `My Games\Fallout4` folders
 - check the manifest's unpacked payload size plus extraction overhead against free space
 - for chunked packer manifests, read each archive block once, verify it asynchronously, and expose it to the 7-Zip SDK only after SHA256 succeeds
@@ -50,9 +51,11 @@ The `Install` button runs the install pipeline on a background thread:
 
 The GUI is a single native Direct2D/DirectWrite installer screen with the install root, final install folder, progress, and log output.
 
-The app derives the unpack target from the selected install root and stages at `<drive>:\Unpacking`, for example `X:\Unpacking`. Choosing `D:\Folder1\folder2\folder3` installs into `D:\Folder1\folder2\folder3\<archive_name>` after staging on `D:`.
+The app reads archive entry names before extraction. If every complete destination path is at most 240 UTF-16 code units (including the selected root, archive folder name, separators, internal folders, and filename), it extracts directly into `<selected root>\<archive_name>` and skips the final move. Otherwise it stages at `<drive>:\Unpacking` and moves the files into the final folder. If archive metadata cannot be inspected, it also uses staging. Inspection reads archive metadata without unpacking the payload, and the UI remains responsive during this check.
 
-The unpack and install folders must be empty before installation begins. On different volumes, the installer also requires enough destination space for the full unpacked payload. Manifests without `unpacked_size` remain supported and use the archive size as an approximate compatibility fallback.
+For example, choosing `D:\Folder1\folder2\folder3` always installs into `D:\Folder1\folder2\folder3\<archive_name>`; staging on `D:` is used only when needed. Direct installs do not create or clean the unused `D:\Unpacking` folder. Failed or cancelled direct installs leave files in the final folder, and retrying asks before cleaning it. The path budget is a conservative compatibility policy, not a guarantee that every game or external tool supports the final paths.
+
+The chosen extraction and install folders must be empty before installation begins. On different volumes, the installer also requires enough destination space for the full unpacked payload. Manifests without `unpacked_size` remain supported and use the archive size as an approximate compatibility fallback.
 
 ## Ready Binary
 

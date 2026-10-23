@@ -1,8 +1,11 @@
 #pragma once
 
+#include "common/Result.h"
+
 #include <cstdint>
 #include <filesystem>
 #include <string>
+#include <span>
 
 namespace modlist {
 
@@ -19,6 +22,21 @@ struct InstallSpacePlan {
   uintmax_t unpackRequiredBytes{0};
   uintmax_t installRequiredBytes{0};
 };
+
+inline constexpr size_t kDirectExtractionPathBudget = 240;
+
+struct ExtractionPathPlan {
+  std::filesystem::path folder;
+  size_t longestFinalPath{0};
+  size_t entryCount{0};
+  bool direct{false};
+};
+
+bool IsSafeArchiveOutputPath(const std::filesystem::path& path);
+Result<ExtractionPathPlan> PlanArchiveExtraction(
+    const std::filesystem::path& finalFolder,
+    const std::filesystem::path& stagingFolder,
+    std::span<const std::filesystem::path> entries);
 
 uintmax_t ExtractionSpaceRequirement(uintmax_t unpackedBytes);
 InstallSpacePlan PlanInstallSpace(uintmax_t unpackedBytes, bool sameVolume);
