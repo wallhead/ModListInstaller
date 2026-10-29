@@ -1,11 +1,11 @@
 #include "ui/NativeStrings.h"
 
 #include "manifest/Json.h"
+#include "common/EmbeddedResource.h"
+#include "resource.h"
 
 #include <windows.h>
 
-#include <fstream>
-#include <iterator>
 
 namespace modlist {
 namespace {
@@ -41,22 +41,19 @@ void ReplaceAll(std::wstring& value, const std::wstring& needle,
 
 }  // namespace
 
-bool NativeStrings::Load(const std::filesystem::path& path, std::wstring* warning) {
+bool NativeStrings::LoadEmbedded(std::wstring* warning) {
   values_.clear();
-  std::ifstream input(path, std::ios::binary);
-  if (!input) {
+  const auto content = EmbeddedTextResource(IDR_UI_STRINGS);
+  if (!content.ok()) {
     if (warning != nullptr) {
-      *warning = L"Файл текста не найден; используются встроенные строки: " + path.wstring();
+      *warning = L"Не удалось загрузить встроенный текст интерфейса.";
     }
     return false;
   }
-  const std::string content((std::istreambuf_iterator<char>(input)),
-                            std::istreambuf_iterator<char>());
-  auto parsed = ParseJson(content);
+  auto parsed = ParseJson(content.value());
   if (!parsed.ok() || !parsed.value().IsObject()) {
     if (warning != nullptr) {
-      *warning = L"Не удалось прочитать файл текста; используются встроенные строки: " +
-                 path.wstring();
+      *warning = L"Не удалось прочитать встроенный текст интерфейса.";
     }
     return false;
   }

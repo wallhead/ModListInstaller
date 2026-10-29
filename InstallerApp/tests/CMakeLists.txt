@@ -1,4 +1,5 @@
-add_executable(installer_core_tests test_main.cpp)
+add_executable(installer_core_tests test_main.cpp ../src/ui/NativeStrings.cpp)
+target_include_directories(installer_core_tests PRIVATE ../resources)
 if(WIN32)
   target_sources(installer_core_tests PRIVATE ../resources/app.rc)
 endif()

@@ -1,11 +1,12 @@
 #define NOMINMAX
 
 #include "ui/NativeInstallerView.h"
+#include "common/EmbeddedResource.h"
+#include "resource.h"
 
 #include <algorithm>
 #include <cctype>
 #include <cmath>
-#include <fstream>
 #include <optional>
 #include <string_view>
 #include <unordered_map>
@@ -185,7 +186,6 @@ D2D1_RECT_F Inset(D2D1_RECT_F rect, float amount) {
 }  // namespace
 
 bool NativeInstallerView::Initialize(HWND hwnd,
-                                     const std::filesystem::path& cssPath,
                                      std::wstring* warning) {
   if (FAILED(D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED,
                                d2dFactory_.GetAddressOf()))) {
@@ -196,25 +196,22 @@ bool NativeInstallerView::Initialize(HWND hwnd,
                                  reinterpret_cast<IUnknown**>(writeFactory_.GetAddressOf())))) {
     return false;
   }
-  LoadTheme(cssPath, warning);
+  LoadTheme(warning);
   if (FAILED(CreateTextFormats())) {
     return false;
   }
   return SUCCEEDED(EnsureTarget(hwnd));
 }
 
-bool NativeInstallerView::LoadTheme(const std::filesystem::path& cssPath,
-                                    std::wstring* warning) {
-  std::ifstream input(cssPath, std::ios::binary);
-  if (!input) {
+bool NativeInstallerView::LoadTheme(std::wstring* warning) {
+  const auto css = EmbeddedTextResource(IDR_UI_THEME);
+  if (!css.ok()) {
     if (warning != nullptr) {
-      *warning = L"Файл темы не найден; используются встроенные цвета: " + cssPath.wstring();
+      *warning = L"Не удалось загрузить встроенную тему интерфейса.";
     }
     return false;
   }
-  const std::string css((std::istreambuf_iterator<char>(input)),
-                        std::istreambuf_iterator<char>());
-  const auto variables = ParseRootVariables(RemoveComments(css));
+  const auto variables = ParseRootVariables(RemoveComments(css.value()));
   if (variables.empty()) {
     if (warning != nullptr) {
       *warning = L"В :root файла темы не найдены переменные; используются встроенные цвета.";

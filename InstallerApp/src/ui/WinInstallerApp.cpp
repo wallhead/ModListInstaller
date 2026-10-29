@@ -1,6 +1,7 @@
 #define NOMINMAX
 
 #include "app/PackageDiscovery.h"
+#include "app/RuntimePaths.h"
 #include "extractor/PipelinedSevenZipExtractor.h"
 #include "extractor/SevenZipExtractor.h"
 #include "manifest/Manifest.h"
@@ -314,7 +315,7 @@ std::string Timestamp() {
 }
 
 std::filesystem::path AppLogPath() {
-  const auto logFolder = ModuleFolder() / "data" / "logs";
+  const auto logFolder = ModuleFolder() / "logs";
   std::error_code ec;
   std::filesystem::create_directories(logFolder, ec);
   return logFolder / "modlist-installer.log";
@@ -392,24 +393,20 @@ std::filesystem::path ExeFolder() {
   return ModuleFolder();
 }
 
-std::filesystem::path DataFolder() {
-  return ExeFolder() / "data";
+std::filesystem::path RuntimeFolder() {
+  return modlist::UserRuntimeFolder(ExeFolder());
 }
 
 std::filesystem::path ArchiveFolder() {
-  return DataFolder() / "downloads";
+  return modlist::LocateInstallerPackage(ExeFolder()).archiveFolder;
 }
 
 std::filesystem::path PackageFolder() {
-  return DataFolder() / "package";
-}
-
-std::filesystem::path UiFolder() {
-  return DataFolder() / "ui";
+  return modlist::LocateInstallerPackage(ExeFolder()).manifestPath.parent_path();
 }
 
 std::filesystem::path ManifestPath() {
-  return PackageFolder() / "manifest.json";
+  return modlist::LocateInstallerPackage(ExeFolder()).manifestPath;
 }
 
 bool PackageManifestFileExists() {
@@ -422,8 +419,9 @@ void WriteLastSevenZipLog(const std::string& output) {
     return;
   }
   std::error_code ec;
-  std::filesystem::create_directories(DataFolder(), ec);
-  std::ofstream log(DataFolder() / "last-7z-output.log", std::ios::binary);
+  const auto logFolder = AppLogPath().parent_path();
+  std::filesystem::create_directories(logFolder, ec);
+  std::ofstream log(logFolder / "last-7z-output.log", std::ios::binary);
   if (log) {
     log << output;
   }
@@ -2566,7 +2564,7 @@ void RunInstallWorker(HWND hwnd,
     PostLog(hwnd, manifestMessage);
   }
   if (!manifest.has_value()) {
-    PostLog(hwnd, L"Необходим файл data\\package\\manifest.json.");
+    PostLog(hwnd, L"Необходим файл manifest.json рядом с установщиком.");
     PostValidationFailed(hwnd);
     FinishWorker(hwnd);
     return;
@@ -2699,6 +2697,12 @@ bool ValidateFolders(const SpaceRequirements& requirements = {},
   const auto selectedInstallRoot = std::filesystem::path(installText);
   const auto installFolder = FinalInstallFolder(selectedInstallRoot);
   const auto unpackFolder = extractionFolder.empty() ? SelectedUnpackFolder() : extractionFolder;
+  if ((!installFolder.empty() && modlist::InstallationOverlapsPackage(installFolder, ExeFolder())) ||
+      (!unpackFolder.empty() && modlist::InstallationOverlapsPackage(unpackFolder, ExeFolder()))) {
+    SendUiError(UiText("path_error_title", L"Ошибка пути"),
+                L"Папки установки и распаковки не должны пересекаться с папкой установщика и архивов.");
+    return false;
+  }
   if (!unpackFolder.empty()) {
     const auto result = validator.ValidateInstallFolder(unpackFolder);
     AppendLog(L"Unpack folder: " + PathToDisplay(unpackFolder) + L" - " + Widen(result.message));
@@ -2896,7 +2900,7 @@ void StartInstall(HWND hwnd) {
   auto manifest = LoadPackageManifest(manifestMessage);
   if (!manifest.has_value()) {
     AppendLog(manifestMessage);
-    AppendLog(L"Необходим файл data\\package\\manifest.json.");
+    AppendLog(L"Необходим файл manifest.json рядом с установщиком.");
     return;
   }
   g_archiveFolderName = Widen(manifest->archiveName);
@@ -2907,6 +2911,11 @@ void StartInstall(HWND hwnd) {
   if (installFolder.empty() || unpackFolder.empty()) {
     SendUiError(UiText("path_error_title", L"Ошибка пути"),
                 L"Выберите полную папку установки на диске.");
+    return;
+  }
+  if (modlist::InstallationOverlapsPackage(installFolder, ExeFolder())) {
+    SendUiError(UiText("path_error_title", L"Ошибка пути"),
+                L"Папка установки не должна пересекаться с папкой установщика и архивов.");
     return;
   }
   g_stopRequested = false;
@@ -3009,6 +3018,7 @@ void ConfirmPendingFolderCleanup(HWND hwnd) {
       (!currentUnpackFolder.empty() &&
        IsSameFolder(pending.unpackFolder, currentUnpackFolder) &&
        IsSameFolder(currentUnpackFolder.parent_path(), currentUnpackFolder.root_path()) &&
+       !modlist::InstallationOverlapsPackage(currentUnpackFolder, ExeFolder()) &&
        !IsSameFolder(currentUnpackFolder, currentUnpackFolder.root_path()) &&
        currentUnpackFolder.filename() == kUnpackFolderName);
   const bool safeInstall =
@@ -3016,6 +3026,7 @@ void ConfirmPendingFolderCleanup(HWND hwnd) {
       (!selectedRoot.empty() && !currentInstallFolder.empty() &&
        IsSameFolder(pending.installFolder, currentInstallFolder) &&
        IsSameFolder(currentInstallFolder.parent_path(), selectedRoot) &&
+       !modlist::InstallationOverlapsPackage(currentInstallFolder, ExeFolder()) &&
        !IsSameFolder(currentInstallFolder, currentInstallFolder.root_path()));
   if (!safeUnpack || !safeInstall) {
     AppendLog(L"Очистка отменена: выбранные папки изменились.");
@@ -3160,17 +3171,15 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
       controls.dwSize = sizeof(controls);
       controls.dwICC = ICC_PROGRESS_CLASS;
       InitCommonControlsEx(&controls);
-      std::filesystem::create_directories(DataFolder() / "logs");
-      std::filesystem::create_directories(PackageFolder());
-      std::filesystem::create_directories(ArchiveFolder());
-      std::filesystem::create_directories(DataFolder() / "tools" / "7zip");
+      AppLogPath();
+      std::filesystem::create_directories(RuntimeFolder() / "tools" / "7zip");
       ApplyWindowFrameTheme(hwnd);
       std::wstring themeWarning;
-      if (!g_nativeView.Initialize(hwnd, UiFolder() / "style.css", &themeWarning)) {
+      if (!g_nativeView.Initialize(hwnd, &themeWarning)) {
         return -1;
       }
       std::wstring stringsWarning;
-      g_strings.Load(UiFolder() / "strings.json", &stringsWarning);
+      g_strings.LoadEmbedded(&stringsWarning);
       g_statusText = UiText("status_idle", L"Ожидание | Ожидание проверки");
       SetWindowTextW(hwnd, UiText("window_title", L"Modlist Installer Beta").c_str());
       g_contentBrush = CreateSolidBrush(kContentColor);
@@ -3226,8 +3235,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
       PopulateDriveCombo();
       SetText(g_installEdit, L"");
       AppendLog(L"App log: " + PathToDisplay(AppLogPath()));
-      AppendLog(L"Native CSS theme: " + PathToDisplay(UiFolder() / "style.css"));
-      AppendLog(L"Native UI strings: " + PathToDisplay(UiFolder() / "strings.json"));
+      AppendLog(L"Тема и текст интерфейса встроены в установщик.");
       if (!themeWarning.empty()) {
         AppendLog(themeWarning);
       }

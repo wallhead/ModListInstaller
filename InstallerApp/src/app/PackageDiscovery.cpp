@@ -1,5 +1,12 @@
 #include "app/PackageDiscovery.h"
 
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
+
 #include <algorithm>
 #include <vector>
 
@@ -24,6 +31,50 @@ bool IsFirstArchivePart(const std::filesystem::path& path) {
 }
 
 }  // namespace
+
+bool InstallationOverlapsPackage(const std::filesystem::path& target,
+                                 const std::filesystem::path& packageFolder) {
+  std::error_code ec;
+  auto install = std::filesystem::weakly_canonical(target, ec).make_preferred();
+  if (ec || target.empty()) return true;
+  if (packageFolder.empty()) return true;
+  const auto isParent = [](const auto& parent, const auto& child) {
+    const auto a = parent.native();
+    const auto b = child.native();
+    if (a.size() > b.size()) return false;
+#ifdef _WIN32
+    const bool prefix = CompareStringOrdinal(a.data(), static_cast<int>(a.size()),
+        b.data(), static_cast<int>(a.size()), TRUE) == CSTR_EQUAL;
+#else
+    const bool prefix = b.compare(0, a.size(), a) == 0;
+#endif
+    return prefix && (a.size() == b.size() || a.back() == std::filesystem::path::preferred_separator ||
+                      b[a.size()] == std::filesystem::path::preferred_separator);
+  };
+  const auto layout = LocateInstallerPackage(packageFolder);
+  for (const auto& inputFolder : {packageFolder, layout.archiveFolder,
+                                  layout.manifestPath.parent_path()}) {
+    auto resolved = std::filesystem::weakly_canonical(inputFolder, ec).make_preferred();
+    if (ec || isParent(install, resolved) || isParent(resolved, install)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+InstallerPackageLayout LocateInstallerPackage(const std::filesystem::path& executableFolder) {
+  std::error_code ec;
+  const auto manifest = executableFolder / "manifest.json";
+  if (std::filesystem::is_regular_file(manifest, ec)) {
+    return {manifest, executableFolder};
+  }
+  ec.clear();
+  const auto legacyManifest = executableFolder / "data" / "package" / "manifest.json";
+  if (std::filesystem::is_regular_file(legacyManifest, ec)) {
+    return {legacyManifest, executableFolder / "data" / "downloads"};
+  }
+  return {manifest, executableFolder};
+}
 
 Result<PackageDiscovery> DiscoverPackageNear(const std::filesystem::path& folder) {
   std::error_code ec;

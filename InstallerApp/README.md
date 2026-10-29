@@ -26,11 +26,11 @@ The GUI executable is built as:
 InstallerApp\build\windows\x64\release\modlist-installer-gui.exe
 ```
 
-Copy it into `dist`, put `manifest.json` in `dist\data\package`, keep archive parts in `dist\data\downloads`, and keep the optional native theme in `dist\data\ui\style.css`. The GUI does not use torrent files.
+Place it beside `manifest.json` and the archive parts in an archive-named folder. Theme, translations, 7-Zip, and its license are embedded in the executable. The GUI does not use torrent files.
 
 The `Install` button runs the install pipeline on a background thread:
 
-- load `data\package\manifest.json`
+- load `manifest.json` beside the executable (or the legacy `data\package\manifest.json` layout)
 - inspect archive entry paths before extraction and choose the extraction folder
 - validate the chosen extraction and install folders
 - resolve the Windows Documents known folder and create missing `My Games\Skyrim Special Edition` and `My Games\Fallout4` folders
@@ -38,14 +38,14 @@ The `Install` button runs the install pipeline on a background thread:
 - for chunked packer manifests, read each archive block once, verify it asynchronously, and expose it to the 7-Zip SDK only after SHA256 succeeds
 - show simultaneous validation and extraction percentages, validation speed, ETA, and elapsed time
 - retain separate sequential HDD or parallel SSD validation followed by command-line extraction for legacy manifests or unavailable SDK components
-- look for the archive named by the manifest in `data\downloads`
+- look for the archive named by the manifest beside the executable
 - check unpack free space again before extraction; same-volume installs do not reserve a second full copy
 - show live unpack percentage, speed, and ETA in the progress bar and status line
 - refresh unpack elapsed time every second, count ETA down between percentage changes, and map split archives across the full unpack progress range
 - show live install percentage, speed, ETA, and elapsed time in the status line
 - install from the unpack folder into the final install folder, using same-drive move/cut semantics instead of copying when both folders are on the same drive
-- embed the 7-Zip command-line executable, SDK library, and license inside the installer exe and extract them to `data\tools\7zip` when needed
-- stream full 7-Zip diagnostics to `dist\data\logs` while keeping only a small in-memory tail for the GUI
+- extract embedded 7-Zip tools and license into the package-specific Local AppData cache when needed
+- stream full 7-Zip diagnostics to `logs` beside the executable while keeping only a small in-memory tail for the GUI
 - run 7-Zip inside a memory-limited child process so oversized archives fail cleanly instead of exhausting system RAM
 - extract with bundled 7-Zip into the selected install folder
 
@@ -68,23 +68,14 @@ InstallerApp\dist\modlist-installer.exe
 The runtime layout is:
 
 ```text
-InstallerApp\dist\
+YourPack\
   modlist-installer.exe
-  data\
-    package\
-      manifest.json
-    logs\
-    downloads\
-      YourPack.7z.001
-      YourPack.7z.002
-    tools\
-      7zip\
-    ui\
-      style.css
-      strings.json
+  manifest.json
+  YourPack.7z.001
+  YourPack.7z.002
 ```
 
-Do not commit generated logs.
+On startup, the installer creates `logs\modlist-installer.log` beside its executable. Extraction diagnostics and `last-7z-output.log` are also saved in `logs`. The current log path is shown in the installer and accessible using Open Log. Extracted tools remain in `%LOCALAPPDATA%\ModlistInstaller\<package key>`, where the key identifies the package's absolute folder. No external UI files are needed. Do not commit generated logs.
 
 ## Release Build Script
 
@@ -93,7 +84,7 @@ cd InstallerApp
 .\scripts\build-release.ps1
 ```
 
-The script configures xmake for release, runs tests, and copies the GUI exe, native CSS theme, and editable text catalogue into `dist`. No browser runtime is required.
+The script configures xmake for release, rebuilds embedded assets, runs tests, and copies only the GUI executable into `dist`. No browser runtime is required.
 
 ## Change Theme And Text
 
@@ -103,23 +94,13 @@ Edit the source stylesheet:
 InstallerApp\ui\style.css
 ```
 
-For a quick local test without rebuilding the exe, copy the theme into `dist\data\ui`:
-
-```powershell
-Copy-Item -Force .\ui\style.css .\dist\data\ui\style.css
-```
-
-Then restart `dist\modlist-installer.exe`.
-
-For release builds, use:
+Edit `ui\strings.json` to change labels, buttons, dialogs, and primary messages. Preserve placeholders such as `{path}`. Rebuild after changing CSS or JSON:
 
 ```powershell
 .\scripts\build-release.ps1
 ```
 
-The renderer reads supported `:root` variables at startup: the palette variables plus `--font-family`, `--font-size`, `--header-height`, `--footer-height`, `--control-height`, `--corner-radius`, `--content-padding`, and `--label-width`. Treat edits in `dist\data\ui` as temporary because the next release build overwrites them.
-
-Edit `ui\strings.json` to change visible labels, buttons, dialogs, and primary messages without rebuilding. Copy it to `dist\data\ui\strings.json` for a quick test, preserve placeholders such as `{path}`, and restart the installer. Missing keys use built-in defaults.
+The renderer reads supported `:root` variables from its embedded stylesheet: the palette variables plus `--font-family`, `--font-size`, `--header-height`, `--footer-height`, `--control-height`, `--corner-radius`, `--content-padding`, and `--label-width`. The source CSS and JSON remain editable in the repository but are not distributed or read from external files at runtime.
 
 ## Build With CMake
 
@@ -136,16 +117,9 @@ The GUI package layout is:
 ```text
 MyPack/
   modlist-installer.exe
-  data/
-    package/
-      manifest.json
-    downloads/
-      MyPack.7z.001
-      MyPack.7z.002
-    tools/
-    ui/
-      style.css
-      strings.json
+  manifest.json
+  MyPack.7z.001
+  MyPack.7z.002
 ```
 
 Run from that folder:
@@ -154,8 +128,8 @@ Run from that folder:
 modlist-installer.exe
 ```
 
-The GUI requires `data\package\manifest.json`, loads optional native theme variables from `data\ui\style.css` and text from `data\ui\strings.json`, uses archive files from `data\downloads`, and uses the manifest's `unpacked_size` for space checks. Chunked packer manifests use a bounded verified-block cache: validation runs ahead of extraction, and unverified bytes never reach 7-Zip. Legacy manifests use the original separate verification pass. If the manifest is missing, invalid, or any hash fails, installation stops and shows a validation failure message.
+The GUI requires `manifest.json`, uses archive files beside the executable, and uses the manifest's `unpacked_size` for space checks. If no flat manifest exists, it also supports older `data\package\manifest.json` and `data\downloads` packages. Chunked packer manifests use a bounded verified-block cache: validation runs ahead of extraction, and unverified bytes never reach 7-Zip. Legacy manifests use the original separate verification pass. If the manifest is missing, invalid, or any hash fails, installation stops and shows a validation failure message.
 
 The interface uses Windows Direct2D and DirectWrite. It does not require WebView2, Edge, .NET, or an internet connection.
 
-The SDK component is from [7-Zip](https://www.7-zip.org/) and is distributed with its original license in `resources\7zip-License.txt` and `data\tools\7zip\License.txt`.
+The SDK component is from [7-Zip](https://www.7-zip.org/). Its original license is in `resources\7zip-License.txt`, embedded in the executable, and written into the Local AppData tools cache.

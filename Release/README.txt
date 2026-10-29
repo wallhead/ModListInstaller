@@ -1,15 +1,17 @@
 ModListInstaller v0.3.4
 
-Run modlist-packer.exe to create a complete modlist release folder.
+Keep modlist-packer.exe and modlist-installer.exe together. Run the packer to
+create <selected release parent>\<archive name>.
 
 The generated installer expects:
-- data\package\manifest.json
-- archive parts in data\downloads
-- native theme in data\ui
-- bundled support files in data\tools
+- modlist-installer.exe
+- manifest.json
+- archive parts
 
-The native Direct2D interface reads its editable theme from data\ui\style.css
-and its editable visible text from data\ui\strings.json.
+These files are all placed directly in the archive-named folder. The theme,
+text, 7-Zip tools, and license are embedded in the installer. On startup, a logs
+folder with modlist-installer.log is created beside the executable. Extracted
+tools are stored under %LOCALAPPDATA%\ModlistInstaller\<package key>.
 It does not require WebView2, Edge, .NET, or internet access.
 
 The final folder is <selected install root>\<archive_name>. Before extraction,

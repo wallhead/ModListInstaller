@@ -1,6 +1,5 @@
 #pragma once
 
-#include <filesystem>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -10,7 +9,7 @@ namespace modlist {
 
 class NativeStrings {
 public:
-  bool Load(const std::filesystem::path& path, std::wstring* warning);
+  bool LoadEmbedded(std::wstring* warning);
   std::wstring Get(std::string_view key, std::wstring_view fallback) const;
   std::wstring Format(
       std::string_view key,

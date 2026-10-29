@@ -70,7 +70,7 @@ enum class NativeButtonStyle {
 
 class NativeInstallerView {
 public:
-  bool Initialize(HWND hwnd, const std::filesystem::path& cssPath, std::wstring* warning);
+  bool Initialize(HWND hwnd, std::wstring* warning);
   void Paint(HWND hwnd, const NativeInstallerViewState& state, const RECT* updateRect = nullptr);
   void PaintDialog(HWND hwnd, const std::wstring& title, const std::wstring& message);
   void PaintDrivePopup(HWND hwnd, const std::vector<std::wstring>& drives,
@@ -88,7 +88,7 @@ public:
   COLORREF InputColor() const;
 
 private:
-  bool LoadTheme(const std::filesystem::path& cssPath, std::wstring* warning);
+  bool LoadTheme(std::wstring* warning);
   HRESULT CreateTextFormats();
   HRESULT EnsureTarget(HWND hwnd);
   HRESULT EnsureDcTarget(HWND hwnd);

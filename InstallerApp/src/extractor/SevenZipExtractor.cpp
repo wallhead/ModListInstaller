@@ -1,6 +1,7 @@
 #include "extractor/SevenZipExtractor.h"
 
 #include "paths/PathValidator.h"
+#include "app/RuntimePaths.h"
 #include "resource.h"
 
 #ifndef NOMINMAX
@@ -64,7 +65,7 @@ std::filesystem::path ModuleFolder() {
 }
 
 std::filesystem::path LocalToolCacheFolder(const std::filesystem::path& appRoot) {
-  return appRoot / "data" / "tools" / "7zip";
+  return UserRuntimeFolder(appRoot) / "tools" / "7zip";
 }
 
 Result<std::filesystem::path> ExtractEmbeddedSevenZip(const std::filesystem::path& appRoot) {
@@ -112,7 +113,7 @@ Result<std::filesystem::path> ExtractEmbeddedSevenZip(const std::filesystem::pat
 std::filesystem::path MakeOutputCapturePath(const std::filesystem::path& sevenZipExe) {
   const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
   (void)sevenZipExe;
-  auto logFolder = ModuleFolder() / "data" / "logs";
+  auto logFolder = ModuleFolder() / "logs";
   std::error_code ec;
   std::filesystem::create_directories(logFolder, ec);
   if (ec) {

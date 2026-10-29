@@ -16,3 +16,15 @@ target("modlist-packer")
         set_runtimes("MT")
     end
 target_end()
+
+target("packer_tests")
+    set_kind("binary")
+    set_rundir("$(projectdir)")
+    add_includedirs("resources")
+    add_files("tests/test_main.cpp", "resources/app.rc")
+    if is_plat("windows") then
+        add_cxxflags("/W4", "/permissive-", {tools = "cl"})
+        add_syslinks("user32", "gdi32", "comdlg32", "shell32", "ole32", "comctl32", "bcrypt", "psapi")
+        set_runtimes("MT")
+    end
+target_end()

@@ -2,6 +2,7 @@
 
 #include "extractor/SevenZipSdkInterfaces.h"
 #include "manifest/Manifest.h"
+#include "app/RuntimePaths.h"
 #include "resource.h"
 
 #ifndef NOMINMAX
@@ -158,7 +159,7 @@ Result<std::filesystem::path> ExtractEmbeddedLibrary(const std::filesystem::path
     return Result<std::filesystem::path>::Error("Embedded 7-Zip SDK library could not be loaded");
   }
 
-  const auto folder = appRoot / "data" / "tools" / "7zip";
+  const auto folder = UserRuntimeFolder(appRoot) / "tools" / "7zip";
   std::error_code ec;
   std::filesystem::create_directories(folder, ec);
   if (ec) {

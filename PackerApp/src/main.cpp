@@ -500,24 +500,12 @@ std::wstring SevenZipVolumeSize(const std::wstring& value) {
   return value;
 }
 
-std::filesystem::path DataFolder(const PackerConfig& config) {
-  return config.releaseFolder / "data";
-}
-
-std::filesystem::path DownloadsFolder(const PackerConfig& config) {
-  return DataFolder(config) / "downloads";
-}
-
 std::filesystem::path PackageFolder(const PackerConfig& config) {
-  return DataFolder(config) / "package";
-}
-
-std::filesystem::path UiFolder(const PackerConfig& config) {
-  return DataFolder(config) / "ui";
+  return config.releaseFolder / config.archiveName;
 }
 
 std::filesystem::path ArchivePath(const PackerConfig& config) {
-  return DownloadsFolder(config) / (config.archiveName + SelectArchiveExtension(config));
+  return PackageFolder(config) / (config.archiveName + SelectArchiveExtension(config));
 }
 
 bool IsSafeArchiveName(const std::wstring& name) {
@@ -528,6 +516,18 @@ bool IsSafeArchiveName(const std::wstring& name) {
     return false;
   }
   if (name.find_first_of(L"<>:\"/\\|?*") != std::wstring::npos) {
+    return false;
+  }
+  if (std::any_of(name.begin(), name.end(), [](wchar_t ch) { return ch < 0x20; })) {
+    return false;
+  }
+  auto stem = name.substr(0, name.find(L'.'));
+  for (auto& ch : stem) {
+    ch = static_cast<wchar_t>(std::towupper(ch));
+  }
+  if (stem == L"CON" || stem == L"PRN" || stem == L"AUX" || stem == L"NUL" ||
+      (stem.size() == 4 && (stem.starts_with(L"COM") || stem.starts_with(L"LPT")) &&
+       stem[3] >= L'1' && stem[3] <= L'9')) {
     return false;
   }
   const std::filesystem::path path(name);
@@ -894,9 +894,9 @@ std::vector<std::filesystem::path> FindArchiveOutputsAndTemps(const std::filesys
       continue;
     }
     const auto lowerName = Lower(entry.path().filename().wstring());
-    const bool selectedArchiveTemp =
-        lowerName == lowerBase + L".tmp" ||
-        (lowerName.starts_with(tempPrefix) && lowerName.ends_with(L".tmp"));
+    const bool selectedArchiveTemp = lowerName == lowerBase + L".tmp" ||
+        (lowerName.starts_with(tempPrefix) && lowerName.ends_with(L".tmp") &&
+         IsNumericVolumeSuffix(lowerName.substr(tempPrefix.size(), lowerName.size() - tempPrefix.size() - 4)));
     if (selectedArchiveTemp &&
         std::find(files.begin(), files.end(), entry.path()) == files.end()) {
       files.push_back(entry.path());
@@ -910,7 +910,7 @@ bool RemovePreviousPackageOutputs(HWND hwnd, const PackerConfig& config) {
   std::error_code ec;
   for (const auto* extension : {L".7z", L".zip"}) {
     const auto base = config.archiveName + extension;
-    for (const auto& file : FindArchiveOutputsAndTemps(DownloadsFolder(config), base)) {
+    for (const auto& file : FindArchiveOutputsAndTemps(PackageFolder(config), base)) {
       std::filesystem::remove(file, ec);
       if (ec) {
         PostLog(hwnd, L"Unable to remove previous archive part: " + file.wstring() + L" - " + Widen(ec.message()));
@@ -927,6 +927,10 @@ bool RemovePreviousPackageOutputs(HWND hwnd, const PackerConfig& config) {
     return false;
   }
   if (manifestExists) {
+    if (!std::filesystem::is_regular_file(manifestPath, ec) || ec) {
+      PostLog(hwnd, L"Previous manifest is not a regular file: " + manifestPath.wstring());
+      return false;
+    }
     std::filesystem::remove(manifestPath, ec);
     if (ec) {
       PostLog(hwnd, L"Unable to remove previous manifest: " + Widen(ec.message()));
@@ -983,11 +987,11 @@ std::optional<ArchiveSet> SelectArchiveSet(HWND hwnd, const PackerConfig& config
     ArchiveSet set;
     set.baseName = config.archiveName + SelectArchiveExtension(config);
     set.archiveName = config.archiveName;
-    set.files = FindArchivePartsForBase(DownloadsFolder(config), set.baseName);
+    set.files = FindArchivePartsForBase(PackageFolder(config), set.baseName);
     return set;
   }
 
-  auto sets = FindArchiveSets(DownloadsFolder(config));
+  auto sets = FindArchiveSets(PackageFolder(config));
   if (sets.empty()) {
     return std::nullopt;
   }
@@ -1019,13 +1023,13 @@ std::optional<ArchiveSet> SelectArchiveSet(HWND hwnd, const PackerConfig& config
 bool WriteManifest(HWND hwnd, const PackerConfig& config, uint64_t unpackedSize) {
   const auto archiveSet = SelectArchiveSet(hwnd, config);
   if (!archiveSet.has_value()) {
-    PostLog(hwnd, L"No archive parts found in data\\downloads.");
+    PostLog(hwnd, L"No archive parts found in: " + PackageFolder(config).wstring());
     return false;
   }
 
   const auto& files = archiveSet->files;
   if (files.empty()) {
-    PostLog(hwnd, L"No archive parts found in data\\downloads.");
+    PostLog(hwnd, L"No archive parts found in: " + PackageFolder(config).wstring());
     return false;
   }
 
@@ -1039,8 +1043,8 @@ bool WriteManifest(HWND hwnd, const PackerConfig& config, uint64_t unpackedSize)
   }
 
   PostLog(hwnd, L"Generating manifest for " + std::to_wstring(files.size()) + L" archive file(s).");
-  const auto downloadsFolder = DownloadsFolder(config);
-  const size_t workerCount = SelectHashWorkerCount(downloadsFolder, files.size());
+  const auto packageFolder = PackageFolder(config);
+  const size_t workerCount = SelectHashWorkerCount(packageFolder, files.size());
   PostLog(hwnd, workerCount == 1
                     ? L"Manifest hashing workers: 1 (sequential HDD-friendly read)"
                     : L"Manifest hashing workers: " + std::to_wstring(workerCount) + L" (SSD parallel read)");
@@ -1077,7 +1081,7 @@ bool WriteManifest(HWND hwnd, const PackerConfig& config, uint64_t unpackedSize)
 
       PostLog(hwnd, L"Hashing archive file: " + files[index].filename().wstring());
       if (!HashArchiveFile(hwnd,
-                           downloadsFolder,
+                           packageFolder,
                            files[index],
                            config.chunkSize,
                            manifests[index],
@@ -1109,7 +1113,6 @@ bool WriteManifest(HWND hwnd, const PackerConfig& config, uint64_t unpackedSize)
   }
 
   std::error_code ec;
-  const auto packageFolder = PackageFolder(config);
   std::filesystem::create_directories(packageFolder, ec);
   if (ec) {
     PostLog(hwnd, L"Unable to create package folder: " + Widen(ec.message()));
@@ -1403,79 +1406,35 @@ int RunProcess(HWND hwnd,
   return static_cast<int>(exitCode);
 }
 
-bool PrepareInstallerSetup(HWND hwnd, const PackerConfig& config) {
+bool PrepareInstallerSetup(HWND hwnd, const PackerConfig& config,
+                           const std::filesystem::path& installerSourceFolder = ModuleFolder()) {
   std::error_code ec;
-  for (const auto& folder : {PackageFolder(config),
-                            DownloadsFolder(config),
-                            DataFolder(config) / "logs",
-                            DataFolder(config) / "tools" / "7zip"}) {
-    ec.clear();
-    std::filesystem::create_directories(folder, ec);
-    if (ec) {
-      PostLog(hwnd, L"Unable to create runtime folder: " + folder.wstring() + L" - " + Widen(ec.message()));
-      return false;
-    }
+  const auto packageFolder = PackageFolder(config);
+  std::filesystem::create_directories(packageFolder, ec);
+  if (ec) {
+    PostLog(hwnd, L"Unable to create package folder: " + packageFolder.wstring() + L" - " + Widen(ec.message()));
+    return false;
+  }
+  if (!config.copyInstaller) {
+    return true;
   }
 
-  const auto packerFolder = ModuleFolder();
-  const auto source = packerFolder / "modlist-installer.exe";
-  const auto target = config.releaseFolder / "modlist-installer.exe";
-  if (config.copyInstaller && std::filesystem::exists(source, ec)) {
-    std::filesystem::copy_file(source, target, std::filesystem::copy_options::overwrite_existing, ec);
-    if (ec) {
-      PostLog(hwnd, L"Unable to copy installer: " + Widen(ec.message()));
-      return false;
-    } else {
-      PostLog(hwnd, L"Installer copied: " + target.wstring());
-    }
-  } else if (config.copyInstaller) {
+  const auto source = installerSourceFolder / "modlist-installer.exe";
+  const auto target = packageFolder / "modlist-installer.exe";
+  if (!std::filesystem::is_regular_file(source, ec) || ec) {
     PostLog(hwnd, L"Unable to prepare setup: modlist-installer.exe was not found beside modlist-packer.exe.");
     return false;
   }
-
-  auto sourceUi = packerFolder / "data" / "ui";
-  if (!std::filesystem::exists(sourceUi, ec)) {
-    sourceUi = packerFolder / "ui";
-    ec.clear();
+  if (std::filesystem::exists(target, ec) && !ec && std::filesystem::equivalent(source, target, ec) && !ec) {
+    return true;
   }
-  const auto targetUi = UiFolder(config);
-  if (config.copyInstaller && std::filesystem::exists(sourceUi, ec) && std::filesystem::is_directory(sourceUi, ec)) {
-    std::filesystem::remove_all(targetUi, ec);
-    if (ec) {
-      PostLog(hwnd, L"Unable to replace installer UI: " + Widen(ec.message()));
-      return false;
-    }
-    std::filesystem::copy(sourceUi, targetUi, std::filesystem::copy_options::recursive, ec);
-    if (ec) {
-      PostLog(hwnd, L"Unable to copy installer UI: " + Widen(ec.message()));
-      return false;
-    } else {
-      PostLog(hwnd, L"Installer UI copied: " + targetUi.wstring());
-    }
-  } else if (config.copyInstaller) {
-    PostLog(hwnd, L"Unable to prepare setup: data\\ui was not found beside modlist-packer.exe.");
+  ec.clear();
+  std::filesystem::copy_file(source, target, std::filesystem::copy_options::overwrite_existing, ec);
+  if (ec) {
+    PostLog(hwnd, L"Unable to copy installer: " + Widen(ec.message()));
     return false;
   }
-
-  const auto sourceTools = packerFolder / "data" / "tools";
-  const auto targetTools = DataFolder(config) / "tools";
-  if (config.copyInstaller && std::filesystem::exists(sourceTools, ec) &&
-      std::filesystem::is_directory(sourceTools, ec)) {
-    std::filesystem::remove_all(targetTools, ec);
-    if (ec) {
-      PostLog(hwnd, L"Unable to replace installer tools: " + Widen(ec.message()));
-      return false;
-    }
-    std::filesystem::copy(sourceTools, targetTools, std::filesystem::copy_options::recursive, ec);
-    if (ec) {
-      PostLog(hwnd, L"Unable to copy installer tools: " + Widen(ec.message()));
-      return false;
-    }
-    PostLog(hwnd, L"Installer tools copied: " + targetTools.wstring());
-  } else if (config.copyInstaller) {
-    PostLog(hwnd, L"Unable to prepare setup: data\\tools was not found beside modlist-packer.exe.");
-    return false;
-  }
+  PostLog(hwnd, L"Installer copied: " + target.wstring());
   return true;
 }
 
@@ -1513,7 +1472,7 @@ bool ValidateConfig(HWND hwnd, const PackerConfig& config) {
     return false;
   }
   if (!IsSafeArchiveName(config.archiveName)) {
-    PostLog(hwnd, L"Archive name cannot contain path separators, reserved characters, or parent-directory segments.");
+    PostLog(hwnd, L"Archive name cannot contain path separators, reserved/control characters, device names, or parent-directory segments.");
     return false;
   }
   if (config.archiveFirst) {
@@ -1521,7 +1480,8 @@ bool ValidateConfig(HWND hwnd, const PackerConfig& config) {
       PostLog(hwnd, L"Source folder is required.");
       return false;
     }
-    if (PathsOverlap(config.sourceFolder, config.releaseFolder)) {
+    if (PathsOverlap(config.sourceFolder, config.releaseFolder) ||
+        PathsOverlap(config.sourceFolder, PackageFolder(config))) {
       PostLog(hwnd, L"Source and release folders must not be the same or contain one another.");
       return false;
     }
@@ -1531,9 +1491,9 @@ bool ValidateConfig(HWND hwnd, const PackerConfig& config) {
     PostLog(hwnd, L"Unable to create release folder: " + Widen(ec.message()));
     return false;
   }
-  std::filesystem::create_directories(DownloadsFolder(config), ec);
+  std::filesystem::create_directories(PackageFolder(config), ec);
   if (ec) {
-    PostLog(hwnd, L"Unable to create downloads folder: " + Widen(ec.message()));
+    PostLog(hwnd, L"Unable to create archive-named package folder: " + Widen(ec.message()));
     return false;
   }
   return true;
@@ -1582,7 +1542,7 @@ void Worker(HWND hwnd, PackerConfig config) {
   uint64_t unpackedSize = 0;
   if (config.archiveFirst) {
     PostLog(hwnd, L"Creating archive...");
-    PostLog(hwnd, L"Archive output folder: " + DownloadsFolder(config).wstring());
+    PostLog(hwnd, L"Archive output folder: " + PackageFolder(config).wstring());
     PostLog(hwnd, L"7-Zip command: " + BuildSevenZipCommand(config));
     unpackedSize = EstimateFolderBytes(hwnd, config.sourceFolder);
     if (unpackedSize > 0) {
@@ -1606,7 +1566,7 @@ void Worker(HWND hwnd, PackerConfig config) {
       PostLog(hwnd, L"Testing archive...");
       PostStatus(hwnd, L"Starting archive test...");
       uint64_t archiveBytes = 0;
-      for (const auto& file : FindArchivePartsForBase(DownloadsFolder(config), config.archiveName + SelectArchiveExtension(config))) {
+      for (const auto& file : FindArchivePartsForBase(PackageFolder(config), config.archiveName + SelectArchiveExtension(config))) {
         std::error_code ec;
         archiveBytes += std::filesystem::file_size(file, ec);
         if (ec) {

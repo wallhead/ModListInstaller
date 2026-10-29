@@ -1,19 +1,16 @@
 # Runtime Layout
 
-Keep only the launcher at the root of this folder.
+The distributable folder contains only the installer, manifest, and archives.
 
 ```text
-dist/
+YourPack/
   modlist-installer.exe
+  manifest.json
   YourPack.7z.001
   YourPack.7z.002
-  data/
-    package/
-      manifest.json
-    downloads/
-    logs/
-    tools/
-      7zip/
 ```
 
-The app creates missing `data\package`, `data\downloads`, `data\logs`, and `data\tools\7zip` folders on startup.
+The theme and text are embedded in the executable. On startup, `logs` is created
+beside the executable with `modlist-installer.log`. Open Log opens that log.
+Tools are cached under `%LOCALAPPDATA%\ModlistInstaller\<package key>`.
+Older `data` layouts remain supported.

@@ -1,4 +1,7 @@
 #include "app/PackageDiscovery.h"
+#include "app/RuntimePaths.h"
+#include "ui/NativeStrings.h"
+#include "common/EmbeddedResource.h"
 #include "extractor/PipelinedSevenZipExtractor.h"
 #include "extractor/SevenZipExtractor.h"
 #include "manifest/Json.h"
@@ -730,10 +733,10 @@ void TestPipelinedExtractor() {
   const auto sdkCache = root / "sdk-cache";
   const auto library = extractor.LocateLibrary(sdkCache);
   Expect(library.ok(), library.error().c_str());
-  Expect(library.value() == sdkCache / "data" / "tools" / "7zip" / "7z.dll",
+  Expect(library.value() == UserRuntimeFolder(sdkCache) / "tools" / "7zip" / "7z.dll",
          "Pipeline test should use the embedded 7-Zip SDK library");
   Expect(std::filesystem::is_regular_file(
-             sdkCache / "data" / "tools" / "7zip" / "License.txt"),
+             UserRuntimeFolder(sdkCache) / "tools" / "7zip" / "License.txt"),
          "Pipeline should extract the embedded 7-Zip license");
   PipelinedExtractionConfig config;
   config.sevenZipLibrary = library.value();
@@ -861,6 +864,49 @@ void TestPipelinedExtractor() {
 
 #endif
 
+void TestInstallerPackageLayout() {
+  const auto root = std::filesystem::temp_directory_path() / "modlist_flat_layout_tests";
+  std::filesystem::remove_all(root);
+  std::filesystem::create_directories(root / "data" / "package");
+  { std::ofstream file(root / "data" / "package" / "manifest.json"); file << "{}"; }
+  auto layout = LocateInstallerPackage(root);
+  Expect(layout.manifestPath == root / "data" / "package" / "manifest.json" &&
+             layout.archiveFolder == root / "data" / "downloads",
+         "Older data packages must remain discoverable");
+  const auto externalArchives = root.parent_path() / "modlist_flat_external_archives";
+  std::filesystem::create_directories(externalArchives);
+  std::error_code linkError;
+  std::filesystem::create_directory_symlink(externalArchives, root / "data" / "downloads", linkError);
+  if (!linkError) {
+    Expect(InstallationOverlapsPackage(externalArchives, root),
+           "Resolved legacy archive directories must be protected outside the EXE folder");
+    std::filesystem::remove(root / "data" / "downloads");
+  }
+  std::filesystem::remove(externalArchives);
+  { std::ofstream file(root / "manifest.json"); file << "{}"; }
+  layout = LocateInstallerPackage(root);
+  Expect(layout.manifestPath == root / "manifest.json" && layout.archiveFolder == root,
+         "A flat manifest must take priority over an older data layout");
+  Expect(InstallationOverlapsPackage(root, root) &&
+             InstallationOverlapsPackage(root.parent_path(), root) &&
+             InstallationOverlapsPackage(root / "installed", root) &&
+             !InstallationOverlapsPackage(root.parent_path() / "modlist_flat_layout_tests_other", root),
+         "Install and cleanup paths must never overlap the distributed package");
+  const auto runtime = UserRuntimeFolder(root);
+  Expect(runtime.is_absolute() && runtime != root &&
+             runtime.wstring().find(root.wstring()) != 0,
+         "Runtime tools must live outside the distributed package");
+  NativeStrings strings;
+  std::wstring warning;
+  Expect(strings.LoadEmbedded(&warning), "Embedded translations should load without external files");
+  const auto theme = EmbeddedTextResource(105);
+  Expect(theme.ok() && theme.value().find(":root") != std::string::npos,
+         "The installer theme must be embedded without an external stylesheet");
+  Expect(strings.Get("button_install", L"missing") == L"\u0423\u0441\u0442\u0430\u043d\u043e\u0432\u0438\u0442\u044c",
+         "Embedded translations should retain the Russian Install label");
+  std::filesystem::remove_all(root);
+}
+
 void TestPackageDiscovery() {
   const auto root = std::filesystem::temp_directory_path() / "modlist_installer_package_tests";
   std::filesystem::remove_all(root);
@@ -961,6 +1007,7 @@ int main() {
     TestPipelinedExtractor();
 #endif
     TestPackageDiscovery();
+    TestInstallerPackageLayout();
     TestPackageDiscoveryWithoutTorrent();
     TestInstallSpacePlanning();
     TestSameVolumeDetection();

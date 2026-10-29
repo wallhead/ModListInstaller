@@ -14,6 +14,7 @@ add_library(installer_core
 )
 
 target_include_directories(installer_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_include_directories(installer_core PRIVATE ../resources)
 target_compile_features(installer_core PUBLIC cxx_std_20)
 
 if(MSVC)
@@ -36,6 +37,8 @@ add_executable(modlist-installer app/main.cpp)
 target_link_libraries(modlist-installer PRIVATE installer_core)
 
 if(WIN32)
+  set_property(SOURCE ../resources/app.rc APPEND PROPERTY OBJECT_DEPENDS
+    "${CMAKE_CURRENT_SOURCE_DIR}/../ui/style.css;${CMAKE_CURRENT_SOURCE_DIR}/../ui/strings.json")
   add_executable(modlist-installer-gui WIN32
     ui/WinInstallerApp.cpp
     ui/NativeInstallerView.cpp
@@ -48,13 +51,4 @@ if(WIN32)
   target_link_libraries(modlist-installer-gui PRIVATE installer_core
     user32 gdi32 d2d1 dwrite dwmapi uxtheme comctl32 shlwapi
     ole32 oleaut32 shell32 advapi32)
-  add_custom_command(TARGET modlist-installer-gui POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E make_directory
-      "$<TARGET_FILE_DIR:modlist-installer-gui>/data/ui"
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-      "${CMAKE_CURRENT_SOURCE_DIR}/../ui/style.css"
-      "$<TARGET_FILE_DIR:modlist-installer-gui>/data/ui/style.css"
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-      "${CMAKE_CURRENT_SOURCE_DIR}/../ui/strings.json"
-      "$<TARGET_FILE_DIR:modlist-installer-gui>/data/ui/strings.json")
 endif()

@@ -98,7 +98,7 @@ target("installer_core_tests")
         set_runtimes("MT")
     end
     set_rundir("$(projectdir)")
-    add_files("tests/test_main.cpp")
+    add_files("tests/test_main.cpp", "src/ui/NativeStrings.cpp")
     if is_plat("windows") then
         add_files("resources/app.rc")
     end

@@ -4,3 +4,5 @@
 #define IDR_7ZIP_EXE 102
 #define IDR_7ZIP_DLL 103
 #define IDR_7ZIP_LICENSE 104
+#define IDR_UI_THEME 105
+#define IDR_UI_STRINGS 106
