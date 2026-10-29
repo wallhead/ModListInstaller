@@ -3,6 +3,7 @@
 #include <windows.h>
 #include <commctrl.h>
 #include <shlobj.h>
+#include <shellapi.h>
 #include <winioctl.h>
 #include <bcrypt.h>
 #include <psapi.h>
@@ -172,6 +173,14 @@ std::optional<std::filesystem::path> ExtractEmbeddedSevenZip(std::wstring& error
   if (std::filesystem::exists(outputPath, ec) && !ec) {
     const auto existingSize = std::filesystem::file_size(outputPath, ec);
     writeFile = ec || existingSize != size;
+    if (!writeFile) {
+      std::ifstream input(outputPath, std::ios::binary);
+      std::vector<char> existingBytes(size);
+      input.read(existingBytes.data(), static_cast<std::streamsize>(existingBytes.size()));
+      writeFile = !input ||
+          !std::equal(existingBytes.begin(), existingBytes.end(), static_cast<const char*>(data)) ||
+          input.peek() != std::char_traits<char>::eof();
+    }
   }
 
   if (writeFile) {
@@ -181,6 +190,7 @@ std::optional<std::filesystem::path> ExtractEmbeddedSevenZip(std::wstring& error
       return std::nullopt;
     }
     output.write(static_cast<const char*>(data), size);
+    output.close();
     if (!output) {
       error = L"Unable to finish writing embedded 7-Zip executable.";
       return std::nullopt;
@@ -382,11 +392,17 @@ void AppendLog(const std::wstring& text) {
 }
 
 void PostLog(HWND hwnd, std::wstring text) {
-  PostMessageW(hwnd, kLogMessage, 0, reinterpret_cast<LPARAM>(new std::wstring(std::move(text))));
+  auto payload = std::make_unique<std::wstring>(std::move(text));
+  if (hwnd != nullptr && PostMessageW(hwnd, kLogMessage, 0, reinterpret_cast<LPARAM>(payload.get()))) {
+    payload.release();
+  }
 }
 
 void PostStatus(HWND hwnd, std::wstring text) {
-  PostMessageW(hwnd, kStatusMessage, 0, reinterpret_cast<LPARAM>(new std::wstring(std::move(text))));
+  auto payload = std::make_unique<std::wstring>(std::move(text));
+  if (hwnd != nullptr && PostMessageW(hwnd, kStatusMessage, 0, reinterpret_cast<LPARAM>(payload.get()))) {
+    payload.release();
+  }
 }
 
 void PostProgress(HWND hwnd, int progress) {
@@ -676,9 +692,6 @@ std::wstring BuildSevenZipCommand(const PackerConfig& config) {
                          L" -mx=" + config.level +
                          L" -mmt=" + config.threads +
                          L" -y -bsp1";
-  if (config.pathMode == L"Full paths") {
-    command += L" -spf";
-  }
   if (config.format == L"7z") {
     if (!config.method.empty()) {
       command += L" -m0=" + config.method;
@@ -1140,7 +1153,7 @@ bool WriteManifest(HWND hwnd, const PackerConfig& config, uint64_t unpackedSize)
   for (size_t i = 0; i < manifests.size(); ++i) {
     const auto& file = manifests[i];
     output << "    {\n";
-    output << "      \"path\": \"" << JsonEscape(file.path.generic_string()) << "\",\n";
+    output << "      \"path\": \"" << JsonEscape(Narrow(file.path.generic_wstring())) << "\",\n";
     output << "      \"size\": " << file.size << ",\n";
     output << "      \"sha256\": \"" << Narrow(file.sha256) << "\",\n";
     output << "      \"chunks\": [\n";
@@ -1475,6 +1488,30 @@ bool ValidateConfig(HWND hwnd, const PackerConfig& config) {
     PostLog(hwnd, L"Archive name cannot contain path separators, reserved/control characters, device names, or parent-directory segments.");
     return false;
   }
+  if (!config.pathMode.empty() && config.pathMode != L"Relative paths") {
+    PostLog(hwnd, L"Only Relative paths is supported; absolute archive entries cannot be installed safely.");
+    return false;
+  }
+  if (!config.parameters.empty()) {
+    int argumentCount = 0;
+    auto* arguments = CommandLineToArgvW((L"7z.exe " + config.parameters).c_str(), &argumentCount);
+    if (arguments == nullptr) {
+      PostLog(hwnd, L"Unable to parse additional 7-Zip parameters.");
+      return false;
+    }
+    bool fullPaths = false;
+    for (int i = 1; i < argumentCount; ++i) {
+      const auto argument = Lower(arguments[i]);
+      if (argument.starts_with(L"-spf") || argument.starts_with(L"/spf")) {
+        fullPaths = true;
+      }
+    }
+    LocalFree(arguments);
+    if (fullPaths) {
+      PostLog(hwnd, L"The -spf full-path switches are not supported; use Relative paths.");
+      return false;
+    }
+  }
   if (config.archiveFirst) {
     if (!std::filesystem::exists(config.sourceFolder, ec) || !std::filesystem::is_directory(config.sourceFolder, ec)) {
       PostLog(hwnd, L"Source folder is required.");
@@ -1688,7 +1725,6 @@ void SetDefaults(HWND hwnd) {
   SelectCombo(g_chunkCombo, 1);
 
   AddComboItem(g_pathModeCombo, L"Relative paths");
-  AddComboItem(g_pathModeCombo, L"Full paths");
   SelectCombo(g_pathModeCombo, 0);
 
   SetText(g_archiveNameEdit, L"MyPack");
@@ -1772,6 +1808,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
                                   WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL,
                                   14, 504, 690, 156, hwnd,
                                   reinterpret_cast<HMENU>(static_cast<INT_PTR>(kLogEdit)), g_instance, nullptr);
+      SendMessageW(g_logEdit, EM_SETLIMITTEXT, 0, 0);
       SendMessageW(g_progress, PBM_SETRANGE, 0, MAKELPARAM(0, 100));
       SetDefaults(hwnd);
       AppendLog(L"Modlist Packer ready.");

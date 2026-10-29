@@ -21,7 +21,8 @@ InstallerPackageLayout LocateInstallerPackage(const std::filesystem::path& execu
 bool InstallationOverlapsPackage(const std::filesystem::path& target,
                                  const std::filesystem::path& packageFolder);
 
-Result<PackageDiscovery> DiscoverPackageNear(const std::filesystem::path& folder);
+Result<PackageDiscovery> DiscoverPackageNear(const std::filesystem::path& folder,
+                                           bool includeTorrents = true);
 Result<PackageDiscovery> DiscoverPackageFromTorrent(const std::filesystem::path& torrentFile);
 
 }  // namespace modlist

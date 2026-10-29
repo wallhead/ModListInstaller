@@ -1,4 +1,5 @@
 #include "verifier/Sha256.h"
+#include "common/PathText.h"
 
 #include <fstream>
 #include <iomanip>
@@ -95,7 +96,7 @@ std::array<uint8_t, 32> Sha256::Final() {
 Result<std::string> Sha256::FileHexDigest(const std::filesystem::path& path) {
   std::ifstream input(path, std::ios::binary);
   if (!input) {
-    return Result<std::string>::Error("Unable to open file for SHA256: " + path.string());
+    return Result<std::string>::Error("Unable to open file for SHA256: " + PathToUtf8(path));
   }
   Sha256 sha;
   std::array<uint8_t, 64 * 1024> buffer{};

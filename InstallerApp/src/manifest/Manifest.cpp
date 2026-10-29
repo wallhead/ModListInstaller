@@ -1,6 +1,7 @@
 #include "manifest/Manifest.h"
 
 #include "manifest/Json.h"
+#include "common/PathText.h"
 
 #include <algorithm>
 #include <cctype>
@@ -34,11 +35,11 @@ bool IsHexSha256(const std::string& value) {
 }
 
 std::string NormalizePathForCheck(std::filesystem::path path) {
-  return path.generic_string();
+  return GenericPathToUtf8(path);
 }
 
 std::string NormalizeManifestPath(std::filesystem::path path) {
-  std::string text = path.generic_string();
+  std::string text = GenericPathToUtf8(path);
   std::transform(text.begin(), text.end(), text.begin(), [](unsigned char c) {
     return static_cast<char>(std::tolower(c));
   });
@@ -70,7 +71,7 @@ Result<ManifestFile> ParseFile(const JsonValue& json, size_t index) {
   }
 
   ManifestFile file;
-  file.path = path->AsString();
+  file.path = PathFromUtf8(path->AsString());
   file.size = static_cast<uint64_t>(size->AsNumber());
   file.sha256 = hash->AsString();
   std::transform(file.sha256.begin(), file.sha256.end(), file.sha256.begin(), [](unsigned char c) {
@@ -153,7 +154,7 @@ bool EndsWithInsensitive(std::string value, const std::string& suffix) {
 }
 
 std::string InferArchiveName(const std::filesystem::path& firstArchivePart) {
-  std::string name = firstArchivePart.filename().string();
+  std::string name = PathToUtf8(firstArchivePart.filename());
   if (EndsWithInsensitive(name, ".001")) {
     name.resize(name.size() - 4);
   }
@@ -186,13 +187,13 @@ Result<std::string> ReadArchiveName(const JsonValue& root,
 
 std::filesystem::path SelectFirstArchivePart(const std::vector<ManifestFile>& files) {
   for (const auto& file : files) {
-    const auto path = file.path.generic_string();
+    const auto path = GenericPathToUtf8(file.path);
     if (EndsWithInsensitive(path, ".7z.001") || EndsWithInsensitive(path, ".zip.001")) {
       return file.path;
     }
   }
   for (const auto& file : files) {
-    const auto path = file.path.generic_string();
+    const auto path = GenericPathToUtf8(file.path);
     if (EndsWithInsensitive(path, ".7z") || EndsWithInsensitive(path, ".zip")) {
       return file.path;
     }
@@ -256,7 +257,7 @@ Result<Manifest> ParsePackerManifest(const JsonValue& root) {
 Result<Manifest> ManifestLoader::LoadFromFile(const std::filesystem::path& path) const {
   std::ifstream input(path, std::ios::binary);
   if (!input) {
-    return Result<Manifest>::Error("Unable to open manifest: " + path.string());
+    return Result<Manifest>::Error("Unable to open manifest: " + PathToUtf8(path));
   }
   std::ostringstream buffer;
   buffer << input.rdbuf();
@@ -264,6 +265,7 @@ Result<Manifest> ManifestLoader::LoadFromFile(const std::filesystem::path& path)
 }
 
 Result<Manifest> ManifestLoader::LoadFromString(const std::string& jsonText) const {
+  try {
   auto parsed = ParseJson(jsonText);
   if (!parsed.ok()) {
     return Result<Manifest>::Error(parsed.error());
@@ -387,7 +389,7 @@ Result<Manifest> ManifestLoader::LoadFromString(const std::string& jsonText) con
   if (auto required = RequireString(firstArchivePart, "extract.first_archive_part"); !required.ok()) {
     return Result<Manifest>::Error(required.error());
   }
-  manifest.extract.firstArchivePart = firstArchivePart->AsString();
+  manifest.extract.firstArchivePart = PathFromUtf8(firstArchivePart->AsString());
   if (!IsSafeManifestRelativePath(manifest.extract.firstArchivePart)) {
     return Result<Manifest>::Error("extract.first_archive_part is unsafe");
   }
@@ -395,7 +397,7 @@ Result<Manifest> ManifestLoader::LoadFromString(const std::string& jsonText) con
     return Result<Manifest>::Error("extract.first_archive_part must match an entry in files[]");
   }
   if (const JsonValue* value = extract->Find("target_subfolder"); value != nullptr && value->IsString()) {
-    manifest.extract.targetSubfolder = value->AsString();
+    manifest.extract.targetSubfolder = PathFromUtf8(value->AsString());
     if (!manifest.extract.targetSubfolder.empty() && !IsSafeManifestRelativePath(manifest.extract.targetSubfolder)) {
       return Result<Manifest>::Error("extract.target_subfolder is unsafe");
     }
@@ -414,6 +416,9 @@ Result<Manifest> ManifestLoader::LoadFromString(const std::string& jsonText) con
   manifest.archiveName = std::move(archiveName.value());
 
   return Result<Manifest>::Ok(std::move(manifest));
+  } catch (const std::filesystem::filesystem_error&) {
+    return Result<Manifest>::Error("Manifest paths must contain valid UTF-8 text");
+  }
 }
 
 bool IsSafeManifestRelativePath(const std::filesystem::path& path) {

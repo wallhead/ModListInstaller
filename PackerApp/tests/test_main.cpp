@@ -1,9 +1,11 @@
 #include "../src/main.cpp"
 
+#include <cwchar>
 #include <functional>
 #include <iostream>
 #include <set>
 #include <stdexcept>
+#include <string_view>
 
 namespace {
 
@@ -22,13 +24,141 @@ void WriteFile(const std::filesystem::path& path, const std::string& contents) {
   std::filesystem::create_directories(path.parent_path());
   std::ofstream output(path, std::ios::binary | std::ios::trunc);
   output.write(contents.data(), static_cast<std::streamsize>(contents.size()));
-  Require(static_cast<bool>(output), "Unable to write fixture: " + path.string());
+  Require(static_cast<bool>(output), "Unable to write fixture: " + Narrow(path.wstring()));
 }
 
 std::string ReadFile(const std::filesystem::path& path) {
   std::ifstream input(path, std::ios::binary);
-  Require(static_cast<bool>(input), "Missing file: " + path.string());
+  Require(static_cast<bool>(input), "Missing file: " + Narrow(path.wstring()));
   return {std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
+}
+
+std::string Utf8Bytes(std::u8string_view text) {
+  return {reinterpret_cast<const char*>(text.data()), text.size()};
+}
+
+class ScopedLocalAppData {
+ public:
+  explicit ScopedLocalAppData(const std::filesystem::path& folder) {
+    const DWORD length = GetEnvironmentVariableW(L"LOCALAPPDATA", nullptr, 0);
+    if (length > 0) {
+      previous_.resize(length);
+      const DWORD copied = GetEnvironmentVariableW(L"LOCALAPPDATA", previous_.data(), length);
+      Require(copied > 0 && copied < length, "Unable to save LOCALAPPDATA");
+      previous_.resize(copied);
+      hadPrevious_ = true;
+    }
+    Require(SetEnvironmentVariableW(L"LOCALAPPDATA", folder.c_str()) != FALSE,
+            "Unable to isolate the embedded tool cache");
+  }
+
+  ~ScopedLocalAppData() {
+    SetEnvironmentVariableW(L"LOCALAPPDATA", hadPrevious_ ? previous_.c_str() : nullptr);
+  }
+
+ private:
+  std::wstring previous_;
+  bool hadPrevious_{false};
+};
+
+class OwnedFixtureTree {
+ public:
+  explicit OwnedFixtureTree(const std::filesystem::path& parent, bool keep = false) : keep_(keep) {
+    parent_ = std::filesystem::absolute(parent).lexically_normal();
+    std::filesystem::create_directories(parent_);
+    Require(std::filesystem::canonical(parent_) == parent_, "Fixture parent must not redirect outside its known path");
+    static unsigned int sequence = 0;
+    root_ = parent_ / ("flat-layout-" + std::to_string(GetCurrentProcessId()) + "-" +
+                       std::to_string(GetTickCount64()) + "-" + std::to_string(sequence++));
+    Require(std::filesystem::create_directory(root_), "Fixture directory already exists");
+    WriteFile(root_ / ".packer-tests-owned", root_.filename().string());
+    owned_ = true;
+  }
+
+  OwnedFixtureTree(const OwnedFixtureTree&) = delete;
+  OwnedFixtureTree& operator=(const OwnedFixtureTree&) = delete;
+
+  ~OwnedFixtureTree() {
+    if (owned_ && !keep_) {
+      try {
+        Cleanup();
+      } catch (const std::exception& error) {
+        std::cerr << "Fixture cleanup refused: " << Narrow(root_.wstring()) << ": " << error.what() << '\n';
+      }
+    }
+  }
+
+  const std::filesystem::path& Root() const { return root_; }
+
+  void Cleanup() {
+    if (!owned_) return;
+    // Never sweep test-fixtures or older runs, and never traverse a redirected directory.
+    Require(root_.parent_path() == parent_ && std::filesystem::canonical(root_) == root_ &&
+                std::filesystem::canonical(parent_) == parent_, "Fixture cleanup escaped its generated root");
+    Require(ReadFile(root_ / ".packer-tests-owned") == root_.filename().string(),
+            "Fixture ownership marker is missing or changed");
+    auto checkEntry = [](const std::filesystem::path& path) {
+      const DWORD attributes = GetFileAttributesW(path.c_str());
+      Require(attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_REPARSE_POINT) == 0,
+              "Fixture cleanup must not traverse reparse points");
+    };
+    checkEntry(root_);
+    for (const auto& entry : std::filesystem::recursive_directory_iterator(root_)) checkEntry(entry.path());
+    std::filesystem::remove_all(root_);
+    owned_ = false;
+  }
+
+ private:
+  std::filesystem::path parent_;
+  std::filesystem::path root_;
+  bool keep_{false};
+  bool owned_{false};
+};
+
+std::string CaptureProcess(const std::wstring& command, const std::filesystem::path& outputPath) {
+  SECURITY_ATTRIBUTES security{sizeof(SECURITY_ATTRIBUTES), nullptr, TRUE};
+  HANDLE output = CreateFileW(outputPath.c_str(), GENERIC_WRITE, FILE_SHARE_READ, &security,
+                              CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+  Require(output != INVALID_HANDLE_VALUE, "Unable to create process output fixture");
+  STARTUPINFOW startup{};
+  startup.cb = sizeof(startup);
+  startup.dwFlags = STARTF_USESTDHANDLES;
+  startup.hStdOutput = output;
+  startup.hStdError = output;
+  startup.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+  PROCESS_INFORMATION process{};
+  auto mutableCommand = command;
+  const BOOL created = CreateProcessW(nullptr, mutableCommand.data(), nullptr, nullptr, TRUE,
+                                      CREATE_NO_WINDOW, nullptr, nullptr, &startup, &process);
+  CloseHandle(output);
+  Require(created != FALSE, "Unable to start captured process");
+  const DWORD wait = WaitForSingleObject(process.hProcess, 30000);
+  if (wait != WAIT_OBJECT_0) {
+    TerminateProcess(process.hProcess, 255);
+    WaitForSingleObject(process.hProcess, INFINITE);
+  }
+  DWORD exitCode = 255;
+  GetExitCodeProcess(process.hProcess, &exitCode);
+  CloseHandle(process.hThread);
+  CloseHandle(process.hProcess);
+  const auto result = ReadFile(outputPath);
+  Require(wait == WAIT_OBJECT_0 && exitCode == 0, "Captured process failed: " + result);
+  return result;
+}
+
+std::vector<std::filesystem::path> ListedArchivePaths(const PackerConfig& config,
+                                                     const std::filesystem::path& outputPath) {
+  const auto listing = CaptureProcess(Quote(config.sevenZipExe) + L" l -slt -ba -sccUTF-8 " +
+                                         Quote(ArchivePath(config)), outputPath);
+  std::vector<std::filesystem::path> paths;
+  std::istringstream lines(listing);
+  std::string line;
+  while (std::getline(lines, line)) {
+    if (!line.empty() && line.back() == '\r') line.pop_back();
+    if (line.starts_with("Path = ")) paths.emplace_back(Widen(line.substr(7)));
+  }
+  Require(!paths.empty(), "7-Zip metadata listing has no entries: " + listing);
+  return paths;
 }
 
 std::set<std::wstring> EntryNames(const std::filesystem::path& folder) {
@@ -52,6 +182,7 @@ PackerConfig Config(const std::string& testName) {
   config.solid = L"8g";
   config.volumeSize = L"8k";
   config.threads = L"2";
+  config.pathMode = L"Relative paths";
   config.chunkSize = 1024;
   config.copyInstaller = false;
   WriteFile(config.sourceFolder / "nested" / "readme.txt", "Small modlist payload\r\n");
@@ -72,6 +203,38 @@ void DrainMessages() {
   while (PeekMessageW(&message, g_testWindow, 0, 0, PM_REMOVE)) {
     DispatchMessageW(&message);
   }
+}
+
+void FixtureCleanupIsOwnedAndRunScoped() {
+  const auto parent = g_fixtureRoot / "fixture-cleanup-scope";
+  WriteFile(parent / "notes.txt", "unrelated parent file");
+  WriteFile(parent / "older-run" / "keep.txt", "unrelated older fixture");
+  std::filesystem::path generated;
+  {
+    OwnedFixtureTree fixture(parent);
+    generated = fixture.Root();
+    WriteFile(generated / "nested" / "generated.txt", "owned fixture");
+  }
+  Require(!std::filesystem::exists(generated), "Default cleanup retained its own generated fixture tree");
+  Require(ReadFile(parent / "notes.txt") == "unrelated parent file" &&
+              ReadFile(parent / "older-run" / "keep.txt") == "unrelated older fixture",
+          "Fixture cleanup removed unrelated parent files or older runs");
+  OwnedFixtureTree unmarked(parent);
+  const auto marker = unmarked.Root() / ".packer-tests-owned";
+  WriteFile(marker, "not this run");
+  WriteFile(unmarked.Root() / "keep.txt", "do not delete an unowned tree");
+  bool rejected = false;
+  try { unmarked.Cleanup(); } catch (const std::exception&) { rejected = true; }
+  Require(rejected && ReadFile(unmarked.Root() / "keep.txt") == "do not delete an unowned tree",
+          "Fixture cleanup removed a tree without its ownership marker");
+  WriteFile(marker, unmarked.Root().filename().string());
+  unmarked.Cleanup();
+  {
+    OwnedFixtureTree retained(parent, true);
+    generated = retained.Root();
+    WriteFile(generated / "generated.txt", "retained fixture");
+  }
+  Require(ReadFile(generated / "generated.txt") == "retained fixture", "Opt-in fixture retention was ignored");
 }
 
 void FlatPreparation() {
@@ -162,6 +325,160 @@ void ManifestOnlySelectionAndAmbiguity() {
   WriteFile(ambiguous / "Second.zip", "second");
   Require(!WriteManifest(g_testWindow, config, 0), "Ambiguous archive set should be rejected");
   Require(!std::filesystem::exists(ambiguous / "manifest.json"), "Ambiguous set wrote a manifest");
+}
+
+void CyrillicManifestUsesUtf8AndKnownHashes() {
+  auto config = Config("cyrillic-manifest");
+  config.archiveFirst = false;
+  config.archiveName = L"\u0421\u0431\u043e\u0440\u043a\u0430";
+  config.chunkSize = 3;
+  const auto package = PackageFolder(config);
+  WriteFile(package / (config.archiveName + L".7z.001"), "abcdef");
+  Require(WriteManifest(g_testWindow, config, 6), "Cyrillic manifest generation failed");
+  const auto manifest = ReadFile(package / "manifest.json");
+  Require(MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, manifest.data(),
+                              static_cast<int>(manifest.size()), nullptr, 0) > 0,
+          "Manifest contains invalid UTF-8 bytes");
+  const auto filename = Utf8Bytes(u8"\u0421\u0431\u043e\u0440\u043a\u0430.7z.001");
+  Require(manifest.find("\"path\": \"" + filename + "\"") != std::string::npos,
+          "Cyrillic files[].path is not the expected UTF-8 filename");
+  Require(ReadFile(package / Widen(filename)) == "abcdef", "UTF-8 manifest filename did not roundtrip");
+  for (const auto* hash : {
+           "bef57ec7f53a6d40beb640a780a639c83bc29ac8a9816f1fc6c5c6dcd93c4721",
+           "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+           "cb8379ac2098aa165029e3938a51da0bcecfc008fd6795f401178647f96c5b34"}) {
+    Require(manifest.find(hash) != std::string::npos, "Cyrillic manifest lost known full/chunk SHA-256");
+  }
+}
+
+void EmbeddedCacheRepairsSameSizeTampering() {
+  std::wstring error;
+  const auto cache = ExtractEmbeddedSevenZip(error);
+  Require(cache.has_value(), "Embedded extraction failed: " + Narrow(error));
+  Require(IsSameOrChildPath(*cache, g_fixtureRoot), "Test must not tamper with the user's real tool cache");
+  const HMODULE module = GetModuleHandleW(nullptr);
+  const HRSRC resource = FindResourceW(module, MAKEINTRESOURCEW(IDR_7ZIP_EXE), MAKEINTRESOURCEW(10));
+  const HGLOBAL loaded = LoadResource(module, resource);
+  const auto* data = static_cast<const char*>(LockResource(loaded));
+  const DWORD size = SizeofResource(module, resource);
+  Require(data != nullptr && size > 1, "Unable to inspect embedded reference bytes");
+  const std::string expected(data, size);
+  Require(ReadFile(*cache) == expected, "First extraction differs from embedded bytes");
+  auto tampered = expected;
+  tampered[tampered.size() / 2] ^= 0x01;
+  WriteFile(*cache, tampered);
+  Require(std::filesystem::file_size(*cache) == expected.size(), "Tamper fixture changed executable size");
+  const auto repaired = ExtractEmbeddedSevenZip(error);
+  Require(repaired.has_value() && *repaired == *cache, "Tampered cache was not regenerated");
+  const auto repairedBytes = ReadFile(*cache);
+  // Restore even on a failed assertion so later integration tests never execute tampered bytes.
+  if (repairedBytes != expected) WriteFile(*cache, expected);
+  Require(repairedBytes == expected, "Same-size tampered cache was trusted instead of restored");
+  const auto timestamp = std::filesystem::last_write_time(*cache) - std::chrono::hours(1);
+  std::filesystem::last_write_time(*cache, timestamp);
+  Require(ExtractEmbeddedSevenZip(error).has_value(), "Valid cache could not be reused");
+  Require(std::filesystem::last_write_time(*cache) == timestamp, "Valid cache was needlessly rewritten");
+}
+
+void RealSevenZipFullPathMetadata() {
+  auto config = Config("full-path-metadata");
+  config.volumeSize = L"none";
+  Require(ValidateConfig(g_testWindow, config), "Relative-path fixture was rejected");
+  Require(ResolveSevenZip(g_testWindow, config), "Unable to resolve 7-Zip for metadata reproduction");
+  Require(RunProcess(g_testWindow, BuildSevenZipCommand(config), L"Check relative paths", 0) == 0,
+          "Actual relative-path packing failed");
+  const auto relativePaths = ListedArchivePaths(config, config.sourceFolder.parent_path() / "relative-path-listing.txt");
+  Require(std::find(relativePaths.begin(), relativePaths.end(), std::filesystem::path(L"nested/readme.txt")) != relativePaths.end() &&
+              std::none_of(relativePaths.begin(), relativePaths.end(), [](const auto& path) {
+                return path.has_root_path();
+              }), "Relative-path archive metadata contains a rooted path or lost its nested filename");
+  config.archiveName = L"FullPaths";
+  Require(ValidateConfig(g_testWindow, config), "Unable to prepare full-path reproduction output");
+  // Deliberately bypass config validation to characterize the unsafe 7-Zip switch itself.
+  Require(RunProcess(g_testWindow, BuildSevenZipCommand(config) + L" -spf", L"Reproduce -spf", 0) == 0,
+          "Actual 7-Zip -spf packing failed");
+  const auto paths = ListedArchivePaths(config, config.sourceFolder.parent_path() / "full-path-listing.txt");
+  const auto expected = config.sourceFolder / "nested" / "readme.txt";
+  Require(std::find(paths.begin(), paths.end(), expected) != paths.end(),
+          "-spf reproduction did not retain the absolute source filename");
+  Require(std::all_of(paths.begin(), paths.end(), [](const auto& path) { return path.is_absolute(); }),
+          "-spf reproduction did not produce absolute archive entries");
+  std::cout << "REPRO: -spf archive entry: " << Narrow(expected.wstring()) << '\n';
+}
+
+void UnsafePathModesAreRejectedBeforeWriting() {
+  for (const auto* mode : {L"Full paths", L"unknown mode"}) {
+    auto config = Config("rejected-path-mode-" + std::to_string(std::wcslen(mode)));
+    config.pathMode = mode;
+    Require(!ValidateConfig(g_testWindow, config), "Unsafe path mode accepted: " + Narrow(mode));
+    Require(!std::filesystem::exists(config.releaseFolder), "Unsafe path mode created release output");
+  }
+  size_t index = 0;
+  for (const auto* parameters : {L"-spf", L"-spf2", L"-mx=3 \"-spf\"", L"-SPF", L"/spf"}) {
+    auto config = Config("rejected-spf-" + std::to_string(index++));
+    config.parameters = parameters;
+    Require(!ValidateConfig(g_testWindow, config), "Full paths accepted via parameters: " + Narrow(parameters));
+    Require(!std::filesystem::exists(config.releaseFolder), "Unsafe parameters created release output");
+  }
+}
+
+void NullTargetsDoNotQueueOwnedStrings() {
+  PostLog(nullptr, L"unowned log");
+  PostStatus(nullptr, L"unowned status");
+  MSG message{};
+  bool queued = false;
+  while (PeekMessageW(&message, reinterpret_cast<HWND>(static_cast<INT_PTR>(-1)),
+                       kLogMessage, kStatusMessage, PM_REMOVE)) {
+    std::unique_ptr<std::wstring> payload(reinterpret_cast<std::wstring*>(message.lParam));
+    queued = true;
+  }
+  Require(!queued, "Null PostMessage target queued strings with no owning window handler");
+  PostLog(g_testWindow, L"owned log");
+  PostStatus(g_testWindow, L"owned status");
+  DrainMessages();
+  Require(std::find(g_messages.begin(), g_messages.end(), L"owned log") != g_messages.end() &&
+              std::find(g_messages.begin(), g_messages.end(), L"owned status") != g_messages.end(),
+          "Valid log/status messages no longer transfer to the receiving window");
+}
+
+LRESULT CALLBACK HiddenPackerWindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
+  if (message == WM_DESTROY) return 0;
+  return WindowProc(hwnd, message, wParam, lParam);
+}
+
+void PackerLogRetainsLongOutputAndDefaults() {
+  g_instance = GetModuleHandleW(nullptr);
+  WNDCLASSW windowClass{};
+  windowClass.lpfnWndProc = HiddenPackerWindowProc;
+  windowClass.hInstance = g_instance;
+  windowClass.lpszClassName = L"HiddenPackerLogTest";
+  Require(RegisterClassW(&windowClass) != 0, "Unable to register hidden packer window");
+  const HWND window = CreateWindowExW(0, windowClass.lpszClassName, L"", WS_OVERLAPPED,
+                                      0, 0, 735, 710, nullptr, nullptr, g_instance, nullptr);
+  Require(window != nullptr, "Unable to create hidden packer controls");
+  try {
+    const auto defaults = ReadConfig(true);
+    Require(defaults.level == L"5" && defaults.method == L"LZMA2" && defaults.dictionary == L"32m" &&
+                defaults.wordSize == L"32" && defaults.solid == L"8g" && defaults.threads == L"20" &&
+                SevenZipVolumeSize(defaults.volumeSize) == L"4092m" && defaults.memoryLimitPercent == 80 &&
+                defaults.chunkSize == 64ull * 1024ull * 1024ull,
+            "Review fixes changed the compression/hash/memory defaults");
+    const auto limit = SendMessageW(g_logEdit, EM_GETLIMITTEXT, 0, 0);
+    std::cout << "REPRO: packer log EM_GETLIMITTEXT = " << limit << '\n';
+    const std::wstring line(100, L'x');
+    for (int i = 0; i < 700; ++i) AppendLog(line);
+    AppendLog(L"final-log-marker");
+    const auto log = GetText(g_logEdit);
+    Require(log.size() > 70000 && log.ends_with(L"final-log-marker\r\n"),
+            "Packer log truncated output beyond the edit-control default limit");
+    Require(defaults.pathMode == L"Relative paths" &&
+                SendMessageW(g_pathModeCombo, CB_GETCOUNT, 0, 0) == 1,
+            "Packer UI still offers the incompatible Full paths mode");
+  } catch (...) {
+    DestroyWindow(window);
+    throw;
+  }
+  DestroyWindow(window);
 }
 
 void CleanupIsNameScopedAndPreservesDirectories() {
@@ -294,20 +611,109 @@ void RealSingleZipCompression() {
           "ZIP manifest must use root-relative archive path");
 }
 
+void RealCyrillicPackingAndManifestRoundTrip() {
+  auto config = Config("cyrillic-compression");
+  const auto caseRoot = config.sourceFolder.parent_path();
+  config.sourceFolder = caseRoot / L"\u0418\u0441\u0442\u043e\u0447\u043d\u0438\u043a";
+  config.releaseFolder = caseRoot / L"\u0420\u0435\u043b\u0438\u0437\u044b";
+  config.archiveName = L"\u0421\u0431\u043e\u0440\u043a\u0430";
+  config.chunkSize = 3;
+  const std::filesystem::path payloadName = L"\u041c\u043e\u0434\u044b/\u0442\u0435\u0441\u0442.txt";
+  WriteFile(config.sourceFolder / payloadName, "abcdef");
+  if (!g_installerSource.empty()) {
+    auto setupConfig = config;
+    setupConfig.copyInstaller = true;
+    Require(PrepareInstallerSetup(g_testWindow, setupConfig, g_installerSource),
+            "Unable to prepare the Cyrillic E2E fixture installer");
+  }
+  Worker(g_testWindow, config);
+  const auto package = PackageFolder(config);
+  if (!g_installerSource.empty()) {
+    Require(ReadFile(package / "modlist-installer.exe") == ReadFile(g_installerSource / "modlist-installer.exe"),
+            "Cyrillic E2E fixture did not preserve the supplied installer");
+  }
+  const auto manifest = ReadFile(package / "manifest.json");
+  Require(MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, manifest.data(),
+                              static_cast<int>(manifest.size()), nullptr, 0) > 0,
+          "Packed Cyrillic manifest is not valid UTF-8");
+  const auto archiveName = Utf8Bytes(u8"\u0421\u0431\u043e\u0440\u043a\u0430.7z.001");
+  Require(manifest.find("\"path\": \"" + archiveName + "\"") != std::string::npos,
+          "Real packing did not write the literal Cyrillic UTF-8 archive filename");
+  // Use a real JSON parser and independent hashes, then pass the parsed UTF-8 path back to 7-Zip.
+  const auto script = caseRoot / "roundtrip.ps1";
+  WriteFile(script, R"ps(param([string]$ManifestPath, [string]$ExpectedName, [string]$SevenZip, [string]$Extracted)
+$ErrorActionPreference = 'Stop'
+$manifest = Get-Content -LiteralPath $ManifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
+if ($manifest.archive_name -cne $ExpectedName -or @($manifest.files).Count -ne 1) { throw 'Wrong archive name/file count' }
+$file = $manifest.files[0]
+if ($file.path -cne ($ExpectedName + '.7z.001')) { throw 'JSON UTF-8 path roundtrip failed' }
+$archive = Join-Path (Split-Path -Parent $ManifestPath) $file.path
+if ((Get-Item -LiteralPath $archive).Length -ne $file.size) { throw 'Manifest size mismatch' }
+$bytes = [IO.File]::ReadAllBytes($archive)
+$sha = [Security.Cryptography.SHA256]::Create()
+try {
+  $fullHash = [BitConverter]::ToString($sha.ComputeHash($bytes)).Replace('-', '').ToLowerInvariant()
+  if ($fullHash -cne $file.sha256) { throw 'Manifest full hash mismatch' }
+  $index = 0
+  for ($offset = 0; $offset -lt $bytes.Length; $offset += $manifest.hash.chunk_size) {
+    $count = [int][Math]::Min($manifest.hash.chunk_size, $bytes.Length - $offset)
+    $hash = [BitConverter]::ToString($sha.ComputeHash($bytes, $offset, $count)).Replace('-', '').ToLowerInvariant()
+    if ($hash -cne $file.chunks[$index]) { throw 'Manifest chunk hash mismatch' }
+    $index++
+  }
+  if ($index -ne @($file.chunks).Count) { throw 'Wrong manifest chunk count' }
+} finally { $sha.Dispose() }
+& $SevenZip x $archive ('-o' + $Extracted) -y | Out-Null
+if ($LASTEXITCODE -ne 0) { throw 'Parsed manifest archive could not be extracted' }
+Write-Output ('JSON roundtrip and independent full/chunk SHA-256 verified: ' + $file.sha256)
+)ps");
+  Require(ResolveSevenZip(g_testWindow, config), "Unable to resolve 7-Zip for Cyrillic extraction");
+  const auto extracted = caseRoot / L"\u0420\u0430\u0441\u043f\u0430\u043a\u043e\u0432\u0430\u043d\u043e";
+  const auto output = CaptureProcess(L"powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File " +
+                                        Quote(script) + L" -ManifestPath " + Quote(package / "manifest.json") +
+                                        L" -ExpectedName " + Quote(config.archiveName) + L" -SevenZip " +
+                                        Quote(config.sevenZipExe) + L" -Extracted " + Quote(extracted),
+                                    caseRoot / "roundtrip-output.txt");
+  Require(output.find("JSON roundtrip and independent full/chunk SHA-256 verified") != std::string::npos,
+          "Independent manifest roundtrip did not finish");
+  Require(ReadFile(extracted / payloadName) == "abcdef", "Cyrillic source filename/payload did not roundtrip");
+  Require(ReadFile(extracted / payloadName) == ReadFile(config.sourceFolder / payloadName),
+          "Extracted Cyrillic payload differs from the source");
+  std::atomic_uint64_t done{0};
+  FileManifest payload;
+  Require(HashArchiveFile(g_testWindow, extracted, extracted / payloadName, 3, payload, done, 6,
+                          std::chrono::steady_clock::now()), "Unable to hash the extracted Cyrillic payload");
+  Require(payload.path.generic_wstring() == L"\u041c\u043e\u0434\u044b/\u0442\u0435\u0441\u0442.txt" &&
+              payload.sha256 == L"bef57ec7f53a6d40beb640a780a639c83bc29ac8a9816f1fc6c5c6dcd93c4721" &&
+              payload.chunks == std::vector<std::wstring>{
+                  L"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+                  L"cb8379ac2098aa165029e3938a51da0bcecfc008fd6795f401178647f96c5b34"},
+          "Cyrillic payload lost its known filename or full/chunk SHA-256 hashes");
+  std::cout << "REPRO: Cyrillic UTF-8 path: " << archiveName << "; payload SHA-256: " << Narrow(payload.sha256) << '\n';
+}
+
 }  // namespace
 
 int wmain(int argc, wchar_t* argv[]) {
+  std::unique_ptr<OwnedFixtureTree> fixtureTree;
   try {
-    if (argc != 1) {
-      Require(argc == 3 && std::wstring(argv[1]) == L"--installer-source",
-              "Usage: packer_tests [--installer-source <folder containing modlist-installer.exe>]");
-      g_installerSource = std::filesystem::absolute(argv[2]);
-      Require(std::filesystem::is_regular_file(g_installerSource / "modlist-installer.exe"),
-              "Installer source folder must contain modlist-installer.exe");
+    bool keepFixtures = false;
+    const std::string usage = "Usage: packer_tests [--keep-fixtures] [--installer-source <folder containing modlist-installer.exe>]";
+    for (int i = 1; i < argc; ++i) {
+      const std::wstring option = argv[i];
+      if (option == L"--keep-fixtures" && !keepFixtures) {
+        keepFixtures = true;
+      } else if (option == L"--installer-source" && g_installerSource.empty() && i + 1 < argc) {
+        g_installerSource = std::filesystem::absolute(argv[++i]);
+        Require(std::filesystem::is_regular_file(g_installerSource / "modlist-installer.exe"),
+                "Installer source folder must contain modlist-installer.exe");
+      } else {
+        throw std::runtime_error(usage);
+      }
     }
-    g_fixtureRoot = ModuleFolder() / "test-fixtures" /
-        ("flat-layout-" + std::to_string(GetCurrentProcessId()) + "-" + std::to_string(GetTickCount64()));
-    Require(std::filesystem::create_directories(g_fixtureRoot), "Fixture directory already exists");
+    fixtureTree = std::make_unique<OwnedFixtureTree>(ModuleFolder() / "test-fixtures", keepFixtures);
+    g_fixtureRoot = fixtureTree->Root();
+    ScopedLocalAppData isolatedCache(g_fixtureRoot / "local-appdata");
     WNDCLASSW windowClass{};
     windowClass.lpfnWndProc = TestWindowProc;
     windowClass.hInstance = GetModuleHandleW(nullptr);
@@ -316,20 +722,28 @@ int wmain(int argc, wchar_t* argv[]) {
     g_testWindow = CreateWindowExW(0, windowClass.lpszClassName, L"", 0, 0, 0, 0, 0,
                                   HWND_MESSAGE, nullptr, windowClass.hInstance, nullptr);
     Require(g_testWindow != nullptr, "Unable to create test message window");
-    std::cout << "Fixture root: " << g_fixtureRoot.string() << std::endl;
+    std::cout << "Fixture root: " << Narrow(g_fixtureRoot.wstring()) << std::endl;
     const std::vector<std::pair<const char*, std::function<void()>>> tests{
+        {"fixture cleanup owns only this run and supports retention", FixtureCleanupIsOwnedAndRunScoped},
         {"flat preparation", FlatPreparation},
         {"portable installer preparation and refresh", PortableInstallerPreparation},
         {"missing installer rejection", MissingInstallerDoesNotFallBackToRuntimeFiles},
         {"Manifest Only root paths, filtering and known SHA-256 hashes", ManifestOnlyUsesFlatRootAndRealArchiveName},
         {"Manifest Only archive selection and ambiguity", ManifestOnlySelectionAndAmbiguity},
+        {"Cyrillic manifest UTF-8 bytes and known hashes", CyrillicManifestUsesUtf8AndKnownHashes},
         {"name-scoped cleanup preserves unrelated outputs", CleanupIsNameScopedAndPreservesDirectories},
         {"missing package cleanup", MissingPackageCleanupIsHarmless},
         {"cleanup preserves manifest directory", CleanupDoesNotDeleteManifestDirectory},
         {"source/release overlap rejection", OverlappingFoldersAreRejectedBeforeWriting},
         {"unsafe archive name rejection", UnsafeArchiveNamesAreRejectedBeforeWriting},
+        {"real -spf absolute archive metadata reproduction", RealSevenZipFullPathMetadata},
+        {"unsafe path mode and parameter rejection", UnsafePathModesAreRejectedBeforeWriting},
+        {"owned strings are not queued without a window", NullTargetsDoNotQueueOwnedStrings},
+        {"same-size embedded cache tamper regeneration", EmbeddedCacheRepairsSameSizeTampering},
+        {"packer log retains long output and compression defaults", PackerLogRetainsLongOutputAndDefaults},
         {"real compression, integrity test, extraction and manifest", RealCompressionTestAndManifest},
-        {"real unsplit ZIP compression and manifest", RealSingleZipCompression}};
+        {"real unsplit ZIP compression and manifest", RealSingleZipCompression},
+        {"real Cyrillic packing and parsed manifest roundtrip", RealCyrillicPackingAndManifestRoundTrip}};
     int failures = 0;
     for (const auto& [name, test] : tests) {
       g_cancelRequested = false;
@@ -348,9 +762,21 @@ int wmain(int argc, wchar_t* argv[]) {
       DrainMessages();
     }
     DestroyWindow(g_testWindow);
+    g_testWindow = nullptr;
     std::cout << tests.size() - failures << '/' << tests.size() << " tests passed\n";
+    if (keepFixtures) {
+      std::cout << "Fixtures retained: " << Narrow(g_fixtureRoot.wstring()) << '\n';
+    } else {
+      fixtureTree->Cleanup();
+      std::cout << "Fixtures removed: " << Narrow(g_fixtureRoot.wstring()) << '\n';
+    }
     return failures == 0 ? 0 : 1;
   } catch (const std::exception& error) {
+    if (g_testWindow != nullptr) {
+      DrainMessages();
+      DestroyWindow(g_testWindow);
+      g_testWindow = nullptr;
+    }
     std::cerr << "Test harness failed: " << error.what() << '\n';
     return 1;
   }

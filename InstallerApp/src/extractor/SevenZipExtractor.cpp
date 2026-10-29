@@ -2,6 +2,8 @@
 
 #include "paths/PathValidator.h"
 #include "app/RuntimePaths.h"
+#include "common/EmbeddedFile.h"
+#include "common/PathText.h"
 #include "resource.h"
 
 #ifndef NOMINMAX
@@ -90,13 +92,7 @@ Result<std::filesystem::path> ExtractEmbeddedSevenZip(const std::filesystem::pat
   }
 
   const auto outputPath = outputFolder / "7z.exe";
-  bool writeFile = true;
-  if (std::filesystem::exists(outputPath, ec) && !ec) {
-    const auto existingSize = std::filesystem::file_size(outputPath, ec);
-    writeFile = ec || existingSize != size;
-  }
-
-  if (writeFile) {
+  if (!EmbeddedFileMatches(outputPath, data, size)) {
     std::ofstream output(outputPath, std::ios::binary | std::ios::trunc);
     if (!output) {
       return Result<std::filesystem::path>::Error("Unable to write embedded 7-Zip executable.");
@@ -440,7 +436,7 @@ ExtractionResult SevenZipExtractor::Extract(const ExtractionConfig& config, Prog
     return result;
   }
   if (!std::filesystem::exists(config.archiveFirstPart, ec)) {
-    result.message = "Archive first part is missing: " + config.archiveFirstPart.string();
+    result.message = "Archive first part is missing: " + PathToUtf8(config.archiveFirstPart);
     return result;
   }
   std::filesystem::create_directories(config.installFolder, ec);
@@ -462,8 +458,8 @@ ExtractionResult SevenZipExtractor::Extract(const ExtractionConfig& config, Prog
   result.command = NarrowForLog(command);
   std::string outputTail;
   result.exitCode = RunProcessAndCapture(command, outputPath, outputTail, config.cancelRequested, progressCallback);
-  result.output = "Full 7-Zip output is streamed to:\n" + outputPath.string() + "\n\nLast captured output:\n" + outputTail;
-  result.ok = result.exitCode == 0 || result.exitCode == 1;
+  result.output = "Full 7-Zip output is streamed to:\n" + PathToUtf8(outputPath) + "\n\nLast captured output:\n" + outputTail;
+  result.ok = result.exitCode == 0;
   result.message = SevenZipExitMessage(result.exitCode);
   return result;
 }

@@ -3,6 +3,8 @@
 #include "extractor/SevenZipSdkInterfaces.h"
 #include "manifest/Manifest.h"
 #include "app/RuntimePaths.h"
+#include "common/EmbeddedFile.h"
+#include "common/PathText.h"
 #include "resource.h"
 
 #ifndef NOMINMAX
@@ -101,11 +103,6 @@ std::string HexDigest(const std::vector<uint8_t>& digest) {
   return out.str();
 }
 
-std::string PathToUtf8(const std::filesystem::path& path) {
-  const auto utf8 = path.u8string();
-  return std::string(reinterpret_cast<const char*>(utf8.data()), utf8.size());
-}
-
 std::string WindowsErrorMessage(DWORD error) {
   LPWSTR raw = nullptr;
   const DWORD length = FormatMessageW(
@@ -167,11 +164,7 @@ Result<std::filesystem::path> ExtractEmbeddedLibrary(const std::filesystem::path
         "Unable to create 7-Zip SDK cache folder: " + ec.message());
   }
   const auto output = folder / "7z.dll";
-  bool write = true;
-  if (std::filesystem::exists(output, ec) && !ec) {
-    write = std::filesystem::file_size(output, ec) != size || ec;
-  }
-  if (write) {
+  if (!EmbeddedFileMatches(output, data, size)) {
     std::ofstream stream(output, std::ios::binary | std::ios::trunc);
     if (!stream) {
       return Result<std::filesystem::path>::Error("Unable to write embedded 7z.dll");
@@ -207,20 +200,20 @@ bool EndsWithDigits(const std::string& value) {
 
 std::vector<const ManifestFile*> ArchiveVolumes(const Manifest& manifest) {
   std::vector<const ManifestFile*> volumes;
-  const std::string first = manifest.extract.firstArchivePart.generic_string();
+  const std::string first = GenericPathToUtf8(manifest.extract.firstArchivePart);
   if (first.size() >= 4 && first[first.size() - 4] == '.' && EndsWithDigits(first)) {
     const std::string prefix = first.substr(0, first.size() - 3);
     for (const auto& file : manifest.files) {
-      const std::string path = file.path.generic_string();
+      const std::string path = GenericPathToUtf8(file.path);
       if (path.size() == prefix.size() + 3 && path.starts_with(prefix) && EndsWithDigits(path)) {
         volumes.push_back(&file);
       }
     }
     std::sort(volumes.begin(), volumes.end(), [](const auto* left, const auto* right) {
-      return left->path.generic_string() < right->path.generic_string();
+      return GenericPathToUtf8(left->path) < GenericPathToUtf8(right->path);
     });
     for (size_t index = 0; index < volumes.size(); ++index) {
-      const std::string path = volumes[index]->path.generic_string();
+      const std::string path = GenericPathToUtf8(volumes[index]->path);
       const unsigned int number = static_cast<unsigned int>(std::stoul(path.substr(path.size() - 3)));
       if (number != index + 1) {
         return {};
@@ -487,14 +480,14 @@ public:
           volume.path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
           FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN | FILE_FLAG_OVERLAPPED, nullptr);
       if (volume.handle == INVALID_HANDLE_VALUE) {
-        error_ = "Unable to open archive volume " + volume.path.string() + ": " +
+        error_ = "Unable to open archive volume " + PathToUtf8(volume.path) + ": " +
                  WindowsErrorMessage(GetLastError());
         break;
       }
       LARGE_INTEGER actualSize{};
       if (!GetFileSizeEx(volume.handle, &actualSize) ||
           static_cast<uint64_t>(actualSize.QuadPart) != volume.size) {
-        error_ = "Archive volume size mismatch: " + volume.path.string();
+        error_ = "Archive volume size mismatch: " + PathToUtf8(volume.path);
         CloseHandle(volume.handle);
         volume.handle = INVALID_HANDLE_VALUE;
         break;
@@ -798,7 +791,7 @@ private:
                                     slot.requested, nullptr, &slot.overlapped);
       if (!started && GetLastError() != ERROR_IO_PENDING) {
         error = "Unable to start archive read for " +
-                volumes_[chunk.volumeIndex].path.string() + ": " +
+                PathToUtf8(volumes_[chunk.volumeIndex].path) + ": " +
                 WindowsErrorMessage(GetLastError());
         return false;
       }
@@ -818,7 +811,7 @@ private:
       if (!GetOverlappedResult(file, &slot.overlapped, &read, FALSE) ||
           read != slot.requested) {
         error = "Unable to read archive volume " +
-                volumes_[chunk.volumeIndex].path.string() + ": " +
+                PathToUtf8(volumes_[chunk.volumeIndex].path) + ": " +
                 WindowsErrorMessage(GetLastError());
         slot.active = false;
         cancelActive();
@@ -879,7 +872,7 @@ private:
       }
     }
     if (verifyHash && HexDigest(digest) != chunk.expectedHash) {
-      error = "SHA256 mismatch in " + volumes_[chunk.volumeIndex].path.filename().string() +
+      error = "SHA256 mismatch in " + PathToUtf8(volumes_[chunk.volumeIndex].path.filename()) +
               ", block " + std::to_string(chunk.fileChunkIndex + 1);
       return {};
     }

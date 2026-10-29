@@ -18,10 +18,10 @@ PackerApp/dist/modlist-packer.exe
 Ready-to-use versioned release archives are written to:
 
 ```text
-Release/ModlistInstaller-v0.3.4.zip
+Release/ModlistInstaller-v0.3.5.zip
 ```
 
-Extract the zip and run `modlist-packer.exe`. Published older ZIPs retain their original layout; the current source build uses the flat layout below.
+Download [v0.3.5](https://github.com/wallhead/ModListInstaller/releases/tag/v0.3.5), extract the ZIP, and run `modlist-packer.exe` inside its folder. The archive includes the matching installer, README, and 7-Zip license. No external UI files or browser runtime are needed. Published older ZIPs retain their original layout; v0.3.5 uses the flat layout below.
 
 ## Installer Runtime Layout
 
@@ -46,6 +46,7 @@ The installer reads `manifest.json` and archive parts beside its executable. UI 
 - One-read asynchronous SHA256 validation/extraction for chunked packer manifests: a background reader verifies blocks before an embedded 7-Zip SDK decoder can consume them.
 - Legacy manifests retain the separate full SHA256 pass and command-line 7-Zip extraction path.
 - Archive discovery beside the executable, using the archive filename from `manifest.json`.
+- UTF-8 manifest paths support non-English archive names across Windows display languages and code pages.
 - Before extraction, archive entry names are checked against the final install path. If every complete path fits within 240 UTF-16 code units, extraction goes directly into `<install root>\<archive_name>` and skips the final move.
 - Longer paths or unavailable archive metadata use the short `<drive>:\Unpacking` staging folder on the install volume.
 - Unpacked payload size recorded in new manifests for accurate free-space checks.
@@ -56,9 +57,13 @@ The installer reads `manifest.json` and archive parts beside its executable. UI 
 - Same-drive installs use move/cut semantics automatically when possible.
 - Successful staged installs remove the empty `<drive>:\Unpacking` folder; direct installs leave that unused folder untouched.
 - Embedded 7-Zip command-line and SDK components are cached in Local AppData when needed.
+- Cached tools are compared byte-for-byte with their embedded originals before reuse.
+- Progress updates are rate-limited to keep the native interface responsive; long paths are handled correctly by access checks.
 - A `logs` folder is created beside the executable on startup for the main log and extraction diagnostics.
 
 ## Quick Use
+
+Use Relative paths when packing. Absolute paths (`-spf` and `-spf2`) are rejected because they cannot be installed safely. The installer also refuses to overlap its own package folder; choose a different installation root when the generated final folder would be the downloaded package itself.
 
 1. Keep the packer and installer executables together.
 2. In the packer, select the source folder, release parent, and archive name.

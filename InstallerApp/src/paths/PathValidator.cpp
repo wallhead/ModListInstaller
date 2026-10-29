@@ -1,4 +1,5 @@
 #include "paths/PathValidator.h"
+#include "common/PathText.h"
 #include "manifest/Manifest.h"
 
 #include <algorithm>
@@ -62,7 +63,7 @@ std::optional<std::wstring> VolumeIdentity(const std::filesystem::path& path) {
 #endif
 
 bool StartsWithUsersFolder(const std::filesystem::path& path) {
-  const std::string text = Upper(path.lexically_normal().string());
+  const std::string text = Upper(PathToUtf8(path.lexically_normal()));
   return text.find(":\\USERS\\") != std::string::npos || text.find(":/USERS/") != std::string::npos;
 }
 
@@ -78,8 +79,20 @@ size_t Depth(const std::filesystem::path& path) {
 }
 
 bool CanWriteProbe(const std::filesystem::path& folder) {
+#ifdef _WIN32
+  // Probe filenames must not make a writable destination fail the legacy path limit.
+  auto folderText = folder.native();
+  if (!folderText.starts_with(L"\\\\?\\")) {
+    folderText = folderText.starts_with(L"\\\\")
+        ? L"\\\\?\\UNC\\" + folderText.substr(2)
+        : L"\\\\?\\" + folderText;
+  }
+  const std::filesystem::path accessFolder(folderText);
+#else
+  const auto& accessFolder = folder;
+#endif
   std::error_code ec;
-  std::filesystem::create_directories(folder, ec);
+  std::filesystem::create_directories(accessFolder, ec);
   if (ec) {
     return false;
   }
@@ -90,8 +103,8 @@ bool CanWriteProbe(const std::filesystem::path& folder) {
   const auto suffix = std::to_string(
       std::chrono::steady_clock::now().time_since_epoch().count());
 #endif
-  const auto probeFolder = folder / (".modlist_access_probe_" + suffix);
-  const auto movedProbeFolder = folder / (".modlist_access_probe_moved_" + suffix);
+  const auto probeFolder = accessFolder / (".modlist_access_probe_" + suffix);
+  const auto movedProbeFolder = accessFolder / (".modlist_access_probe_moved_" + suffix);
   std::filesystem::remove_all(probeFolder, ec);
   if (ec) {
     return false;
@@ -213,7 +226,7 @@ PathValidationResult PathValidator::ValidateDownloadFolder(const std::filesystem
   if (!result.ok) {
     return result;
   }
-  if (result.normalizedPath.string().size() > 120) {
+  if (result.normalizedPath.wstring().size() > 120) {
     result.warning = true;
     result.message = "Download folder path is long; resume and archive handling will be safer in a shorter folder.";
   }
@@ -226,7 +239,7 @@ PathValidationResult PathValidator::ValidateInstallFolder(const std::filesystem:
     return result;
   }
 
-  const std::string text = result.normalizedPath.string();
+  const std::wstring text = result.normalizedPath.wstring();
   if (text.size() > maxRecommendedInstallPathLength_) {
     result.warning = true;
     result.message = "Install path is longer than recommended. Choose a short root-level folder like D:\\Sky.";
@@ -250,7 +263,7 @@ bool PathValidator::IsSameDrive(const std::filesystem::path& a, const std::files
     return *aVolume == *bVolume;
   }
 #endif
-  return Upper(a.lexically_normal().root_name().string()) == Upper(b.lexically_normal().root_name().string());
+  return PathTextEqual(a.lexically_normal().root_name().wstring(), b.lexically_normal().root_name().wstring());
 }
 
 PathValidationResult PathValidator::ValidateBaseFolder(const std::filesystem::path& path, uintmax_t requiredBytes) const {
@@ -266,7 +279,7 @@ PathValidationResult PathValidator::ValidateBaseFolder(const std::filesystem::pa
     result.message = "Unable to normalize folder path: " + ec.message();
     return result;
   }
-  result.driveRoot = result.normalizedPath.root_name().string();
+  result.driveRoot = PathToUtf8(result.normalizedPath.root_name());
 
   if (!CanWriteProbe(result.normalizedPath)) {
     result.message = "Folder is not writable or cannot be created.";

@@ -17,7 +17,7 @@ SelectedReleaseParent\
     MyPack.7z.002
 ```
 
-The child folder is named from the archive name field, without an added archive extension. A new package contains only the installer, manifest, and archive file(s), with no `data`, `ui`, `tools`, or log directories. Manifest archive paths are plain filenames relative to this child folder.
+The child folder is named from the archive name field, without an added archive extension. A new package contains only the installer, manifest, and archive file(s), with no `data`, `ui`, `tools`, or log directories. Manifest archive paths are UTF-8 plain filenames relative to this child folder, including non-ASCII archive names.
 
 ## Manifest
 
@@ -32,7 +32,9 @@ The manifest stores:
 
 The default chunk size is 64 MiB.
 
-7-Zip is embedded inside `modlist-packer.exe` and extracted to a per-user cache when archive creation starts. The packer does not ask for an external `7z.exe`.
+7-Zip is embedded inside `modlist-packer.exe` and extracted to a per-user cache when archive creation starts. Cached executable bytes are compared with the embedded copy before reuse; a mismatch, including same-size corruption, causes regeneration. The packer does not ask for an external `7z.exe`.
+
+Only `Relative paths` is supported. Full paths (`-spf`, including `-spf2`) embed absolute source paths that the installer rejects. Full/unknown path modes and full-path switches in additional parameters are rejected before package output is created.
 
 The default compression profile matches the recommended release settings:
 
@@ -82,12 +84,16 @@ xmake build packer_tests
 xmake run packer_tests
 ```
 
-The console tests exercise the production setup, worker, embedded compression, archive integrity testing, extraction, full/chunk hashing, Manifest Only, overlap validation, and scoped cleanup on small files. Fixtures are retained under the printed `build\windows\x64\release\test-fixtures\flat-layout-...` path. Tests without an installer source use an inert installer placeholder.
+The console tests exercise the production setup, worker, embedded compression, archive integrity testing, extraction, full/chunk hashing, Manifest Only, overlap validation, and scoped cleanup on small files. Regressions cover real Cyrillic packing and UTF-8 manifest roundtrips, independent JSON/full/chunk hash verification, actual relative/`-spf` archive metadata, config/parameter rejection, same-size cached-tool tampering, and log output past the edit control's default 30,000-character limit. The JSON roundtrip uses Windows PowerShell's built-in JSON parser and .NET SHA-256, without extra modules.
+
+Each run uses a unique marked tree under the printed `build\windows\x64\release\test-fixtures\flat-layout-...` path and a private tool cache. By default, that run's tree is removed after tests, including failed tests. Cleanup does not sweep older runs or the parent directory; unrelated files/directories are preserved. Redirected paths, reparse points, and missing/changed ownership markers cause cleanup to refuse deletion. Tests without an installer source use an inert installer placeholder for the ASCII package.
 
 To recreate a launchable flat package with the current installer:
 
 ```powershell
-xmake run packer_tests --installer-source dist
+xmake run packer_tests --keep-fixtures --installer-source dist
 ```
 
-Open `compression\releases\My Pack\modlist-installer.exe` under the printed fixture root for native installer E2E. That folder contains the real installer, `manifest.json`, and three small split archive parts. The fixture's source and independently extracted payload are retained alongside `releases` for comparison. No UI automation or large benchmarks are run.
+`--keep-fixtures` also works alone, and either option order is accepted. `--installer-source` alone still cleans up after testing.
+
+Open `compression\releases\My Pack\modlist-installer.exe` under the printed fixture root for native installer E2E. That folder contains the real installer, `manifest.json`, and three small split archive parts. The Unicode E2E package is under `cyrillic-compression`, in its Cyrillic-named release parent and archive child; with `--installer-source`, it also contains the supplied installer. Its UTF-8 manifest points to the real Cyrillic archive filename, and the archive contains a Cyrillic nested payload with known SHA-256 hashes. Sources, independently extracted payloads, archive metadata listings, and the JSON verification output are retained for comparison. Controls are tested in a hidden native window; no visible UI automation or large benchmarks are run.

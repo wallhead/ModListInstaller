@@ -2,6 +2,8 @@
 #include "app/RuntimePaths.h"
 #include "ui/NativeStrings.h"
 #include "common/EmbeddedResource.h"
+#include "common/PathText.h"
+#include "common/ProgressThrottle.h"
 #include "extractor/PipelinedSevenZipExtractor.h"
 #include "extractor/SevenZipExtractor.h"
 #include "manifest/Json.h"
@@ -94,6 +96,22 @@ void TestSha256() {
          "SHA256 digest mismatch");
 }
 
+void TestProgressThrottle() {
+  ProgressThrottle throttle(std::chrono::milliseconds(100));
+  const auto start = std::chrono::steady_clock::time_point{};
+  Expect(throttle.ShouldReport(false, start), "First progress update must be delivered");
+  for (int i = 0; i < 1000; ++i) {
+    Expect(!throttle.ShouldReport(false, start + std::chrono::milliseconds(99)),
+           "Progress callbacks within 100 ms must be coalesced");
+  }
+  Expect(throttle.ShouldReport(false, start + std::chrono::milliseconds(100)),
+         "Progress should refresh at ten updates per second");
+  Expect(throttle.ShouldReport(true, start + std::chrono::milliseconds(101)),
+         "Final progress updates must bypass the time limit");
+  Expect(PathTextEqual(L"D:\\\u0421\u0411\u041e\u0420\u041a\u0410", L"d:\\\u0441\u0431\u043e\u0440\u043a\u0430"),
+         "Windows path comparison must handle Cyrillic case without locale dependence");
+}
+
 void TestManifestLoader() {
   ManifestLoader loader;
   auto manifest = loader.LoadFromString(ValidManifestJson(Sha256::HexDigest("abc")));
@@ -118,6 +136,50 @@ void TestPackerManifestLoader() {
          "Packer manifest chunk hash should be retained");
   Expect(manifest.value().files[0].chunkSha256[0] == Sha256::HexDigest("abc"),
          "Packer manifest chunk hash mismatch");
+}
+
+void TestUtf8ManifestArchivePaths() {
+  std::string json = PackerManifestJson(Sha256::HexDigest("abc"));
+  const std::string escapedName = R"(\u0421\u0431\u043e\u0440\u043a\u0430_\uD83D\uDE00)";
+  size_t position = 0;
+  while ((position = json.find("MyPack", position)) != std::string::npos) {
+    json.replace(position, 6, escapedName);
+    position += escapedName.size();
+  }
+  const auto expected = std::filesystem::path(L"\u0421\u0431\u043e\u0440\u043a\u0430_\U0001F600.7z.001");
+  auto manifest = ManifestLoader().LoadFromString(json);
+  Expect(manifest.ok(), manifest.error().c_str());
+  Expect(manifest.value().files.front().path == expected &&
+             manifest.value().extract.firstArchivePart == expected,
+         "Manifest archive paths must decode UTF-8 independently of the Windows code page");
+  const auto root = std::filesystem::temp_directory_path() / "modlist_utf8_archive_test";
+  std::filesystem::create_directories(root);
+  { std::ofstream out(root / expected, std::ios::binary); out << "abc"; }
+  Expect(Verifier().Verify(root, manifest.value().files).ok,
+         "The UTF-8 manifest should verify the actual Unicode archive filename");
+  auto package = DiscoverPackageNear(root);
+  Expect(package.ok() && package.value().firstArchivePart == root / expected,
+         "Archive discovery must support filenames outside the active ANSI code page");
+  { std::ofstream file(root / "one.torrent"); file << "torrent"; }
+  { std::ofstream file(root / "two.torrent"); file << "torrent"; }
+  Expect(DiscoverPackageNear(root, false).ok(),
+         "The local installer must ignore unrelated torrent files");
+  std::filesystem::remove_all(root);
+}
+
+void TestExecutableCacheRepairsSameSizeTampering() {
+  SevenZipExtractor extractor;
+  const auto root = std::filesystem::temp_directory_path() / "modlist_cache_tampering_test";
+  const auto original = extractor.LocateExecutable(root);
+  Expect(original.ok(), original.error().c_str());
+  const auto originalHash = Sha256::FileHexDigest(original.value());
+  {
+    std::fstream file(original.value(), std::ios::binary | std::ios::in | std::ios::out);
+    file.put('X');
+  }
+  const auto repaired = extractor.LocateExecutable(root);
+  Expect(repaired.ok() && Sha256::FileHexDigest(repaired.value()).value() == originalHash.value(),
+         "A same-size altered cached 7z.exe must be replaced with embedded bytes");
 }
 
 void TestPackerManifestRejectsInvalidChunks() {
@@ -501,6 +563,24 @@ void TestPathValidatorAcceptsFolderWithDeleteAccess() {
   std::filesystem::remove_all(root);
 }
 
+void TestPathValidatorAcceptsLongWritableFolder() {
+  const auto base = std::filesystem::temp_directory_path() /
+      ("modlist_long_probe_" + std::to_string(GetCurrentProcessId()));
+  auto folder = base;
+  while (folder.native().size() < 219) {
+    const auto remaining = 219 - folder.native().size();
+    if (remaining == 1) folder += L"x";
+    else folder /= std::wstring(std::min<size_t>(48, remaining - 1), L'x');
+  }
+  std::filesystem::create_directories(folder);
+  const auto result = PathValidator().ValidateInstallFolder(folder);
+  const bool empty = std::filesystem::is_empty(folder);
+  std::filesystem::remove_all(base);
+  Expect(result.ok,
+         "A writable 219-character destination must not fail because its access probe exceeds MAX_PATH");
+  Expect(empty, "Long-path validation left an access probe behind");
+}
+
 void TestWindowsMoveAcceptsLockedEmptySourceAfterFilesMove() {
   const auto root =
       std::filesystem::temp_directory_path() / "modlist_empty_source_lock";
@@ -697,7 +777,7 @@ void TestPipelinedExtractor() {
   }
 
   const auto sevenZip = std::filesystem::current_path() / "resources" / "7z.exe";
-  const auto archive = archives / "pipeline.7z";
+  const auto archive = archives / std::filesystem::path(L"\u0421\u0431\u043e\u0440\u043a\u0430_\U0001F600.7z");
   const std::wstring arguments = L"a " + QuoteCommandArgument(archive) + L" " +
       QuoteCommandArgument(payload.filename()) + L" " +
       QuoteCommandArgument(smallFiles.filename()) + L" -mx=1 -v1m";
@@ -733,6 +813,11 @@ void TestPipelinedExtractor() {
   const auto sdkCache = root / "sdk-cache";
   const auto library = extractor.LocateLibrary(sdkCache);
   Expect(library.ok(), library.error().c_str());
+  const auto libraryHash = Sha256::FileHexDigest(library.value());
+  { std::fstream file(library.value(), std::ios::binary | std::ios::in | std::ios::out); file.put('X'); }
+  const auto repairedLibrary = extractor.LocateLibrary(sdkCache);
+  Expect(repairedLibrary.ok() && Sha256::FileHexDigest(repairedLibrary.value()).value() == libraryHash.value(),
+         "A same-size altered cached 7z.dll must be replaced before loading");
   Expect(library.value() == UserRuntimeFolder(sdkCache) / "tools" / "7zip" / "7z.dll",
          "Pipeline test should use the embedded 7-Zip SDK library");
   Expect(std::filesystem::is_regular_file(
@@ -980,8 +1065,11 @@ int main() {
            "Windows application manifest must be embedded as resource type 24");
 #endif
     TestSha256();
+    TestProgressThrottle();
     TestManifestLoader();
     TestPackerManifestLoader();
+    TestUtf8ManifestArchivePaths();
+    TestExecutableCacheRepairsSameSizeTampering();
     TestPackerManifestRejectsInvalidChunks();
     TestManifestRejectsUnsafeArchiveName();
     TestPackerManifestInfersArchiveName();
@@ -999,6 +1087,7 @@ int main() {
     TestWindowsMoveFallsBackToIndividualLockedEntry();
     TestPathValidatorRejectsFolderWithoutDeleteAccess();
     TestPathValidatorAcceptsFolderWithDeleteAccess();
+    TestPathValidatorAcceptsLongWritableFolder();
     TestWindowsMoveAcceptsLockedEmptySourceAfterFilesMove();
     TestWindowsMoveAcceptsLockedEmptyNestedSourceAfterFilesMove();
     TestInstallMoveFailureProvidesManualRecoveryPaths();

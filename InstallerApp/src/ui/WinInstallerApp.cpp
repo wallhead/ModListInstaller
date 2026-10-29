@@ -2,6 +2,8 @@
 
 #include "app/PackageDiscovery.h"
 #include "app/RuntimePaths.h"
+#include "common/PathText.h"
+#include "common/ProgressThrottle.h"
 #include "extractor/PipelinedSevenZipExtractor.h"
 #include "extractor/SevenZipExtractor.h"
 #include "manifest/Manifest.h"
@@ -360,7 +362,8 @@ void AppendLog(const std::wstring& text) {
 }
 
 void PostLog(HWND hwnd, std::wstring text) {
-  PostMessageW(hwnd, kLogMessage, 0, reinterpret_cast<LPARAM>(new std::wstring(std::move(text))));
+  auto owned = std::make_unique<std::wstring>(std::move(text));
+  if (PostMessageW(hwnd, kLogMessage, 0, reinterpret_cast<LPARAM>(owned.get()))) owned.release();
 }
 
 void PostProgress(HWND hwnd, int progress) {
@@ -368,7 +371,8 @@ void PostProgress(HWND hwnd, int progress) {
 }
 
 void PostStatus(HWND hwnd, std::wstring text) {
-  PostMessageW(hwnd, kStatusMessage, 0, reinterpret_cast<LPARAM>(new std::wstring(std::move(text))));
+  auto owned = std::make_unique<std::wstring>(std::move(text));
+  if (PostMessageW(hwnd, kStatusMessage, 0, reinterpret_cast<LPARAM>(owned.get()))) owned.release();
 }
 
 void PostValidationFailed(HWND hwnd) {
@@ -393,10 +397,6 @@ std::filesystem::path ExeFolder() {
   return ModuleFolder();
 }
 
-std::filesystem::path RuntimeFolder() {
-  return modlist::UserRuntimeFolder(ExeFolder());
-}
-
 std::filesystem::path ArchiveFolder() {
   return modlist::LocateInstallerPackage(ExeFolder()).archiveFolder;
 }
@@ -407,6 +407,13 @@ std::filesystem::path PackageFolder() {
 
 std::filesystem::path ManifestPath() {
   return modlist::LocateInstallerPackage(ExeFolder()).manifestPath;
+}
+
+std::wstring PackageOverlapMessage(const std::filesystem::path& target) {
+  return L"Папка установки или распаковки пересекается с папкой установщика и архивов.\n\n"
+      L"Пакет: " + PathToDisplay(ExeFolder()) + L"\nИтоговый путь: " + PathToDisplay(target) +
+      L"\n\nВыберите другую папку установки или сначала переместите папку пакета в другое место. "
+      L"Например, пакет D:\\Games\\Sky нельзя установить в D:\\Games\\Sky; выберите другой корневой каталог.";
 }
 
 bool PackageManifestFileExists() {
@@ -1295,7 +1302,7 @@ std::optional<modlist::Manifest> LoadPackageManifest(std::wstring& message);
 std::optional<std::filesystem::path> ArchivePartFromManifest(const modlist::Manifest& manifest);
 
 modlist::Result<modlist::PackageDiscovery> ReadPackageFromUi() {
-  auto package = modlist::DiscoverPackageNear(PackageFolder());
+  auto package = modlist::DiscoverPackageNear(PackageFolder(), false);
   if (package.ok() && !package.value().firstArchivePart.has_value()) {
     package.value().firstArchivePart = FindFirstArchivePart(ArchiveFolder());
   }
@@ -1352,6 +1359,7 @@ bool VerifyPackageManifest(HWND hwnd, const modlist::Manifest& manifest) {
   std::atomic_bool failed{false};
   const auto startedAt = std::chrono::steady_clock::now();
   std::mutex jobsMutex;
+  modlist::ProgressThrottle validationThrottle;
   std::deque<modlist::ManifestFile> jobs;
   for (const auto& file : manifest.files) {
     jobs.push_back(file);
@@ -1366,6 +1374,7 @@ bool VerifyPackageManifest(HWND hwnd, const modlist::Manifest& manifest) {
   };
 
   auto postProgress = [&]() {
+    if (!validationThrottle.ShouldReport()) return;
     const uintmax_t done = doneBytes.load();
     const int percent = totalBytes > 0 ? static_cast<int>((done * 100) / totalBytes) : 0;
     const auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
@@ -1877,10 +1886,12 @@ bool RunExtractionStep(HWND hwnd,
   int sampledEta = -1;
   const auto startedAt = std::chrono::steady_clock::now();
   auto etaSampledAt = startedAt;
+  modlist::ProgressThrottle progressThrottle;
   const auto result = extractor.Extract(
       extraction,
       [hwnd, statusLabel, progressBase, progressSpan, estimatedBytes, startedAt,
-       &lastPercent, &sampledSpeed, &sampledEta, &etaSampledAt](int percent) {
+       &lastPercent, &sampledSpeed, &sampledEta, &etaSampledAt, &progressThrottle](int percent) {
+        if (!progressThrottle.ShouldReport()) return;
         const auto now = std::chrono::steady_clock::now();
         const auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - startedAt).count();
         if (percent != lastPercent) {
@@ -1944,6 +1955,8 @@ bool RunPipelinedExtractionStep(HWND hwnd,
   PostProgress(hwnd, progressBase);
   const auto startedAt = std::chrono::steady_clock::now();
   struct PipelineActivityLogState {
+    modlist::ProgressThrottle progressThrottle;
+    bool completionReported{false};
     std::vector<bool> announcedArchives;
     std::vector<bool> completedArchives;
     std::vector<bool> extractedArchives;
@@ -1963,8 +1976,6 @@ bool RunPipelinedExtractionStep(HWND hwnd,
                   100, progress.validatedBytes * 100 / progress.validationTotalBytes))
             : 0;
         const int overallPercent = std::min(validationPercent, progress.extractionPercent);
-        PostProgress(hwnd, progressBase + overallPercent * progressSpan / 100);
-
         if (progress.validationArchiveCount > 0 &&
             activityLog->announcedArchives.size() != progress.validationArchiveCount) {
           activityLog->announcedArchives.assign(progress.validationArchiveCount, false);
@@ -2019,6 +2030,11 @@ bool RunPipelinedExtractionStep(HWND hwnd,
           }
         }
 
+        const bool completed = validationPercent == 100 && progress.extractionPercent == 100;
+        const bool force = completed && !activityLog->completionReported;
+        if (!activityLog->progressThrottle.ShouldReport(force)) return;
+        activityLog->completionReported = activityLog->completionReported || completed;
+        PostProgress(hwnd, progressBase + overallPercent * progressSpan / 100);
         const auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
             std::chrono::steady_clock::now() - startedAt).count();
         uintmax_t speed = 0;
@@ -2102,9 +2118,6 @@ std::wstring NormalizedPathText(const std::filesystem::path& path) {
   if (ec) {
     normalized = path.lexically_normal().wstring();
   }
-  for (auto& ch : normalized) {
-    ch = static_cast<wchar_t>(std::towlower(ch));
-  }
   while (!normalized.empty() && (normalized.back() == L'\\' || normalized.back() == L'/')) {
     normalized.pop_back();
   }
@@ -2112,14 +2125,14 @@ std::wstring NormalizedPathText(const std::filesystem::path& path) {
 }
 
 bool IsSameFolder(const std::filesystem::path& a, const std::filesystem::path& b) {
-  return NormalizedPathText(a) == NormalizedPathText(b);
+  return modlist::PathTextEqual(NormalizedPathText(a), NormalizedPathText(b));
 }
 
 bool IsChildFolder(const std::filesystem::path& child, const std::filesystem::path& parent) {
   const auto childText = NormalizedPathText(child);
   const auto parentText = NormalizedPathText(parent);
   return childText.size() > parentText.size() &&
-         childText.starts_with(parentText) &&
+         modlist::PathTextEqual(std::wstring_view(childText).substr(0, parentText.size()), parentText) &&
          (childText[parentText.size()] == L'\\' || childText[parentText.size()] == L'/');
 }
 
@@ -2700,7 +2713,7 @@ bool ValidateFolders(const SpaceRequirements& requirements = {},
   if ((!installFolder.empty() && modlist::InstallationOverlapsPackage(installFolder, ExeFolder())) ||
       (!unpackFolder.empty() && modlist::InstallationOverlapsPackage(unpackFolder, ExeFolder()))) {
     SendUiError(UiText("path_error_title", L"Ошибка пути"),
-                L"Папки установки и распаковки не должны пересекаться с папкой установщика и архивов.");
+                PackageOverlapMessage(installFolder));
     return false;
   }
   if (!unpackFolder.empty()) {
@@ -2915,7 +2928,7 @@ void StartInstall(HWND hwnd) {
   }
   if (modlist::InstallationOverlapsPackage(installFolder, ExeFolder())) {
     SendUiError(UiText("path_error_title", L"Ошибка пути"),
-                L"Папка установки не должна пересекаться с папкой установщика и архивов.");
+                PackageOverlapMessage(installFolder));
     return;
   }
   g_stopRequested = false;
@@ -3172,7 +3185,6 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
       controls.dwICC = ICC_PROGRESS_CLASS;
       InitCommonControlsEx(&controls);
       AppLogPath();
-      std::filesystem::create_directories(RuntimeFolder() / "tools" / "7zip");
       ApplyWindowFrameTheme(hwnd);
       std::wstring themeWarning;
       if (!g_nativeView.Initialize(hwnd, &themeWarning)) {
@@ -3220,6 +3232,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
                                   16, 177, 622, 258, hwnd,
                                   reinterpret_cast<HMENU>(static_cast<INT_PTR>(kLogEdit)), g_instance, nullptr);
       RecreateUiFonts(hwnd);
+      SendMessageW(g_logEdit, EM_SETLIMITTEXT, 4 * 1024 * 1024, 0);
       SetWindowTheme(g_unpackDriveCombo, L"DarkMode_CFD", nullptr);
       SetWindowTheme(g_installEdit, L"DarkMode_Explorer", nullptr);
       SetWindowTheme(g_logEdit, L"DarkMode_Explorer", nullptr);
@@ -3274,7 +3287,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
       const auto finalFolder = FinalInstallFolder(std::filesystem::path(GetText(g_installEdit)));
       modlist::NativeInstallerViewState state;
       state.title = UiText("app_title", L"Modlist Installer Beta");
-      state.version = UiText("app_version", L"Modlist Installer v0.3.4 by WallHead");
+      state.version = UiText("app_version", L"Modlist Installer v0.3.5 by WallHead");
       state.unpackNote = UiText(
           "unpack_note",
           L"Установщик проверит пути в архиве и распакует файлы прямо в папку установки, если пути достаточно короткие. Иначе он использует временную папку, затем перенесет файлы.");

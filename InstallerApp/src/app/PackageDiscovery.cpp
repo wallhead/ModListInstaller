@@ -1,4 +1,5 @@
 #include "app/PackageDiscovery.h"
+#include "common/PathText.h"
 
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -22,11 +23,11 @@ std::string Lower(std::string value) {
 }
 
 bool HasExtension(const std::filesystem::path& path, const std::string& extension) {
-  return Lower(path.extension().string()) == extension;
+  return Lower(PathToUtf8(path.extension())) == extension;
 }
 
 bool IsFirstArchivePart(const std::filesystem::path& path) {
-  const std::string name = Lower(path.filename().string());
+  const std::string name = Lower(PathToUtf8(path.filename()));
   return name.size() > 7 && name.ends_with(".7z.001");
 }
 
@@ -76,10 +77,10 @@ InstallerPackageLayout LocateInstallerPackage(const std::filesystem::path& execu
   return {manifest, executableFolder};
 }
 
-Result<PackageDiscovery> DiscoverPackageNear(const std::filesystem::path& folder) {
+Result<PackageDiscovery> DiscoverPackageNear(const std::filesystem::path& folder, bool includeTorrents) {
   std::error_code ec;
   if (!std::filesystem::exists(folder, ec) || !std::filesystem::is_directory(folder, ec)) {
-    return Result<PackageDiscovery>::Error("Package folder does not exist: " + folder.string());
+    return Result<PackageDiscovery>::Error("Package folder does not exist: " + PathToUtf8(folder));
   }
 
   std::vector<std::filesystem::path> torrents;
@@ -89,7 +90,7 @@ Result<PackageDiscovery> DiscoverPackageNear(const std::filesystem::path& folder
       continue;
     }
     const auto path = entry.path();
-    if (HasExtension(path, ".torrent")) {
+    if (includeTorrents && HasExtension(path, ".torrent")) {
       torrents.push_back(path);
     } else if (!firstArchivePart.has_value() && IsFirstArchivePart(path)) {
       firstArchivePart = path;
@@ -111,10 +112,10 @@ Result<PackageDiscovery> DiscoverPackageNear(const std::filesystem::path& folder
 Result<PackageDiscovery> DiscoverPackageFromTorrent(const std::filesystem::path& torrentFile) {
   std::error_code ec;
   if (!std::filesystem::exists(torrentFile, ec) || !std::filesystem::is_regular_file(torrentFile, ec)) {
-    return Result<PackageDiscovery>::Error("Torrent file does not exist: " + torrentFile.string());
+    return Result<PackageDiscovery>::Error("Torrent file does not exist: " + PathToUtf8(torrentFile));
   }
   if (!HasExtension(torrentFile, ".torrent")) {
-    return Result<PackageDiscovery>::Error("Expected a .torrent file: " + torrentFile.string());
+    return Result<PackageDiscovery>::Error("Expected a .torrent file: " + PathToUtf8(torrentFile));
   }
 
   auto package = DiscoverPackageNear(torrentFile.parent_path());
