@@ -72,7 +72,7 @@ class NativeInstallerView {
 public:
   bool Initialize(HWND hwnd, std::wstring* warning);
   void Paint(HWND hwnd, const NativeInstallerViewState& state, const RECT* updateRect = nullptr);
-  void PaintDialog(HWND hwnd, const std::wstring& title, const std::wstring& message);
+  void PaintDialog(HWND hwnd, HDC dc, const std::wstring& title, const std::wstring& message) const;
   void PaintDrivePopup(HWND hwnd, const std::vector<std::wstring>& drives,
                        int selectedIndex, int hotIndex);
   void Resize(UINT width, UINT height);
@@ -92,6 +92,7 @@ private:
   HRESULT CreateTextFormats();
   HRESULT EnsureTarget(HWND hwnd);
   HRESULT EnsureDcTarget(HWND hwnd);
+  HRESULT PaintFrame(HWND hwnd, const NativeInstallerViewState& state, const RECT* updateRect);
   Microsoft::WRL::ComPtr<ID2D1SolidColorBrush> Brush(ID2D1RenderTarget* target,
                                                      uint32_t color) const;
   void DrawText(ID2D1RenderTarget* target,
@@ -107,6 +108,8 @@ private:
   Microsoft::WRL::ComPtr<IDWriteFactory> writeFactory_;
   Microsoft::WRL::ComPtr<ID2D1HwndRenderTarget> target_;
   Microsoft::WRL::ComPtr<ID2D1DCRenderTarget> dcTarget_;
+  bool frameValid_ = false;
+  bool preferSoftware_ = false;
   Microsoft::WRL::ComPtr<IDWriteTextFormat> titleFormat_;
   Microsoft::WRL::ComPtr<IDWriteTextFormat> versionFormat_;
   Microsoft::WRL::ComPtr<IDWriteTextFormat> bodyFormat_;

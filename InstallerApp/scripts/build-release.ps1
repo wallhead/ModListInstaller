@@ -11,6 +11,8 @@ try {
   if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
   xmake run installer_core_tests
   if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+  xmake run installer_ui_tests
+  if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
   New-Item -ItemType Directory -Path ".\dist" -Force | Out-Null
   Copy-Item ".\build\windows\x64\release\modlist-installer-gui.exe" ".\dist\modlist-installer.exe" -Force

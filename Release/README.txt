@@ -1,4 +1,4 @@
-ModListInstaller v0.3.5
+ModListInstaller v0.3.6
 
 Keep modlist-packer.exe and modlist-installer.exe together. Run the packer to
 create <selected release parent>\<archive name>.
@@ -16,6 +16,8 @@ tools are stored under %LOCALAPPDATA%\ModlistInstaller\<package key>.
 It does not require WebView2, Edge, .NET, or internet access.
 Archive names and manifest file paths are UTF-8, including non-English names.
 Cached extraction tools are verified against their embedded originals before use.
+Successful installation shows 100% and a themed completion message. Popup text
+and backgrounds do not require a GPU render target.
 
 The final folder is <selected install root>\<archive_name>. Before extraction,
 the installer checks all archive entry paths. If every full destination path

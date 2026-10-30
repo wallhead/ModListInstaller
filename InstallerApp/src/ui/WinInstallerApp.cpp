@@ -929,7 +929,7 @@ LRESULT CALLBACK ThemedDialogProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM
       PAINTSTRUCT paint{};
       BeginPaint(hwnd, &paint);
       if (data != nullptr) {
-        g_nativeView.PaintDialog(hwnd, data->title, data->message);
+        g_nativeView.PaintDialog(hwnd, paint.hdc, data->title, data->message);
       }
       EndPaint(hwnd, &paint);
       return 0;
@@ -1009,6 +1009,9 @@ int ShowThemedMessage(HWND owner,
                       const std::wstring& title,
                       const std::wstring& message,
                       bool confirmation = false) {
+  if (owner != nullptr && IsWindow(owner)) {
+    RedrawWindow(owner, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN);
+  }
   static bool registered = false;
   constexpr wchar_t className[] = L"ModlistInstallerThemedDialog";
   if (!registered) {
@@ -1018,6 +1021,7 @@ int ShowThemedMessage(HWND owner,
     windowClass.lpszClassName = className;
     windowClass.hCursor = LoadCursorW(nullptr, MAKEINTRESOURCEW(32512));
     windowClass.hIcon = LoadIconW(g_instance, MAKEINTRESOURCEW(IDI_MODLIST_INSTALLER));
+    windowClass.hbrBackground = static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH));
     if (RegisterClassW(&windowClass) == 0 && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
       return confirmation ? IDNO : IDOK;
     }
@@ -1037,7 +1041,7 @@ int ShowThemedMessage(HWND owner,
   const UINT dpi = owner != nullptr ? GetDpiForWindow(owner) : GetDpiForSystem();
   RECT windowRect{0, 0, MulDiv(480, static_cast<int>(dpi), 96),
                   MulDiv(heightDip, static_cast<int>(dpi), 96)};
-  constexpr DWORD style = WS_POPUP | WS_CAPTION | WS_SYSMENU;
+  constexpr DWORD style = WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_CLIPCHILDREN;
   AdjustWindowRectExForDpi(&windowRect, style, FALSE, WS_EX_DLGMODALFRAME, dpi);
   int x = CW_USEDEFAULT;
   int y = CW_USEDEFAULT;
@@ -3287,7 +3291,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
       const auto finalFolder = FinalInstallFolder(std::filesystem::path(GetText(g_installEdit)));
       modlist::NativeInstallerViewState state;
       state.title = UiText("app_title", L"Modlist Installer Beta");
-      state.version = UiText("app_version", L"Modlist Installer v0.3.5 by WallHead");
+      state.version = UiText("app_version", L"Modlist Installer v0.3.6 by WallHead");
       state.unpackNote = UiText(
           "unpack_note",
           L"Установщик проверит пути в архиве и распакует файлы прямо в папку установки, если пути достаточно короткие. Иначе он использует временную папку, затем перенесет файлы.");
@@ -3431,13 +3435,17 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
       return 0;
     }
     case kProgressMessage:
-      SendMessageW(g_progress, PBM_SETPOS, static_cast<int>(wParam), 0);
-      SendUiProgress(static_cast<int>(wParam), g_statusText);
+      if (!g_installCompleted) {
+        SendMessageW(g_progress, PBM_SETPOS, static_cast<int>(wParam), 0);
+        SendUiProgress(static_cast<int>(wParam), g_statusText);
+      }
       return 0;
     case kStatusMessage: {
       std::unique_ptr<std::wstring> text(reinterpret_cast<std::wstring*>(lParam));
-      SetWindowTextW(g_statusLabel, text->c_str());
-      SendUiStatus(*text);
+      if (!g_installCompleted) {
+        SetWindowTextW(g_statusLabel, text->c_str());
+        SendUiStatus(*text);
+      }
       return 0;
     }
     case kValidationFailedMessage:
@@ -3505,9 +3513,13 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
       return 0;
     }
     case kWorkerFinishedMessage: {
+      g_workerRunning = false;
       SetControlsRunning(hwnd, false);
       if (wParam != 0 && !g_closeAfterWorker) {
         g_installCompleted = true;
+        SendMessageW(g_progress, PBM_SETPOS, 100, 0);
+        SetWindowTextW(g_statusLabel, L"Установка 100%");
+        SendUiProgress(100, L"Установка 100%");
         SetWindowTextW(GetDlgItem(hwnd, kStartButton), UiText("button_close", L"Закрыть").c_str());
         SendUiState();
         ShowThemedMessage(hwnd, UiText("window_title", L"Modlist Installer Beta"),

@@ -18,10 +18,10 @@ PackerApp/dist/modlist-packer.exe
 Ready-to-use versioned release archives are written to:
 
 ```text
-Release/ModlistInstaller-v0.3.5.zip
+Release/ModlistInstaller-v0.3.6.zip
 ```
 
-Download [v0.3.5](https://github.com/wallhead/ModListInstaller/releases/tag/v0.3.5), extract the ZIP, and run `modlist-packer.exe` inside its folder. The archive includes the matching installer, README, and 7-Zip license. No external UI files or browser runtime are needed. Published older ZIPs retain their original layout; v0.3.5 uses the flat layout below.
+Download [v0.3.6](https://github.com/wallhead/ModListInstaller/releases/tag/v0.3.6), extract the ZIP, and run `modlist-packer.exe` inside its folder. The archive includes the matching installer, README, and 7-Zip license. No external UI files or browser runtime are needed. Published older ZIPs retain their original layout; current releases use the flat layout below.
 
 ## Installer Runtime Layout
 
@@ -59,6 +59,7 @@ The installer reads `manifest.json` and archive parts beside its executable. UI 
 - Embedded 7-Zip command-line and SDK components are cached in Local AppData when needed.
 - Cached tools are compared byte-for-byte with their embedded originals before reuse.
 - Progress updates are rate-limited to keep the native interface responsive; long paths are handled correctly by access checks.
+- Successful installation reaches 100% before the themed completion dialog appears. Popup backgrounds and text remain readable without a GPU render target, and late progress messages cannot restore a stale percentage.
 - A `logs` folder is created beside the executable on startup for the main log and extraction diagnostics.
 
 ## Quick Use

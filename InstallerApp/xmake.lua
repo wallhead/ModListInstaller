@@ -1,5 +1,5 @@
 set_project("ModlistInstaller")
-set_version("0.3.5")
+set_version("0.3.6")
 
 add_rules("mode.debug", "mode.release")
 set_languages("c++20")
@@ -104,3 +104,18 @@ target("installer_core_tests")
     end
     add_deps("installer_core")
 target_end()
+
+if is_plat("windows") then
+    target("installer_ui_tests")
+        set_kind("binary")
+        if has_config("use_libtorrent") then
+            set_runtimes("MT")
+        end
+        set_rundir("$(projectdir)")
+        add_files("tests/test_ui.cpp", "src/ui/NativeInstallerView.cpp", "src/ui/NativeStrings.cpp", "resources/app.rc")
+        add_includedirs("resources")
+        add_cxxflags("/utf-8", {tools = "cl"})
+        add_deps("installer_core")
+        add_syslinks("user32", "gdi32", "d2d1", "dwrite", "dwmapi", "uxtheme", "comdlg32", "shell32", "ole32", "oleaut32", "comctl32", "shlwapi", "advapi32")
+    target_end()
+end

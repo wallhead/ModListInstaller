@@ -298,13 +298,21 @@ HRESULT NativeInstallerView::EnsureTarget(HWND hwnd) {
   GetClientRect(hwnd, &client);
   const auto size = D2D1::SizeU(static_cast<UINT32>(std::max(1L, client.right)),
                                static_cast<UINT32>(std::max(1L, client.bottom)));
-  const auto properties = D2D1::RenderTargetProperties(
-      D2D1_RENDER_TARGET_TYPE_DEFAULT,
+  auto properties = D2D1::RenderTargetProperties(
+      preferSoftware_ ? D2D1_RENDER_TARGET_TYPE_SOFTWARE : D2D1_RENDER_TARGET_TYPE_DEFAULT,
       D2D1::PixelFormat(DXGI_FORMAT_UNKNOWN, D2D1_ALPHA_MODE_UNKNOWN));
-  const auto hwndProperties = D2D1::HwndRenderTargetProperties(hwnd, size);
-  const HRESULT result = d2dFactory_->CreateHwndRenderTarget(
+  const auto hwndProperties = D2D1::HwndRenderTargetProperties(
+      hwnd, size, D2D1_PRESENT_OPTIONS_RETAIN_CONTENTS);
+  HRESULT result = d2dFactory_->CreateHwndRenderTarget(
       properties, hwndProperties, target_.GetAddressOf());
+  if (FAILED(result) && !preferSoftware_) {
+    preferSoftware_ = true;
+    properties.type = D2D1_RENDER_TARGET_TYPE_SOFTWARE;
+    result = d2dFactory_->CreateHwndRenderTarget(
+        properties, hwndProperties, target_.ReleaseAndGetAddressOf());
+  }
   if (SUCCEEDED(result)) {
+    frameValid_ = false;
     const float dpi = static_cast<float>(GetDpiForWindow(hwnd));
     target_->SetDpi(dpi, dpi);
     target_->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_CLEARTYPE);
@@ -398,9 +406,19 @@ RECT NativeInstallerView::ToPixels(HWND hwnd, const D2D1_RECT_F& rect) const {
 
 void NativeInstallerView::Paint(HWND hwnd, const NativeInstallerViewState& state,
                                 const RECT* updateRect) {
-  if (FAILED(EnsureTarget(hwnd))) {
-    return;
+  for (int attempt = 0; attempt < 2; ++attempt) {
+    if (FAILED(EnsureTarget(hwnd))) return;
+    if (SUCCEEDED(PaintFrame(hwnd, state, frameValid_ ? updateRect : nullptr))) {
+      frameValid_ = true;
+      return;
+    }
+    DiscardDeviceResources();
+    preferSoftware_ = true;
   }
+}
+
+HRESULT NativeInstallerView::PaintFrame(HWND hwnd, const NativeInstallerViewState& state,
+                                       const RECT* updateRect) {
   const D2D1_SIZE_F size = target_->GetSize();
   const float width = size.width;
   const float height = size.height;
@@ -500,51 +518,50 @@ void NativeInstallerView::Paint(HWND hwnd, const NativeInstallerViewState& state
     target_->PopAxisAlignedClip();
   }
 
-  const HRESULT result = target_->EndDraw();
-  if (result == D2DERR_RECREATE_TARGET) {
-    DiscardDeviceResources();
-  }
+  return target_->EndDraw();
 }
 
 void NativeInstallerView::PaintDialog(HWND hwnd,
+                                      HDC dc,
                                       const std::wstring& titleValue,
-                                      const std::wstring& messageValue) {
+                                      const std::wstring& messageValue) const {
   RECT client{};
   GetClientRect(hwnd, &client);
-  ComPtr<ID2D1HwndRenderTarget> dialogTarget;
-  const auto properties = D2D1::RenderTargetProperties(
-      D2D1_RENDER_TARGET_TYPE_DEFAULT,
-      D2D1::PixelFormat(DXGI_FORMAT_UNKNOWN, D2D1_ALPHA_MODE_UNKNOWN));
-  const auto hwndProperties = D2D1::HwndRenderTargetProperties(
-      hwnd, D2D1::SizeU(static_cast<UINT32>(std::max(1L, client.right)),
-                        static_cast<UINT32>(std::max(1L, client.bottom))));
-  if (FAILED(d2dFactory_->CreateHwndRenderTarget(properties, hwndProperties,
-                                                  dialogTarget.GetAddressOf()))) {
-    return;
-  }
-  const float dpi = static_cast<float>(GetDpiForWindow(hwnd));
-  dialogTarget->SetDpi(dpi, dpi);
-  dialogTarget->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_CLEARTYPE);
-  const D2D1_SIZE_F size = dialogTarget->GetSize();
-  const float footerTop = size.height - theme_.footerHeight;
-  const auto panel = Brush(dialogTarget.Get(), theme_.panelAlt);
-  const auto content = Brush(dialogTarget.Get(), theme_.panel);
-  const auto line = Brush(dialogTarget.Get(), theme_.line);
-  const auto text = Brush(dialogTarget.Get(), theme_.text);
-  const auto muted = Brush(dialogTarget.Get(), theme_.muted);
-
-  dialogTarget->BeginDraw();
-  dialogTarget->Clear(Color(theme_.panel));
-  dialogTarget->FillRectangle(D2D1::RectF(0, 0, size.width, footerTop), content.Get());
-  dialogTarget->FillRectangle(D2D1::RectF(0, footerTop, size.width, size.height), panel.Get());
-  dialogTarget->DrawLine(D2D1::Point2F(0, footerTop + 0.5f),
-                         D2D1::Point2F(size.width, footerTop + 0.5f), line.Get());
-  DrawText(dialogTarget.Get(), titleValue, D2D1::RectF(24.0f, 20.0f, size.width - 24.0f, 54.0f),
-           titleFormat_.Get(), text.Get(), DWRITE_TEXT_ALIGNMENT_CENTER);
-  DrawText(dialogTarget.Get(), messageValue,
-           D2D1::RectF(28.0f, 67.0f, size.width - 28.0f, footerTop - 14.0f),
-           bodyFormat_.Get(), muted.Get(), DWRITE_TEXT_ALIGNMENT_CENTER, true);
-  dialogTarget->EndDraw();
+  const int saved = SaveDC(dc);
+  const int dpi = static_cast<int>(GetDpiForWindow(hwnd));
+  const auto pixels = [dpi](float dip) { return static_cast<int>(std::lround(dip * dpi / 96.0f)); };
+  const int footerTop = client.bottom - pixels(theme_.footerHeight);
+  const auto fill = [dc](const RECT& rect, uint32_t color) {
+    SetDCBrushColor(dc, WinColor(color));
+    FillRect(dc, &rect, static_cast<HBRUSH>(GetStockObject(DC_BRUSH)));
+  };
+  // Modal messages must stay readable even when a GPU render target cannot be created.
+  fill(client, theme_.panel);
+  fill(RECT{0, footerTop, client.right, client.bottom}, theme_.panelAlt);
+  fill(RECT{0, footerTop, client.right, footerTop + 1}, theme_.line);
+  SetBkMode(dc, TRANSPARENT);
+  const auto font = [&](float size, int weight) {
+    return CreateFontW(-pixels(size), 0, 0, 0, weight, FALSE, FALSE, FALSE,
+        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+        DEFAULT_PITCH | FF_DONTCARE, theme_.fontFamily.c_str());
+  };
+  HFONT titleFont = font(theme_.fontSize + 10.0f, FW_SEMIBOLD);
+  HFONT messageFont = font(theme_.fontSize, FW_NORMAL);
+  SelectObject(dc, titleFont != nullptr ? titleFont : GetStockObject(DEFAULT_GUI_FONT));
+  SetTextColor(dc, WinColor(theme_.text));
+  RECT titleRect{pixels(24), pixels(20), client.right - pixels(24), pixels(54)};
+  DrawTextW(dc, titleValue.c_str(), -1, &titleRect,
+            DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+  SelectObject(dc, messageFont != nullptr ? messageFont : GetStockObject(DEFAULT_GUI_FONT));
+  SetTextColor(dc, WinColor(theme_.muted));
+  RECT messageRect{pixels(28), pixels(67), client.right - pixels(28), footerTop - pixels(14)};
+  RECT measured = messageRect;
+  DrawTextW(dc, messageValue.c_str(), -1, &measured, DT_CENTER | DT_WORDBREAK | DT_NOPREFIX | DT_CALCRECT);
+  messageRect.top += std::max(0L, ((messageRect.bottom - messageRect.top) - (measured.bottom - measured.top)) / 2);
+  DrawTextW(dc, messageValue.c_str(), -1, &messageRect, DT_CENTER | DT_WORDBREAK | DT_NOPREFIX);
+  RestoreDC(dc, saved);
+  if (titleFont != nullptr) DeleteObject(titleFont);
+  if (messageFont != nullptr) DeleteObject(messageFont);
 }
 
 void NativeInstallerView::PaintDrivePopup(HWND hwnd,
@@ -606,13 +623,17 @@ void NativeInstallerView::PaintDrivePopup(HWND hwnd,
 
 void NativeInstallerView::Resize(UINT width, UINT height) {
   if (target_) {
-    target_->Resize(D2D1::SizeU(std::max(1U, width), std::max(1U, height)));
+    if (FAILED(target_->Resize(D2D1::SizeU(std::max(1U, width), std::max(1U, height))))) {
+      DiscardDeviceResources();
+    }
   }
+  frameValid_ = false;
 }
 
 void NativeInstallerView::DiscardDeviceResources() {
   target_.Reset();
   dcTarget_.Reset();
+  frameValid_ = false;
 }
 
 bool NativeInstallerView::DrawButton(const DRAWITEMSTRUCT& item,
