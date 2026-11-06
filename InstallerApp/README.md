@@ -18,6 +18,7 @@ Native Windows installer for local modlist release folders produced by `PackerAp
 cd InstallerApp
 xmake
 xmake run installer_core_tests
+xmake run pipeline_scheduler_tests
 ```
 
 The GUI executable is built as:
@@ -36,6 +37,7 @@ The `Install` button runs the install pipeline on a background thread:
 - resolve the Windows Documents known folder and create missing `My Games\Skyrim Special Edition` and `My Games\Fallout4` folders
 - check the manifest's unpacked payload size plus extraction overhead against free space
 - for chunked packer manifests, read each archive block once, verify it asynchronously, and expose it to the 7-Zip SDK only after SHA256 succeeds
+- advance four-block read-ahead on cached reads too, prioritise demand after seeks, and keep cached, borrowed and loading data within six chunk buffers; seeks may require rereading an evicted block
 - show simultaneous validation and extraction percentages, validation speed, ETA, and elapsed time
 - retain separate sequential HDD or parallel SSD validation followed by command-line extraction for legacy manifests or unavailable SDK components
 - look for the archive named by the manifest beside the executable
@@ -85,6 +87,18 @@ cd InstallerApp
 ```
 
 The script configures xmake for release, rebuilds embedded assets, runs tests, and copies only the GUI executable into `dist`. No browser runtime is required.
+
+## Performance Diagnostics
+
+Build the separate portable diagnostic utility with `scripts\build-diagnostics.ps1`.
+It generates 10/20/30 GiB, measures cross-disk bulk/small-file copying, and compares
+the real verified extraction pipeline against ordinary 7-Zip using the same
+archive and thread count. Output checks use file/directory names, types, counts,
+and sizes only, with no per-file SHA-256 pass. The pipeline's archive-block
+SHA-256 validation remains enabled.
+See [diagnostic instructions](src/diagnostics/README.md) for disk-space requirements,
+cache/timing caveats, retained data, and the logs to collect. It is not part of a
+normal installer release.
 
 ## Change Theme And Text
 

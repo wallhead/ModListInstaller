@@ -63,6 +63,7 @@ constexpr int kNextButton = 1016;
 constexpr int kUnpackDriveCombo = 1017;
 constexpr int kOpenLogButton = 1018;
 constexpr int kDrivePickerButton = 1019;
+constexpr int kThemedMessageText = 1020;
 
 constexpr UINT kLogMessage = WM_APP + 1;
 constexpr UINT kProgressMessage = WM_APP + 2;
@@ -904,7 +905,69 @@ struct ThemedDialogData {
   std::wstring message;
   bool confirmation = false;
   int result = IDCANCEL;
+  HWND disabledOwner = nullptr;
+  HFONT messageFont = nullptr;
 };
+
+void SetThemedMessageFont(HWND dialog, ThemedDialogData* data) {
+  if (data == nullptr) return;
+  const auto& theme = g_nativeView.Theme();
+  const int dpi = static_cast<int>(GetDpiForWindow(dialog));
+  HFONT font = CreateFontW(-MulDiv(static_cast<int>(theme.fontSize), dpi, 96),
+      0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
+      CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, theme.fontFamily.c_str());
+  SendMessageW(GetDlgItem(dialog, kThemedMessageText), WM_SETFONT,
+      reinterpret_cast<WPARAM>(font != nullptr ? font : GetStockObject(DEFAULT_GUI_FONT)), TRUE);
+  if (data->messageFont != nullptr) DeleteObject(data->messageFont);
+  data->messageFont = font;
+}
+
+LONG ThemedMessageContentHeight(HWND dialog) {
+  const HWND control = GetDlgItem(dialog, kThemedMessageText);
+  const LONG lines = std::max(1L, static_cast<LONG>(SendMessageW(control, EM_GETLINECOUNT, 0, 0)));
+  HDC dc = GetDC(control);
+  const auto font = reinterpret_cast<HFONT>(SendMessageW(control, WM_GETFONT, 0, 0));
+  const auto previous = SelectObject(dc, font != nullptr ? font : GetStockObject(DEFAULT_GUI_FONT));
+  TEXTMETRICW metrics{};
+  GetTextMetricsW(dc, &metrics);
+  SelectObject(dc, previous);
+  ReleaseDC(control, dc);
+  return lines * std::max(1L, metrics.tmHeight) + MulDiv(4, static_cast<int>(GetDpiForWindow(dialog)), 96);
+}
+
+void LayoutThemedMessage(HWND dialog, int width, int height) {
+  const HWND control = GetDlgItem(dialog, kThemedMessageText);
+  if (control == nullptr) return;
+  const int dpi = static_cast<int>(GetDpiForWindow(dialog));
+  const int margin = MulDiv(28, dpi, 96);
+  const int top = MulDiv(67, dpi, 96);
+  const int available = std::max(1, height - top -
+      MulDiv(static_cast<int>(g_nativeView.Theme().footerHeight) + 14, dpi, 96));
+  const int contentWidth = std::max(1, width - 2 * margin);
+  ShowScrollBar(control, SB_VERT, FALSE);
+  MoveWindow(control, margin, top, contentWidth, available, FALSE);
+  const LONG contentHeight = ThemedMessageContentHeight(dialog);
+  const bool scroll = contentHeight > available;
+  ShowScrollBar(control, SB_VERT, scroll);
+  const int textHeight = scroll ? available : static_cast<int>(contentHeight);
+  MoveWindow(control, margin, top + (available - textHeight) / 2,
+             contentWidth, textHeight, TRUE);
+}
+
+void RestoreThemedDialogOwner(ThemedDialogData* data) {
+  if (data != nullptr && data->disabledOwner != nullptr) {
+    const HWND owner = std::exchange(data->disabledOwner, nullptr);
+    if (IsWindow(owner)) EnableWindow(owner, TRUE);
+  }
+}
+
+void EndThemedDialog(HWND hwnd, int result) {
+  auto* data = reinterpret_cast<ThemedDialogData*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+  if (data != nullptr) data->result = result;
+  // Re-enable before destruction so Windows can reactivate the owner correctly.
+  RestoreThemedDialogOwner(data);
+  DestroyWindow(hwnd);
+}
 
 LRESULT CALLBACK ThemedDialogProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
   auto* data = reinterpret_cast<ThemedDialogData*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
@@ -914,8 +977,26 @@ LRESULT CALLBACK ThemedDialogProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM
     SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(data));
   }
   switch (message) {
-    case WM_CREATE:
+    case WM_CREATE: {
       ApplyWindowFrameTheme(hwnd);
+      std::wstring text;
+      if (data != nullptr) {
+        for (const wchar_t ch : data->message) {
+          if (ch == L'\n' && (text.empty() || text.back() != L'\r')) text += L'\r';
+          text += ch;
+        }
+      }
+      const HWND messageControl = CreateWindowExW(0, L"EDIT", L"",
+          WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_MULTILINE | ES_READONLY | ES_CENTER | ES_AUTOVSCROLL,
+          0, 0, 1, 1, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(kThemedMessageText)),
+          g_instance, nullptr);
+      if (messageControl == nullptr) return -1;
+      SetWindowTheme(messageControl, L"DarkMode_Explorer", nullptr);
+      SetThemedMessageFont(hwnd, data);
+      RECT client{};
+      GetClientRect(hwnd, &client);
+      LayoutThemedMessage(hwnd, client.right, client.bottom);
+      SetWindowTextW(messageControl, text.c_str());
       if (data != nullptr && data->confirmation) {
         CreateButton(hwnd, IDYES, UiText("button_yes", L"Да").c_str(), 0, 0, 96, 32);
         CreateButton(hwnd, IDNO, UiText("button_no", L"Нет").c_str(), 0, 0, 96, 32);
@@ -923,13 +1004,14 @@ LRESULT CALLBACK ThemedDialogProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM
         CreateButton(hwnd, IDOK, UiText("button_ok", L"OK").c_str(), 0, 0, 96, 32);
       }
       return 0;
+    }
     case WM_ERASEBKGND:
       return 1;
     case WM_PAINT: {
       PAINTSTRUCT paint{};
       BeginPaint(hwnd, &paint);
       if (data != nullptr) {
-        g_nativeView.PaintDialog(hwnd, paint.hdc, data->title, data->message);
+        g_nativeView.PaintDialog(hwnd, paint.hdc, data->title);
       }
       EndPaint(hwnd, &paint);
       return 0;
@@ -943,6 +1025,7 @@ LRESULT CALLBACK ThemedDialogProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM
       const int bottom = MulDiv(13, dpi, 96);
       const int gap = MulDiv(8, dpi, 96);
       const int y = height - bottom - buttonHeight;
+      LayoutThemedMessage(hwnd, width, height);
       if (data != nullptr && data->confirmation) {
         const int groupWidth = buttonWidth * 2 + gap;
         const int x = (width - groupWidth) / 2;
@@ -957,6 +1040,7 @@ LRESULT CALLBACK ThemedDialogProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM
       return 0;
     }
     case WM_DPICHANGED: {
+      SetThemedMessageFont(hwnd, data);
       const auto* suggested = reinterpret_cast<const RECT*>(lParam);
       if (suggested != nullptr) {
         SetWindowPos(hwnd, nullptr, suggested->left, suggested->top,
@@ -966,6 +1050,16 @@ LRESULT CALLBACK ThemedDialogProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM
       }
       InvalidateRect(hwnd, nullptr, FALSE);
       return 0;
+    }
+    case WM_CTLCOLOREDIT:
+    case WM_CTLCOLORSTATIC: {
+      const auto dc = reinterpret_cast<HDC>(wParam);
+      const auto& theme = g_nativeView.Theme();
+      const auto color = [](uint32_t value) { return RGB((value >> 16) & 255, (value >> 8) & 255, value & 255); };
+      SetTextColor(dc, color(theme.muted));
+      SetBkColor(dc, color(theme.panel));
+      SetDCBrushColor(dc, color(theme.panel));
+      return reinterpret_cast<LRESULT>(GetStockObject(DC_BRUSH));
     }
     case WM_DRAWITEM: {
       const auto* item = reinterpret_cast<DRAWITEMSTRUCT*>(lParam);
@@ -977,30 +1071,32 @@ LRESULT CALLBACK ThemedDialogProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM
     }
     case WM_COMMAND: {
       const int id = LOWORD(wParam);
-      if (id == IDOK || id == IDYES || id == IDNO) {
-        if (data != nullptr) {
-          data->result = id;
-        }
-        DestroyWindow(hwnd);
+      if (id == IDOK || id == IDYES || id == IDNO || id == IDCANCEL) {
+        EndThemedDialog(hwnd, id == IDCANCEL
+            ? (data != nullptr && data->confirmation ? IDNO : IDOK) : id);
         return 0;
       }
       break;
     }
     case WM_KEYDOWN:
       if (wParam == VK_ESCAPE) {
-        if (data != nullptr) {
-          data->result = data->confirmation ? IDNO : IDOK;
-        }
-        DestroyWindow(hwnd);
+        SendMessageW(hwnd, WM_COMMAND, IDCANCEL, 0);
         return 0;
       }
       break;
     case WM_CLOSE:
-      if (data != nullptr) {
-        data->result = data->confirmation ? IDNO : IDOK;
-      }
-      DestroyWindow(hwnd);
+      SendMessageW(hwnd, WM_COMMAND, IDCANCEL, 0);
       return 0;
+    case WM_DESTROY:
+      RestoreThemedDialogOwner(data);
+      return 0;
+    case WM_NCDESTROY:
+      if (data != nullptr && data->messageFont != nullptr) {
+        DeleteObject(data->messageFont);
+        data->messageFont = nullptr;
+      }
+      SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+      break;
   }
   return DefWindowProcW(hwnd, message, wParam, lParam);
 }
@@ -1009,7 +1105,13 @@ int ShowThemedMessage(HWND owner,
                       const std::wstring& title,
                       const std::wstring& message,
                       bool confirmation = false) {
-  if (owner != nullptr && IsWindow(owner)) {
+  if (owner != nullptr && !IsWindow(owner)) owner = nullptr;
+  const bool ownerMinimized = owner != nullptr && IsIconic(owner);
+  AppendAppLog(L"UI: opening themed message; owner minimized=" +
+               std::to_wstring(ownerMinimized) + L"; title=" + title);
+  // Owned popups are hidden while their owner is minimized.
+  if (ownerMinimized) ShowWindow(owner, SW_RESTORE);
+  if (owner != nullptr) {
     RedrawWindow(owner, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN);
   }
   static bool registered = false;
@@ -1023,6 +1125,8 @@ int ShowThemedMessage(HWND owner,
     windowClass.hIcon = LoadIconW(g_instance, MAKEINTRESOURCEW(IDI_MODLIST_INSTALLER));
     windowClass.hbrBackground = static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH));
     if (RegisterClassW(&windowClass) == 0 && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
+      AppendAppLog(L"UI: themed message class registration failed; Windows error=" +
+                   std::to_wstring(GetLastError()));
       return confirmation ? IDNO : IDOK;
     }
     registered = true;
@@ -1034,44 +1138,73 @@ int ShowThemedMessage(HWND owner,
   data.confirmation = confirmation;
   data.result = confirmation ? IDNO : IDOK;
 
-  const size_t explicitLines = static_cast<size_t>(std::count(message.begin(), message.end(), L'\n')) + 1;
-  const size_t wrappedLines = std::max<size_t>(1, message.size() / 54);
-  const int heightDip = std::clamp(210 + static_cast<int>(std::max(explicitLines, wrappedLines)) * 18,
-                                   250, 430);
   const UINT dpi = owner != nullptr ? GetDpiForWindow(owner) : GetDpiForSystem();
   RECT windowRect{0, 0, MulDiv(480, static_cast<int>(dpi), 96),
-                  MulDiv(heightDip, static_cast<int>(dpi), 96)};
+                  MulDiv(250, static_cast<int>(dpi), 96)};
   constexpr DWORD style = WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_CLIPCHILDREN;
   AdjustWindowRectExForDpi(&windowRect, style, FALSE, WS_EX_DLGMODALFRAME, dpi);
-  int x = CW_USEDEFAULT;
-  int y = CW_USEDEFAULT;
-  if (owner != nullptr) {
-    RECT ownerRect{};
-    GetWindowRect(owner, &ownerRect);
-    x = ownerRect.left + ((ownerRect.right - ownerRect.left) -
-                          (windowRect.right - windowRect.left)) / 2;
-    y = ownerRect.top + ((ownerRect.bottom - ownerRect.top) -
-                         (windowRect.bottom - windowRect.top)) / 2;
+  MONITORINFO monitor{sizeof(monitor)};
+  const HMONITOR targetMonitor = MonitorFromWindow(owner, MONITOR_DEFAULTTONEAREST);
+  if (!GetMonitorInfoW(targetMonitor, &monitor)) {
+    SystemParametersInfoW(SPI_GETWORKAREA, 0, &monitor.rcWork, 0);
   }
+  const RECT work = monitor.rcWork;
+  const LONG width = std::min(windowRect.right - windowRect.left,
+                              std::max(1L, work.right - work.left));
+  LONG height = std::min(windowRect.bottom - windowRect.top,
+                               std::max(1L, work.bottom - work.top));
+  RECT anchor = work;
+  RECT intersection{};
+  RECT ownerRect{};
+  if (owner != nullptr && GetWindowRect(owner, &ownerRect) &&
+      IntersectRect(&intersection, &ownerRect, &work)) anchor = ownerRect;
+  const LONG x = std::clamp(anchor.left + (anchor.right - anchor.left - width) / 2,
+                             work.left, std::max(work.left, work.right - width));
+  LONG y = std::clamp(anchor.top + (anchor.bottom - anchor.top - height) / 2,
+                             work.top, std::max(work.top, work.bottom - height));
   HWND dialog = CreateWindowExW(
       WS_EX_DLGMODALFRAME, className, title.c_str(), style,
-      x, y, windowRect.right - windowRect.left, windowRect.bottom - windowRect.top,
+      x, y, width, height,
       owner, nullptr, g_instance, &data);
   if (dialog == nullptr) {
+    AppendAppLog(L"UI: themed message creation failed; Windows error=" +
+                 std::to_wstring(GetLastError()));
     return data.result;
   }
-  if (owner != nullptr) {
+  RECT client{};
+  GetClientRect(dialog, &client);
+  // Use the native text control's actual wrapped lines, bounded by the monitor.
+  const LONG desiredHeight = ThemedMessageContentHeight(dialog) + height - client.bottom +
+      MulDiv(67 + 14 + static_cast<int>(g_nativeView.Theme().footerHeight),
+             static_cast<int>(GetDpiForWindow(dialog)), 96);
+  height = std::clamp(desiredHeight, height, std::max(height, work.bottom - work.top));
+  y = std::clamp(anchor.top + (anchor.bottom - anchor.top - height) / 2,
+                 work.top, std::max(work.top, work.bottom - height));
+  SetWindowPos(dialog, nullptr, x, y, width, height, SWP_NOACTIVATE | SWP_NOZORDER);
+  if (owner != nullptr && IsWindowEnabled(owner)) {
+    data.disabledOwner = owner;
     EnableWindow(owner, FALSE);
   }
   ShowWindow(dialog, SW_SHOW);
+  SetForegroundWindow(dialog);
+  SetActiveWindow(dialog);
+  SetFocus(GetDlgItem(dialog, confirmation ? IDNO : IDOK));
   UpdateWindow(dialog);
+  AppendAppLog(L"UI: themed message shown; x=" + std::to_wstring(x) +
+               L"; y=" + std::to_wstring(y));
 
   MSG messageData{};
+  std::optional<int> quitCode;
   while (IsWindow(dialog)) {
     const BOOL messageResult = GetMessageW(&messageData, nullptr, 0, 0);
     if (messageResult <= 0) {
+      AppendAppLog(L"UI: themed message loop stopped; result=" +
+                   std::to_wstring(messageResult) + L"; code=" + std::to_wstring(messageData.wParam));
       if (messageResult == 0) {
-        PostQuitMessage(static_cast<int>(messageData.wParam));
+        quitCode = static_cast<int>(messageData.wParam);
+      } else {
+        AppendAppLog(L"UI: themed message loop failed; Windows error=" +
+                     std::to_wstring(GetLastError()));
       }
       break;
     }
@@ -1080,10 +1213,13 @@ int ShowThemedMessage(HWND owner,
       DispatchMessageW(&messageData);
     }
   }
+  if (IsWindow(dialog)) EndThemedDialog(dialog, data.result);
+  RestoreThemedDialogOwner(&data);
   if (owner != nullptr && IsWindow(owner)) {
-    EnableWindow(owner, TRUE);
-    SetForegroundWindow(owner);
+    if (IsWindowEnabled(owner)) SetForegroundWindow(owner);
   }
+  AppendAppLog(L"UI: themed message closed; result=" + std::to_wstring(data.result));
+  if (quitCode.has_value()) PostQuitMessage(*quitCode);
   return data.result;
 }
 
@@ -3513,6 +3649,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
       return 0;
     }
     case kWorkerFinishedMessage: {
+      AppendAppLog(L"UI: worker completion received; success=" + std::to_wstring(wParam != 0));
       g_workerRunning = false;
       SetControlsRunning(hwnd, false);
       if (wParam != 0 && !g_closeAfterWorker) {

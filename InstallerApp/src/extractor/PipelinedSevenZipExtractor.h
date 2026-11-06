@@ -26,6 +26,34 @@ struct PipelineExtractionProgress {
   size_t extractionArchiveCount{0};
 };
 
+// Cumulative, independently readable counters; timings overlap and are not additive.
+struct PipelineExtractionDiagnostics {
+  // Completed successful overlapped reads, including rereads; not physical device traffic.
+  std::atomic<uint64_t> inputDiskBytes{0};
+  std::atomic<uint64_t> inputReadOps{0};
+  // Successful cache loads; reloads are the subset already verified before loading.
+  std::atomic<uint64_t> blockLoads{0};
+  std::atomic<uint64_t> blockReloads{0};
+  // SDK GetBlock lookups, excluding prefetch/verification worker lookups.
+  std::atomic<uint64_t> cacheHits{0};
+  std::atomic<uint64_t> cacheMisses{0};
+  // Missing-block SDK waits only; excludes VerifyAll and worker idle waits.
+  std::atomic<uint64_t> blockWaitNanoseconds{0};
+  std::atomic<uint64_t> diskWaitNanoseconds{0};
+  // Per-block BCrypt setup, data hashing and finalization (not disk reads).
+  std::atomic<uint64_t> hashNanoseconds{0};
+  // Successful CREATE_ALWAYS opens, actual WriteFile bytes, and attempted WriteFile calls.
+  std::atomic<uint64_t> outputFilesCreated{0};
+  std::atomic<uint64_t> outputBytesWritten{0};
+  std::atomic<uint64_t> outputWriteCalls{0};
+  std::atomic<uint64_t> outputCreateNanoseconds{0};
+  std::atomic<uint64_t> outputWriteNanoseconds{0};
+  std::atomic<uint64_t> outputCloseNanoseconds{0};
+  // create_directories calls, including existing directories, root and failed checks.
+  std::atomic<uint64_t> outputDirectoriesChecked{0};
+  std::atomic<uint64_t> outputDirectoryNanoseconds{0};
+};
+
 struct PipelinedExtractionConfig {
   std::filesystem::path sevenZipLibrary;
   std::filesystem::path archiveFolder;
@@ -34,6 +62,8 @@ struct PipelinedExtractionConfig {
   const std::atomic_bool* cancelRequested{nullptr};
   uint32_t decoderThreads{4};
   size_t maxOutputPathLength{0};
+  // Caller-owned; keep alive through Extract, which joins its stream worker before returning.
+  PipelineExtractionDiagnostics* diagnostics{nullptr};
 };
 
 class PipelinedSevenZipExtractor {

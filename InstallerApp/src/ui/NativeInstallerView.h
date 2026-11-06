@@ -72,7 +72,7 @@ class NativeInstallerView {
 public:
   bool Initialize(HWND hwnd, std::wstring* warning);
   void Paint(HWND hwnd, const NativeInstallerViewState& state, const RECT* updateRect = nullptr);
-  void PaintDialog(HWND hwnd, HDC dc, const std::wstring& title, const std::wstring& message) const;
+  void PaintDialog(HWND hwnd, HDC dc, const std::wstring& title) const;
   void PaintDrivePopup(HWND hwnd, const std::vector<std::wstring>& drives,
                        int selectedIndex, int hotIndex);
   void Resize(UINT width, UINT height);

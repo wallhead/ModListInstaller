@@ -523,8 +523,7 @@ HRESULT NativeInstallerView::PaintFrame(HWND hwnd, const NativeInstallerViewStat
 
 void NativeInstallerView::PaintDialog(HWND hwnd,
                                       HDC dc,
-                                      const std::wstring& titleValue,
-                                      const std::wstring& messageValue) const {
+                                      const std::wstring& titleValue) const {
   RECT client{};
   GetClientRect(hwnd, &client);
   const int saved = SaveDC(dc);
@@ -546,22 +545,13 @@ void NativeInstallerView::PaintDialog(HWND hwnd,
         DEFAULT_PITCH | FF_DONTCARE, theme_.fontFamily.c_str());
   };
   HFONT titleFont = font(theme_.fontSize + 10.0f, FW_SEMIBOLD);
-  HFONT messageFont = font(theme_.fontSize, FW_NORMAL);
   SelectObject(dc, titleFont != nullptr ? titleFont : GetStockObject(DEFAULT_GUI_FONT));
   SetTextColor(dc, WinColor(theme_.text));
   RECT titleRect{pixels(24), pixels(20), client.right - pixels(24), pixels(54)};
   DrawTextW(dc, titleValue.c_str(), -1, &titleRect,
             DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
-  SelectObject(dc, messageFont != nullptr ? messageFont : GetStockObject(DEFAULT_GUI_FONT));
-  SetTextColor(dc, WinColor(theme_.muted));
-  RECT messageRect{pixels(28), pixels(67), client.right - pixels(28), footerTop - pixels(14)};
-  RECT measured = messageRect;
-  DrawTextW(dc, messageValue.c_str(), -1, &measured, DT_CENTER | DT_WORDBREAK | DT_NOPREFIX | DT_CALCRECT);
-  messageRect.top += std::max(0L, ((messageRect.bottom - messageRect.top) - (measured.bottom - measured.top)) / 2);
-  DrawTextW(dc, messageValue.c_str(), -1, &messageRect, DT_CENTER | DT_WORDBREAK | DT_NOPREFIX);
   RestoreDC(dc, saved);
   if (titleFont != nullptr) DeleteObject(titleFont);
-  if (messageFont != nullptr) DeleteObject(messageFont);
 }
 
 void NativeInstallerView::PaintDrivePopup(HWND hwnd,

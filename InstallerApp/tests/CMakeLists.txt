@@ -6,7 +6,16 @@ endif()
 target_link_libraries(installer_core_tests PRIVATE installer_core)
 add_test(NAME installer_core_tests COMMAND installer_core_tests)
 
+add_executable(pipeline_scheduler_tests test_pipeline_scheduler.cpp)
+target_include_directories(pipeline_scheduler_tests PRIVATE ../src)
+target_compile_features(pipeline_scheduler_tests PRIVATE cxx_std_20)
+add_test(NAME pipeline_scheduler_tests COMMAND pipeline_scheduler_tests)
+
 if(WIN32)
+  add_executable(pipeline_smoke pipeline_smoke.cpp ../resources/app.rc)
+  target_include_directories(pipeline_smoke PRIVATE ../resources)
+  target_link_libraries(pipeline_smoke PRIVATE installer_core)
+
   add_executable(installer_ui_tests test_ui.cpp ../src/ui/NativeInstallerView.cpp
     ../src/ui/NativeStrings.cpp ../resources/app.rc)
   target_include_directories(installer_ui_tests PRIVATE ../resources)

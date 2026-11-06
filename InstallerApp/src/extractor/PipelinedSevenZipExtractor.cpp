@@ -1,6 +1,7 @@
 #include "extractor/PipelinedSevenZipExtractor.h"
 
 #include "extractor/SevenZipSdkInterfaces.h"
+#include "extractor/VerifiedBlockScheduler.h"
 #include "manifest/Manifest.h"
 #include "app/RuntimePaths.h"
 #include "common/EmbeddedFile.h"
@@ -16,10 +17,10 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <cstring>
-#include <deque>
 #include <fstream>
 #include <iomanip>
 #include <limits>
@@ -28,8 +29,6 @@
 #include <optional>
 #include <sstream>
 #include <thread>
-#include <unordered_map>
-#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -39,9 +38,36 @@ namespace {
 
 using namespace sevenzip_sdk;
 
-constexpr size_t kReadAheadBlocks = 4;
-constexpr size_t kMaxCachedBlocks = 6;
 constexpr uint64_t kMaxPipelineChunkSize = 256ull * 1024ull * 1024ull;
+
+class DiagnosticTimer {
+public:
+  explicit DiagnosticTimer(std::atomic<uint64_t>* counter) : counter_(counter) {
+    if (counter_ != nullptr) {
+      start_ = std::chrono::steady_clock::now();
+    }
+  }
+  ~DiagnosticTimer() {
+    if (counter_ != nullptr) {
+      const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now() - start_).count();
+      counter_->fetch_add(static_cast<uint64_t>(elapsed), std::memory_order_relaxed);
+    }
+  }
+
+private:
+  std::atomic<uint64_t>* counter_;
+  std::chrono::steady_clock::time_point start_{};
+};
+
+void CreateOutputDirectories(const std::filesystem::path& path, std::error_code& ec,
+                             PipelineExtractionDiagnostics* diagnostics) {
+  DiagnosticTimer timer(diagnostics != nullptr ? &diagnostics->outputDirectoryNanoseconds : nullptr);
+  std::filesystem::create_directories(path, ec);
+  if (diagnostics != nullptr) {
+    diagnostics->outputDirectoriesChecked.fetch_add(1, std::memory_order_relaxed);
+  }
+}
 
 template <typename T>
 class ComPtr {
@@ -460,16 +486,14 @@ struct ChunkLocation {
   std::string expectedHash;
 };
 
-struct CachedBlock {
-  std::vector<uint8_t> data;
-  uint64_t accessStamp{0};
-};
+using CachedBlock = detail::VerifiedBlock;
 
 class VerifiedArchiveStream final : public IInStream, private ComRefCount {
 public:
   VerifiedArchiveStream(const PipelinedExtractionConfig& config,
                         std::shared_ptr<ProgressReporter> reporter)
-      : cancelRequested_(config.cancelRequested), reporter_(std::move(reporter)) {
+      : cancelRequested_(config.cancelRequested), diagnostics_(config.diagnostics),
+        reporter_(std::move(reporter)) {
     const auto manifestVolumes = ArchiveVolumes(*config.manifest);
     uint64_t virtualOffset = 0;
     for (const ManifestFile* file : manifestVolumes) {
@@ -510,6 +534,7 @@ public:
       virtualOffset += file->size;
     }
     totalSize_ = virtualOffset;
+    scheduler_ = detail::VerifiedBlockScheduler(chunks_.size());
     verified_.resize(chunks_.size(), false);
     validatedVolumeBytes_.resize(volumes_.size(), 0);
     if (error_.empty()) {
@@ -590,7 +615,7 @@ public:
     } else {
       return STG_E_INVALIDFUNCTION;
     }
-    if ((offset < 0 && base < -offset) ||
+    if ((offset < 0 && offset < -base) ||
         (offset > 0 && base > std::numeric_limits<Int64>::max() - offset)) {
       return HRESULT_FROM_WIN32(ERROR_NEGATIVE_SEEK);
     }
@@ -599,6 +624,16 @@ public:
       return HRESULT_FROM_WIN32(ERROR_NEGATIVE_SEEK);
     }
     position_ = static_cast<UInt64>(next);
+    {
+      std::lock_guard lock(mutex_);
+      const auto chunk = FindChunk(position_);
+      if (chunk) {
+        scheduler_.Request(*chunk);
+      } else {
+        scheduler_.ResetWindow();
+      }
+    }
+    condition_.notify_all();
     if (newPosition != nullptr) {
       *newPosition = position_;
     }
@@ -625,11 +660,7 @@ public:
     if (!error_.empty()) {
       return false;
     }
-    for (size_t index = 0; index < chunks_.size(); ++index) {
-      if (!verified_[index]) {
-        QueueLocked(index, false);
-      }
-    }
+    scheduler_.VerifyRemaining(verified_);
     condition_.notify_all();
     condition_.wait(lock, [&]() {
       return !error_.empty() || IsCancelled() || verifiedCount_ == chunks_.size();
@@ -660,7 +691,8 @@ private:
   }
 
   bool IsCancelled() const {
-    return cancelRequested_ != nullptr && cancelRequested_->load();
+    return stopping_.load() ||
+        (cancelRequested_ != nullptr && cancelRequested_->load());
   }
 
   void SetError(std::string message) {
@@ -690,40 +722,30 @@ private:
     return index;
   }
 
-  void QueueLocked(size_t index, bool priority) {
-    if (index >= chunks_.size() || cache_.contains(index) || queued_.contains(index)) {
-      return;
-    }
-    queued_.insert(index);
-    if (priority) {
-      tasks_.push_front(index);
-    } else {
-      tasks_.push_back(index);
-    }
-  }
-
   std::shared_ptr<CachedBlock> GetBlock(size_t index) {
     std::unique_lock lock(mutex_);
-    requestedChunk_ = index;
-    auto cached = cache_.find(index);
-    if (cached != cache_.end()) {
-      cached->second->accessStamp = ++accessStamp_;
-      return cached->second;
-    }
-    QueueLocked(index, true);
-    for (size_t ahead = 1; ahead <= kReadAheadBlocks && index + ahead < chunks_.size(); ++ahead) {
-      QueueLocked(index + ahead, false);
-    }
+    scheduler_.Request(index);
     condition_.notify_all();
-    condition_.wait(lock, [&]() {
-      return cache_.contains(index) || !error_.empty() || IsCancelled();
-    });
+    auto cached = scheduler_.Find(index);
+    if (cached) {
+      if (diagnostics_ != nullptr) {
+        diagnostics_->cacheHits.fetch_add(1, std::memory_order_relaxed);
+      }
+      return cached;
+    }
+    if (diagnostics_ != nullptr) {
+      diagnostics_->cacheMisses.fetch_add(1, std::memory_order_relaxed);
+    }
+    {
+      DiagnosticTimer timer(diagnostics_ != nullptr ? &diagnostics_->blockWaitNanoseconds : nullptr);
+      while (!scheduler_.Contains(index) && error_.empty() && !IsCancelled()) {
+        condition_.wait_for(lock, std::chrono::milliseconds(100));
+      }
+    }
     if (!error_.empty() || IsCancelled()) {
       return {};
     }
-    auto result = cache_.at(index);
-    result->accessStamp = ++accessStamp_;
-    return result;
+    return scheduler_.Find(index);
   }
 
   std::shared_ptr<CachedBlock> LoadBlock(size_t index,
@@ -742,6 +764,7 @@ private:
     std::vector<uint8_t> digest(32);
     BCRYPT_HASH_HANDLE hash = nullptr;
     if (verifyHash) {
+      DiagnosticTimer timer(diagnostics_ != nullptr ? &diagnostics_->hashNanoseconds : nullptr);
       if (BCryptGetProperty(algorithm, BCRYPT_OBJECT_LENGTH,
                             reinterpret_cast<PUCHAR>(&objectLength), sizeof(objectLength),
                             &returned, 0) != 0) {
@@ -767,11 +790,22 @@ private:
       slots[slot].overlapped.hEvent = readEvents[slot];
     }
 
+    auto waitForRead = [&](HANDLE event, DWORD timeout) {
+      DiagnosticTimer timer(diagnostics_ != nullptr ? &diagnostics_->diskWaitNanoseconds : nullptr);
+      return WaitForSingleObject(event, timeout);
+    };
     auto cancelActive = [&]() {
       for (auto& slot : slots) {
         if (slot.active) {
           CancelIoEx(file, &slot.overlapped);
-          WaitForSingleObject(slot.overlapped.hEvent, INFINITE);
+          waitForRead(slot.overlapped.hEvent, INFINITE);
+          if (diagnostics_ != nullptr) {
+            DWORD read = 0;
+            if (GetOverlappedResult(file, &slot.overlapped, &read, FALSE)) {
+              diagnostics_->inputDiskBytes.fetch_add(read, std::memory_order_relaxed);
+              diagnostics_->inputReadOps.fetch_add(1, std::memory_order_relaxed);
+            }
+          }
           slot.active = false;
         }
       }
@@ -800,7 +834,7 @@ private:
     };
     auto waitRead = [&](size_t slotIndex) -> bool {
       auto& slot = slots[slotIndex];
-      while (WaitForSingleObject(slot.overlapped.hEvent, 100) == WAIT_TIMEOUT) {
+      while (waitForRead(slot.overlapped.hEvent, 100) == WAIT_TIMEOUT) {
         if (IsCancelled()) {
           error = "Validation was cancelled";
           cancelActive();
@@ -808,11 +842,16 @@ private:
         }
       }
       DWORD read = 0;
-      if (!GetOverlappedResult(file, &slot.overlapped, &read, FALSE) ||
-          read != slot.requested) {
+      const BOOL completed = GetOverlappedResult(file, &slot.overlapped, &read, FALSE);
+      const DWORD readError = GetLastError();
+      if (completed && diagnostics_ != nullptr) {
+        diagnostics_->inputDiskBytes.fetch_add(read, std::memory_order_relaxed);
+        diagnostics_->inputReadOps.fetch_add(1, std::memory_order_relaxed);
+      }
+      if (!completed || read != slot.requested) {
         error = "Unable to read archive volume " +
                 PathToUtf8(volumes_[chunk.volumeIndex].path) + ": " +
-                WindowsErrorMessage(GetLastError());
+                WindowsErrorMessage(readError);
         slot.active = false;
         cancelActive();
         return false;
@@ -848,9 +887,13 @@ private:
       if (hasNext) {
         nextOffset += slots[nextSlot].requested;
       }
-      if (verifyHash &&
-          BCryptHashData(hash, block->data.data() + slots[currentSlot].offset,
-                         slots[currentSlot].requested, 0) != 0) {
+      NTSTATUS hashStatus = 0;
+      if (verifyHash) {
+        DiagnosticTimer timer(diagnostics_ != nullptr ? &diagnostics_->hashNanoseconds : nullptr);
+        hashStatus = BCryptHashData(hash, block->data.data() + slots[currentSlot].offset,
+                                    slots[currentSlot].requested, 0);
+      }
+      if (hashStatus != 0) {
         error = "Unable to hash archive block";
         cancelActive();
         BCryptDestroyHash(hash);
@@ -863,9 +906,12 @@ private:
     }
 
     if (verifyHash) {
-      const NTSTATUS finish = BCryptFinishHash(
-          hash, digest.data(), static_cast<ULONG>(digest.size()), 0);
-      BCryptDestroyHash(hash);
+      NTSTATUS finish;
+      {
+        DiagnosticTimer timer(diagnostics_ != nullptr ? &diagnostics_->hashNanoseconds : nullptr);
+        finish = BCryptFinishHash(hash, digest.data(), static_cast<ULONG>(digest.size()), 0);
+        BCryptDestroyHash(hash);
+      }
       if (finish != 0) {
         error = "Unable to finish archive block SHA-256";
         return {};
@@ -877,25 +923,6 @@ private:
       return {};
     }
     return block;
-  }
-
-  void EvictLocked() {
-    while (cache_.size() >= kMaxCachedBlocks) {
-      auto victim = cache_.end();
-      for (auto iterator = cache_.begin(); iterator != cache_.end(); ++iterator) {
-        if (iterator->first == requestedChunk_ || iterator->second.use_count() > 1) {
-          continue;
-        }
-        if (victim == cache_.end() ||
-            iterator->second->accessStamp < victim->second->accessStamp) {
-          victim = iterator;
-        }
-      }
-      if (victim == cache_.end()) {
-        break;
-      }
-      cache_.erase(victim);
-    }
   }
 
   void WorkerLoop() {
@@ -924,18 +951,18 @@ private:
       bool verifyHash = true;
       {
         std::unique_lock lock(mutex_);
-        condition_.wait(lock, [&]() {
-          return stopping_ || IsCancelled() || !error_.empty() || !tasks_.empty();
-        });
+        std::optional<size_t> next;
+        while (!stopping_ && !IsCancelled() && error_.empty()) {
+          next = scheduler_.Next();
+          if (next) {
+            break;
+          }
+          condition_.wait_for(lock, std::chrono::milliseconds(100));
+        }
         if (stopping_ || IsCancelled() || !error_.empty()) {
           break;
         }
-        index = tasks_.front();
-        tasks_.pop_front();
-        queued_.erase(index);
-        if (cache_.contains(index)) {
-          continue;
-        }
+        index = *next;
         verifyHash = !verified_[index];
       }
 
@@ -953,15 +980,19 @@ private:
           condition_.notify_all();
           break;
         }
+        if (diagnostics_ != nullptr) {
+          diagnostics_->blockLoads.fetch_add(1, std::memory_order_relaxed);
+          if (!verifyHash) {
+            diagnostics_->blockReloads.fetch_add(1, std::memory_order_relaxed);
+          }
+        }
         if (!verified_[index]) {
           verified_[index] = true;
           ++verifiedCount_;
           validatedBytes_ += chunks_[index].size;
           validatedVolumeBytes_[chunks_[index].volumeIndex] += chunks_[index].size;
         }
-        EvictLocked();
-        block->accessStamp = ++accessStamp_;
-        cache_[index] = std::move(block);
+        scheduler_.Complete(index, std::move(block));
         validatedBytes = validatedBytes_;
         volumeIndex = chunks_[index].volumeIndex;
         validatedVolumeBytes = validatedVolumeBytes_[volumeIndex];
@@ -971,13 +1002,14 @@ private:
           validatedBytes, volumes_[volumeIndex].path.filename(), volumeIndex + 1,
           volumes_.size(), validatedVolumeBytes, volumes_[volumeIndex].size);
     }
+    condition_.notify_all();
     CloseHandle(readEvents[0]);
     CloseHandle(readEvents[1]);
     BCryptCloseAlgorithmProvider(algorithm, 0);
-    condition_.notify_all();
   }
 
   const std::atomic_bool* cancelRequested_{nullptr};
+  PipelineExtractionDiagnostics* diagnostics_{nullptr};
   std::shared_ptr<ProgressReporter> reporter_;
   std::vector<VolumeHandle> volumes_;
   std::vector<ChunkLocation> chunks_;
@@ -996,16 +1028,12 @@ private:
 
   mutable std::mutex mutex_;
   std::condition_variable condition_;
-  std::deque<size_t> tasks_;
-  std::unordered_set<size_t> queued_;
-  std::unordered_map<size_t, std::shared_ptr<CachedBlock>> cache_;
+  detail::VerifiedBlockScheduler scheduler_{0};
   std::thread worker_;
   std::string error_;
-  size_t requestedChunk_{std::numeric_limits<size_t>::max()};
   size_t verifiedCount_{0};
   uint64_t validatedBytes_{0};
-  uint64_t accessStamp_{0};
-  bool stopping_{false};
+  std::atomic_bool stopping_{false};
 };
 
 class ArchiveOpenCallback final : public IArchiveOpenCallback, private ComRefCount {
@@ -1034,11 +1062,16 @@ private:
 class FileOutStream final : public ISequentialOutStream, private ComRefCount {
 public:
   explicit FileOutStream(const std::filesystem::path& path,
-                         const std::atomic_bool* cancelRequested)
-      : cancelRequested_(cancelRequested) {
+                         const std::atomic_bool* cancelRequested,
+                         PipelineExtractionDiagnostics* diagnostics)
+      : cancelRequested_(cancelRequested), diagnostics_(diagnostics) {
+    DiagnosticTimer timer(diagnostics_ != nullptr ? &diagnostics_->outputCreateNanoseconds : nullptr);
     handle_ = CreateFileW(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr,
                           CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
     openError_ = handle_ == INVALID_HANDLE_VALUE ? GetLastError() : ERROR_SUCCESS;
+    if (handle_ != INVALID_HANDLE_VALUE && diagnostics_ != nullptr) {
+      diagnostics_->outputFilesCreated.fetch_add(1, std::memory_order_relaxed);
+    }
   }
 
   bool Ready() const { return handle_ != INVALID_HANDLE_VALUE; }
@@ -1068,8 +1101,19 @@ public:
       return E_ABORT;
     }
     DWORD written = 0;
-    if (!WriteFile(handle_, data, size, &written, nullptr)) {
-      return HRESULT_FROM_WIN32(GetLastError());
+    BOOL succeeded;
+    DWORD writeError;
+    {
+      DiagnosticTimer timer(diagnostics_ != nullptr ? &diagnostics_->outputWriteNanoseconds : nullptr);
+      succeeded = WriteFile(handle_, data, size, &written, nullptr);
+      writeError = succeeded ? ERROR_SUCCESS : GetLastError();
+    }
+    if (diagnostics_ != nullptr) {
+      diagnostics_->outputWriteCalls.fetch_add(1, std::memory_order_relaxed);
+      diagnostics_->outputBytesWritten.fetch_add(written, std::memory_order_relaxed);
+    }
+    if (!succeeded) {
+      return HRESULT_FROM_WIN32(writeError);
     }
     *processedSize = written;
     return S_OK;
@@ -1077,6 +1121,7 @@ public:
 
   void Close() {
     if (handle_ != INVALID_HANDLE_VALUE) {
+      DiagnosticTimer timer(diagnostics_ != nullptr ? &diagnostics_->outputCloseNanoseconds : nullptr);
       CloseHandle(handle_);
       handle_ = INVALID_HANDLE_VALUE;
     }
@@ -1088,6 +1133,7 @@ private:
   HANDLE handle_{INVALID_HANDLE_VALUE};
   DWORD openError_{ERROR_SUCCESS};
   const std::atomic_bool* cancelRequested_{nullptr};
+  PipelineExtractionDiagnostics* diagnostics_{nullptr};
 };
 
 class ArchiveExtractCallback final : public IArchiveExtractCallback, private ComRefCount {
@@ -1095,9 +1141,10 @@ public:
   ArchiveExtractCallback(IInArchive* archive,
                          std::filesystem::path outputFolder,
                          const std::atomic_bool* cancelRequested,
-                         std::shared_ptr<ProgressReporter> reporter)
+                         std::shared_ptr<ProgressReporter> reporter,
+                         PipelineExtractionDiagnostics* diagnostics)
       : archive_(archive), outputFolder_(std::move(outputFolder)),
-        cancelRequested_(cancelRequested), reporter_(std::move(reporter)) {
+        cancelRequested_(cancelRequested), diagnostics_(diagnostics), reporter_(std::move(reporter)) {
     archive_->AddRef();
   }
 
@@ -1165,7 +1212,7 @@ public:
     currentPath_ = outputFolder_ / relative;
     std::error_code ec;
     if (isDirectory) {
-      std::filesystem::create_directories(currentPath_, ec);
+      CreateOutputDirectories(currentPath_, ec, diagnostics_);
       if (ec) {
         error_ = "Unable to create extracted directory: " + ec.message();
         return E_FAIL;
@@ -1175,12 +1222,12 @@ public:
     if (askExtractMode != kAskExtract) {
       return S_OK;
     }
-    std::filesystem::create_directories(currentPath_.parent_path(), ec);
+    CreateOutputDirectories(currentPath_.parent_path(), ec, diagnostics_);
     if (ec) {
       error_ = "Unable to create extracted file directory: " + ec.message();
       return E_FAIL;
     }
-    auto* stream = new FileOutStream(currentPath_, cancelRequested_);
+    auto* stream = new FileOutStream(currentPath_, cancelRequested_, diagnostics_);
     if (!stream->Ready()) {
       error_ = "Unable to create extracted file " + PathToUtf8(currentPath_) + ": " +
                WindowsErrorMessage(stream->OpenError());
@@ -1237,6 +1284,7 @@ private:
   IInArchive* archive_{nullptr};
   std::filesystem::path outputFolder_;
   const std::atomic_bool* cancelRequested_{nullptr};
+  PipelineExtractionDiagnostics* diagnostics_{nullptr};
   std::shared_ptr<ProgressReporter> reporter_;
   ISequentialOutStream* current_{nullptr};
   FileOutStream* currentFile_{nullptr};
@@ -1413,7 +1461,7 @@ ExtractionResult PipelinedSevenZipExtractor::Extract(
     }
     std::error_code ec;
     if (SUCCEEDED(operation)) {
-      std::filesystem::create_directories(config.installFolder, ec);
+      CreateOutputDirectories(config.installFolder, ec, config.diagnostics);
       if (ec) {
         result.message = "Unable to create extraction folder: " + ec.message();
         operation = E_FAIL;
@@ -1445,7 +1493,7 @@ ExtractionResult PipelinedSevenZipExtractor::Extract(
 
     if (SUCCEEDED(operation)) {
     auto* rawExtractCallback = new ArchiveExtractCallback(
-        archive.Get(), config.installFolder, config.cancelRequested, reporter);
+        archive.Get(), config.installFolder, config.cancelRequested, reporter, config.diagnostics);
     ComPtr<IArchiveExtractCallback> extractCallback(rawExtractCallback);
     operation = archive->Extract(
         nullptr, std::numeric_limits<UInt32>::max(), 0, extractCallback.Get());

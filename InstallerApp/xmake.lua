@@ -105,7 +105,61 @@ target("installer_core_tests")
     add_deps("installer_core")
 target_end()
 
+target("pipeline_scheduler_tests")
+    set_kind("binary")
+    add_includedirs("src")
+    add_files("tests/test_pipeline_scheduler.cpp")
+target_end()
+
 if is_plat("windows") then
+    target("pipeline_smoke")
+        set_kind("binary")
+        if has_config("use_libtorrent") then
+            set_runtimes("MT")
+        end
+        add_files("tests/pipeline_smoke.cpp", "resources/app.rc")
+        add_includedirs("resources")
+        add_deps("installer_core")
+    target_end()
+
+    target("diagnostics_engine")
+        set_kind("static")
+        set_runtimes("MT")
+        add_includedirs("src", "resources", {public = true})
+        add_files("src/diagnostics/Workload.cpp", "src/diagnostics/Benchmark.cpp",
+                  "src/extractor/PipelinedSevenZipExtractor.cpp", "src/extractor/SevenZipExtractor.cpp",
+                  "src/manifest/Json.cpp", "src/manifest/Manifest.cpp", "src/paths/PathValidator.cpp",
+                  "src/verifier/Sha256.cpp")
+        add_cxxflags("/W4", "/utf-8", {tools = "cl"})
+        add_syslinks("bcrypt", "ole32", "oleaut32", "user32", "psapi", "advapi32", {public = true})
+    target_end()
+
+    target("modlist-diagnostics")
+        set_kind("binary")
+        set_runtimes("MT")
+        add_files("src/diagnostics/Main.cpp", "resources/app.rc")
+        add_deps("diagnostics_engine")
+        add_cxxflags("/utf-8", {tools = "cl"})
+        add_syslinks("gdi32", "comctl32", "shell32", "comdlg32")
+        add_ldflags("/SUBSYSTEM:WINDOWS", {tools = "link"})
+    target_end()
+
+    target("diagnostics_integration_tests")
+        set_kind("binary")
+        set_runtimes("MT")
+        add_files("tests/test_diagnostics_integration.cpp", "resources/app.rc")
+        add_deps("diagnostics_engine")
+        add_cxxflags("/utf-8", {tools = "cl"})
+    target_end()
+
+    target("diagnostics_tests")
+        set_kind("binary")
+        set_runtimes("MT")
+        add_includedirs("src")
+        add_files("tests/test_diagnostics.cpp", "src/diagnostics/Workload.cpp")
+        add_cxxflags("/utf-8", {tools = "cl"})
+    target_end()
+
     target("installer_ui_tests")
         set_kind("binary")
         if has_config("use_libtorrent") then

@@ -769,6 +769,7 @@ void TestPipelinedExtractor() {
 
   const auto smallFiles = source / "small-files";
   std::filesystem::create_directories(smallFiles);
+  std::filesystem::create_directories(smallFiles / "empty" / "nested");
   constexpr size_t smallFileCount = 512;
   for (size_t index = 0; index < smallFileCount; ++index) {
     std::ofstream file(smallFiles / ("file-" + std::to_string(index) + ".txt"),
@@ -870,11 +871,16 @@ void TestPipelinedExtractor() {
   Expect(!rejectedResult.ok && !std::filesystem::exists(longDestination),
          "Direct extraction must recheck all paths before creating the output folder");
   config.maxOutputPathLength = 240;
+  PipelineExtractionDiagnostics diagnostics;
+  config.diagnostics = &diagnostics;
   PipelineExtractionProgress lastProgress;
+  bool observedLiveDiagnostics = false;
   std::vector<bool> reportedArchives(parts.size(), false);
   std::vector<bool> extractedArchives(parts.size(), false);
   const auto result = extractor.Extract(config, [&](const auto& progress) {
     lastProgress = progress;
+    observedLiveDiagnostics = observedLiveDiagnostics ||
+        diagnostics.inputReadOps.load() > 0;
     if (progress.validationArchiveIndex > 0 &&
         progress.validationArchiveIndex <= reportedArchives.size()) {
       reportedArchives[progress.validationArchiveIndex - 1] = true;
@@ -885,6 +891,48 @@ void TestPipelinedExtractor() {
     }
   });
   Expect(result.ok, result.message.c_str());
+  Expect(std::filesystem::is_directory(output / "small-files" / "empty" / "nested"),
+         "Pipelined extraction must preserve explicit empty directories");
+  uint64_t actualOutputBytes = 0;
+  uint64_t actualOutputFiles = 0;
+  for (const auto& entry : std::filesystem::recursive_directory_iterator(output)) {
+    if (entry.is_regular_file()) {
+      actualOutputBytes += entry.file_size();
+      ++actualOutputFiles;
+    }
+  }
+  uint64_t manifestBytes = 0;
+  uint64_t manifestBlocks = 0;
+  for (const auto& file : manifest.files) {
+    manifestBytes += file.size;
+    manifestBlocks += file.chunkSha256.size();
+  }
+  Expect(diagnostics.outputBytesWritten.load() == actualOutputBytes && actualOutputBytes > 0,
+         "Diagnostics should count actual bytes written to extracted files");
+  Expect(diagnostics.outputFilesCreated.load() == actualOutputFiles &&
+             actualOutputFiles == smallFileCount + 1,
+         "Diagnostics should count every successfully created output file");
+  Expect(diagnostics.inputDiskBytes.load() >= manifestBytes &&
+             diagnostics.inputReadOps.load() > 0,
+         "Diagnostics should count completed physical reads covering the entire manifest");
+  Expect(diagnostics.blockLoads.load() >= manifestBlocks &&
+             diagnostics.blockReloads.load() == diagnostics.blockLoads.load() - manifestBlocks,
+         "Diagnostics should distinguish first verified loads from uncached block reloads");
+  Expect(diagnostics.cacheHits.load() > 0 && diagnostics.cacheMisses.load() > 0,
+         "Diagnostics should record real SDK cache hits and misses");
+  Expect(observedLiveDiagnostics,
+         "Diagnostics should be readable while extraction is still running");
+  Expect(diagnostics.blockWaitNanoseconds.load() > 0 &&
+             diagnostics.diskWaitNanoseconds.load() > 0 && diagnostics.hashNanoseconds.load() > 0,
+         "Diagnostics should time SDK block waits, disk waits and hashing");
+  Expect(diagnostics.outputWriteCalls.load() >= actualOutputFiles &&
+             diagnostics.outputCreateNanoseconds.load() > 0 &&
+             diagnostics.outputWriteNanoseconds.load() > 0 &&
+             diagnostics.outputCloseNanoseconds.load() > 0,
+         "Diagnostics should record output calls and create/write/close timings");
+  Expect(diagnostics.outputDirectoriesChecked.load() >= actualOutputFiles &&
+             diagnostics.outputDirectoryNanoseconds.load() > 0,
+         "Diagnostics should count and time output directory creation checks");
   {
     std::ifstream sentinel(unusedStaging / "keep.txt");
     std::string contents((std::istreambuf_iterator<char>(sentinel)), std::istreambuf_iterator<char>());
@@ -919,6 +967,7 @@ void TestPipelinedExtractor() {
   }
 
   auto stagedConfig = config;
+  stagedConfig.diagnostics = nullptr;
   stagedConfig.installFolder = stagedPlan.value().folder;
   stagedConfig.maxOutputPathLength = 0;
   const auto stagedResult = extractor.Extract(stagedConfig);
@@ -927,6 +976,70 @@ void TestPipelinedExtractor() {
   Expect(stagedHash.ok() && stagedHash.value() == sourceHash.value(),
          "Staging fallback should extract the same payload as direct extraction");
   Expect(!std::filesystem::exists(longDestination), "Staged extraction must leave the final folder untouched");
+  Expect(diagnostics.outputBytesWritten.load() == actualOutputBytes &&
+             diagnostics.outputFilesCreated.load() == actualOutputFiles,
+         "A subsequent extraction without diagnostics must not update prior counters");
+
+  auto stoppedConfig = config;
+  stoppedConfig.installFolder = root / "stopped-output";
+  stoppedConfig.cancelRequested = &cancelled;
+  stoppedConfig.diagnostics = nullptr;
+  cancelled = true;
+  Expect(!extractor.Extract(stoppedConfig).ok,
+         "Pre-cancelled extraction must not report success");
+  cancelled = false;
+  bool stoppedDuringExtraction = false;
+  const auto stoppedResult = extractor.Extract(stoppedConfig, [&](const auto& progress) {
+    if (progress.extractionPercent > 0) {
+      stoppedDuringExtraction = true;
+      cancelled = true;
+    }
+  });
+  Expect(stoppedDuringExtraction && !stoppedResult.ok,
+         "Cancelling active decoding must release the reader and worker without success");
+  cancelled = false;
+
+  auto blockedConfig = config;
+  blockedConfig.installFolder = root / "blocked-output";
+  blockedConfig.diagnostics = nullptr;
+  std::filesystem::create_directories(blockedConfig.installFolder / payload.filename());
+  const auto blockedResult = extractor.Extract(blockedConfig);
+  Expect(!blockedResult.ok,
+         "An output-open failure must stop and join the prefetch worker safely");
+
+  // Trailing archive bytes are not required by the decoder but still require validation.
+  const auto lastPart = parts.back();
+  {
+    std::ofstream trailing(lastPart, std::ios::binary | std::ios::app);
+    const std::string bytes(3 * 1024 * 1024 + 17, 'T');
+    trailing.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+  }
+  auto trailingManifest = manifest;
+  auto& lastVolume = trailingManifest.files.back();
+  lastVolume.size = std::filesystem::file_size(lastPart);
+  lastVolume.sha256 = Sha256::FileHexDigest(lastPart).value();
+  lastVolume.chunkSha256 = ChunkHashes(lastPart, trailingManifest.hashChunkSize);
+  auto trailingConfig = config;
+  trailingConfig.manifest = &trailingManifest;
+  trailingConfig.installFolder = root / "trailing-output";
+  trailingConfig.diagnostics = nullptr;
+  PipelineExtractionProgress trailingProgress;
+  const auto trailingResult = extractor.Extract(trailingConfig, [&](const auto& progress) {
+    trailingProgress = progress;
+  });
+  Expect(trailingResult.ok, trailingResult.message.c_str());
+  Expect(trailingProgress.validatedBytes == trailingProgress.validationTotalBytes,
+         "Final verification must cover trailing data not consumed by decoding");
+  {
+    std::fstream trailing(lastPart, std::ios::binary | std::ios::in | std::ios::out);
+    trailing.seekp(-1, std::ios::end);
+    trailing.put('X');
+  }
+  trailingConfig.installFolder = root / "corrupted-tail-output";
+  const auto corruptedTail = extractor.Extract(trailingConfig);
+  Expect(!corruptedTail.ok && corruptedTail.message.find("SHA256 mismatch") != std::string::npos,
+         "A corrupt unused tail chunk must fail final verification");
+  std::filesystem::resize_file(lastPart, manifest.files.back().size);
 
   const auto corruptedPart = parts[1];
   {
@@ -939,11 +1052,16 @@ void TestPipelinedExtractor() {
     file.write(&value, 1);
   }
   PipelinedExtractionConfig corruptedConfig = config;
+  PipelineExtractionDiagnostics corruptedDiagnostics;
+  corruptedConfig.diagnostics = &corruptedDiagnostics;
   corruptedConfig.installFolder = root / "corrupted-output";
   const auto corruptedResult = extractor.Extract(corruptedConfig);
   Expect(!corruptedResult.ok, "Pipelined extraction should reject a corrupted volume");
   Expect(corruptedResult.message.find("SHA256 mismatch") != std::string::npos,
          "Pipelined corruption failure should identify the SHA256 mismatch");
+  Expect(corruptedDiagnostics.inputReadOps.load() > 0 &&
+             corruptedDiagnostics.hashNanoseconds.load() > 0,
+         "Diagnostics must remain active without bypassing corruption validation");
   std::filesystem::remove_all(root);
 }
 
