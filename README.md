@@ -18,10 +18,10 @@ PackerApp/dist/modlist-packer.exe
 Ready-to-use versioned release archives are written to:
 
 ```text
-Release/ModlistInstaller-v0.3.7.zip
+Release/ModlistInstaller-v0.3.8.zip
 ```
 
-Download [v0.3.7](https://github.com/wallhead/ModListInstaller/releases/tag/v0.3.7), extract the ZIP, and run `modlist-packer.exe` inside its folder. The archive includes the matching installer, README, and 7-Zip license. No separate VC++ Redistributable, browser runtime, or external UI files are needed. Published older ZIPs retain their original layout; current releases use the flat layout below.
+Download [v0.3.8](https://github.com/wallhead/ModListInstaller/releases/tag/v0.3.8), extract the ZIP, and run `modlist-packer.exe` inside its folder. The archive includes the matching installer, README, and 7-Zip license. No separate VC++ Redistributable, browser runtime, or external UI files are needed. Published older ZIPs retain their original layout; current releases use the flat layout below.
 
 ## Installer Runtime Layout
 
@@ -55,7 +55,7 @@ The installer reads `manifest.json` and archive parts beside its executable. UI 
 - Before installation, the installer uses the Windows Documents known folder and ensures `My Games\Skyrim Special Edition` and `My Games\Fallout4` exist.
 - Live validation, extraction, and install progress with status text.
 - Same-drive installs use move/cut semantics automatically when possible.
-- Successful staged installs remove the empty `<drive>:\Unpacking` folder; direct installs leave that unused folder untouched.
+- Staged installs remove the empty `<drive>:\Unpacking` folder when possible. If only locked empty directories remain, the installer logs a warning and keeps the ownership record for later cleanup. Direct installs leave the unused staging folder untouched.
 - Embedded 7-Zip command-line and SDK components are cached in Local AppData when needed.
 - Cached tools are compared byte-for-byte with their embedded originals before reuse.
 - Progress updates are rate-limited to keep the native interface responsive; long paths are handled correctly by access checks.

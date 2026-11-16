@@ -27,6 +27,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -527,6 +528,40 @@ std::wstring SevenZipVolumeSize(const std::wstring& value) {
   return value;
 }
 
+struct SevenZipOptions {
+  bool fullPaths{false};
+  bool splitVolumes{false};
+};
+
+SevenZipOptions ParseSevenZipOptions(std::wstring_view parameters) {
+  SevenZipOptions options;
+  // 7-Zip 26.02 toggles quoting on each double quote; backslashes are literal.
+  std::wstring argument;
+  while (!parameters.empty()) {
+    argument.clear();
+    bool quoted = false;
+    while (!parameters.empty()) {
+      const wchar_t ch = parameters.front();
+      parameters.remove_prefix(1);
+      if (ch == L'"') quoted = !quoted;
+      else if (!quoted && (ch == L' ' || ch == L'\t')) break;
+      else argument += ch >= L'A' && ch <= L'Z' ? static_cast<wchar_t>(ch + (L'a' - L'A')) : ch;
+    }
+    if (argument == L"--") break;
+    options.fullPaths |= argument.starts_with(L"-spf") || argument.starts_with(L"/spf");
+    options.splitVolumes |= argument.size() > 2 && argument.starts_with(L"-v");
+  }
+  return options;
+}
+
+bool UsesConfiguredVolumes(const PackerConfig& config) {
+  return !config.volumeSize.empty() && config.volumeSize != L"none";
+}
+
+bool SevenZipRequestsSplit(const PackerConfig& config) {
+  return UsesConfiguredVolumes(config) || ParseSevenZipOptions(config.parameters).splitVolumes;
+}
+
 std::filesystem::path PackageFolder(const PackerConfig& config) {
   return config.releaseFolder / config.archiveName;
 }
@@ -721,9 +756,8 @@ std::wstring BuildSevenZipCommand(const PackerConfig& config) {
       command += L" -ms=" + config.solid;
     }
   }
-  const auto volumeSize = SevenZipVolumeSize(config.volumeSize);
-  if (!volumeSize.empty() && volumeSize != L"none") {
-    command += L" -v" + volumeSize;
+  if (UsesConfiguredVolumes(config)) {
+    command += L" -v" + SevenZipVolumeSize(config.volumeSize);
   }
   if (!config.parameters.empty()) {
     command += L" " + config.parameters;
@@ -733,8 +767,7 @@ std::wstring BuildSevenZipCommand(const PackerConfig& config) {
 
 std::wstring BuildSevenZipTestCommand(const PackerConfig& config) {
   auto archive = ArchivePath(config);
-  const auto volumeSize = SevenZipVolumeSize(config.volumeSize);
-  if (!volumeSize.empty() && volumeSize != L"none") {
+  if (SevenZipRequestsSplit(config)) {
     archive += L".001";
   }
   return Quote(config.sevenZipExe) + L" t " + Quote(archive) + L" -y -bsp1";
@@ -1050,10 +1083,32 @@ void CloseManifest(std::ofstream& output) {
   output.close();
 }
 
+constexpr std::wstring_view kWorkNamePattern = L".packer-0000000000000000";
+
 std::wstring UniqueWorkName() {
-  static std::atomic_uint sequence{0};
-  return L".packer-" + std::to_wstring(GetCurrentProcessId()) + L"-" +
-      std::to_wstring(GetTickCount64()) + L"-" + std::to_wstring(sequence.fetch_add(1));
+  unsigned char nonce[8]{};
+  if (BCryptGenRandom(nullptr, nonce, sizeof(nonce), BCRYPT_USE_SYSTEM_PREFERRED_RNG) != 0) {
+    throw std::runtime_error("Unable to generate a package work name");
+  }
+  std::wstring name(kWorkNamePattern);
+  constexpr wchar_t hex[] = L"0123456789abcdef";
+  auto digit = name.end() - 2 * sizeof(nonce);
+  for (auto byte : nonce) {
+    *digit++ = hex[byte >> 4];
+    *digit++ = hex[byte & 15];
+  }
+  return name;
+}
+
+bool CheckPackagePath(HWND hwnd, const std::filesystem::path& path, bool directory = false) {
+  const auto absolute = std::filesystem::absolute(path).make_preferred().wstring();
+  const size_t limit = directory ? MAX_PATH - 12 : MAX_PATH - 1;
+  if (absolute.size() > limit || absolute.starts_with(L"\\\\?\\") || absolute.starts_with(L"\\\\.\\")) {
+    PostLog(hwnd, L"Package path is too long or uses an unsupported path prefix. Shorten the release folder or archive name: " +
+                     absolute);
+    return false;
+  }
+  return true;
 }
 
 bool WriteManifest(HWND hwnd, const PackerConfig& config, uint64_t unpackedSize,
@@ -1071,6 +1126,16 @@ bool WriteManifest(HWND hwnd, const PackerConfig& config, uint64_t unpackedSize,
     return false;
   }
 
+  const auto packageFolder = PackageFolder(config);
+  const auto manifestFolder = outputFolder.empty() ? packageFolder : outputFolder;
+  const auto manifestPath = manifestFolder / "manifest.json";
+  const auto temporaryPath = manifestFolder / UniqueWorkName();
+  if (!CheckPackagePath(hwnd, manifestFolder, true) || !CheckPackagePath(hwnd, manifestPath) ||
+      !CheckPackagePath(hwnd, temporaryPath)) return false;
+  for (const auto& file : files) {
+    if (!CheckPackagePath(hwnd, file)) return false;
+  }
+
   uint64_t totalBytes = 0;
   for (const auto& file : files) {
     std::error_code ec;
@@ -1081,7 +1146,6 @@ bool WriteManifest(HWND hwnd, const PackerConfig& config, uint64_t unpackedSize,
   }
 
   PostLog(hwnd, L"Generating manifest for " + std::to_wstring(files.size()) + L" archive file(s).");
-  const auto packageFolder = PackageFolder(config);
   const size_t workerCount = SelectHashWorkerCount(packageFolder, files.size());
   PostLog(hwnd, workerCount == 1
                     ? L"Manifest hashing workers: 1 (sequential HDD-friendly read)"
@@ -1151,15 +1215,12 @@ bool WriteManifest(HWND hwnd, const PackerConfig& config, uint64_t unpackedSize,
   }
 
   std::error_code ec;
-  const auto manifestFolder = outputFolder.empty() ? packageFolder : outputFolder;
   std::filesystem::create_directories(manifestFolder, ec);
   if (ec) {
     PostLog(hwnd, L"Unable to create package folder: " + Widen(ec.message()));
     return false;
   }
 
-  const auto manifestPath = manifestFolder / "manifest.json";
-  const auto temporaryPath = manifestFolder / (L"manifest.json" + UniqueWorkName() + L".tmp");
   HANDLE temporary = CreateFileW(temporaryPath.c_str(), GENERIC_WRITE, 0, nullptr,
                                  CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
   if (temporary == INVALID_HANDLE_VALUE) {
@@ -1275,30 +1336,110 @@ void UpdateProcessProgressStatus(HWND hwnd,
                                         memoryLimitBytes));
 }
 
-void ConsumeProcessOutput(const char* buffer,
-                          DWORD bytesRead,
-                          std::string& tail,
-                          int& lastPercent) {
-  tail.append(buffer, bytesRead);
-  if (tail.size() > 4096) {
-    tail.erase(0, tail.size() - 4096);
+class SevenZipProgress {
+ public:
+  void Consume(std::string_view bytes, int& lastPercent) noexcept {
+    for (char byte : bytes) {
+      bool erased = false;
+      if (erasePercent_ >= 0) {
+        if (byte == ' ' && eraseSpaces_ < eraseWidth_) {
+          ++eraseSpaces_;
+        } else {
+          erased = byte == '\r' && eraseSpaces_ == eraseWidth_;
+          if (erased) lastPercent = erasePercent_;
+          erasePercent_ = -1;
+        }
+      }
+      if (byte == '\r' || byte == '\n' || byte == '\b') {
+        if (byte == '\r' && candidate_ >= 0) {
+          // Windows 7-Zip clears a frame with CR, one space per byte, then CR.
+          erasePercent_ = candidate_;
+          eraseWidth_ = length_;
+          eraseSpaces_ = 0;
+        }
+        if (byte == '\b' && candidate_ >= 0) lastPercent = candidate_;
+        length_ = 0;
+        candidate_ = -1;
+        frameStart_ = erased;
+      } else if (length_ < kPrefixWidth) {
+        frame_[length_++] = byte;
+        if (length_ == kPrefixWidth) candidate_ = ParsePrefix();
+      } else if (candidate_ >= 0) {
+        if ((length_ == kPrefixWidth && byte != ' ') || length_ == sizeof(frame_)) candidate_ = -1;
+        else frame_[length_++] = byte;
+      }
+    }
   }
-  const auto percentPos = tail.rfind('%');
-  if (percentPos == std::string::npos) {
-    return;
+
+  int Current(int lastPercent) const noexcept {
+    // A bare prefix on an ordinary log line is ambiguous until 7-Zip erases it.
+    return frameStart_ && candidate_ >= 0 && HasProgressSuffix() ? candidate_ : lastPercent;
   }
-  size_t begin = percentPos;
-  while (begin > 0 && std::isdigit(static_cast<unsigned char>(tail[begin - 1]))) {
-    --begin;
+
+ private:
+  int ParsePrefix() const noexcept {
+    if (frame_[3] != '%') return -1;
+    size_t i = 0;
+    while (i < 2 && frame_[i] == ' ') ++i;
+    if (i < 2 && frame_[i] == '0') return -1;
+    int percent = 0;
+    for (; i < 3; ++i) {
+      if (frame_[i] < '0' || frame_[i] > '9') return -1;
+      percent = percent * 10 + frame_[i] - '0';
+    }
+    return percent <= 100 ? percent : -1;
   }
-  if (begin >= percentPos) {
-    return;
+
+  bool HasProgressSuffix() const noexcept {
+    std::string_view suffix(frame_ + kPrefixWidth, length_ - kPrefixWidth);
+    auto skipSpaces = [&] { while (!suffix.empty() && suffix.front() == ' ') suffix.remove_prefix(1); };
+    skipSpaces();
+    const auto count = suffix.find_first_not_of("0123456789");
+    if (count != 0 && !suffix.empty()) {
+      if (count == std::string_view::npos) return suffix.size() <= 20;
+      if (count > 20 || suffix[count] != ' ') return false;
+      suffix.remove_prefix(count);
+      skipSpaces();
+    }
+    if (suffix.empty()) return true;
+    const auto command = suffix.substr(0, suffix.find(' '));
+    // Once a known operation starts, its remaining text, including names, is opaque.
+    for (std::string_view known : {"+", "U", "A", "R", "D", ".", "=", "Scan", "Removing",
+                                   "Anti", "Reading", "Header", "Size", "Open", ":", "T", "E", "X"}) {
+      if (command == known) return true;
+    }
+    return false;
   }
-  const int percent = std::stoi(tail.substr(begin, percentPos - begin));
-  if (percent >= 0 && percent <= 100) {
-    lastPercent = percent;
+
+  static constexpr size_t kPrefixWidth = 4;
+  char frame_[1024]{};
+  size_t length_{0};
+  int candidate_{-1};
+  int erasePercent_{-1};
+  size_t eraseWidth_{0};
+  size_t eraseSpaces_{0};
+  bool frameStart_{false};
+};
+
+struct CloseWinHandle {
+  void operator()(HANDLE handle) const noexcept { CloseHandle(handle); }
+};
+using ScopedWinHandle = std::unique_ptr<void, CloseWinHandle>;
+
+class RunningChild {
+ public:
+  explicit RunningChild(HANDLE process) noexcept : process_(process) {}
+  ~RunningChild() {
+    if (WaitForSingleObject(Get(), 0) != WAIT_OBJECT_0) {
+      TerminateProcess(Get(), 255);
+      WaitForSingleObject(Get(), INFINITE);
+    }
   }
-}
+  HANDLE Get() const noexcept { return process_.get(); }
+
+ private:
+  ScopedWinHandle process_;
+};
 
 int RunProcess(HWND hwnd,
                const std::wstring& command,
@@ -1309,49 +1450,44 @@ int RunProcess(HWND hwnd,
   security.nLength = sizeof(security);
   security.bInheritHandle = TRUE;
 
-  HANDLE readPipe = nullptr;
-  HANDLE writePipe = nullptr;
-  if (!CreatePipe(&readPipe, &writePipe, &security, 0)) {
+  HANDLE rawRead = nullptr;
+  HANDLE rawWrite = nullptr;
+  if (!CreatePipe(&rawRead, &rawWrite, &security, 0)) {
     return static_cast<int>(GetLastError());
   }
-  SetHandleInformation(readPipe, HANDLE_FLAG_INHERIT, 0);
+  const ScopedWinHandle readPipe(rawRead);
+  ScopedWinHandle writePipe(rawWrite);
+  if (!SetHandleInformation(readPipe.get(), HANDLE_FLAG_INHERIT, 0)) {
+    return static_cast<int>(GetLastError());
+  }
 
   STARTUPINFOW startup{};
   startup.cb = sizeof(startup);
   startup.dwFlags = STARTF_USESTDHANDLES;
-  startup.hStdOutput = writePipe;
-  startup.hStdError = writePipe;
+  startup.hStdOutput = writePipe.get();
+  startup.hStdError = writePipe.get();
   startup.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
 
-  HANDLE job = nullptr;
+  ScopedWinHandle job;
   uint64_t memoryLimitBytes = 0;
   if (memoryLimitPercent > 0) {
     memoryLimitBytes = PhysicalMemoryLimitBytes(memoryLimitPercent);
     if (memoryLimitBytes == 0) {
-      CloseHandle(writePipe);
-      CloseHandle(readPipe);
       return static_cast<int>(ERROR_NOT_ENOUGH_MEMORY);
     }
-    job = CreateJobObjectW(nullptr, nullptr);
-    if (job == nullptr) {
-      const DWORD error = GetLastError();
-      CloseHandle(writePipe);
-      CloseHandle(readPipe);
-      return static_cast<int>(error);
+    job.reset(CreateJobObjectW(nullptr, nullptr));
+    if (!job) {
+      return static_cast<int>(GetLastError());
     }
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};
     limits.BasicLimitInformation.LimitFlags =
         JOB_OBJECT_LIMIT_PROCESS_MEMORY | JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
     limits.ProcessMemoryLimit = static_cast<SIZE_T>(memoryLimitBytes);
-    if (!SetInformationJobObject(job,
+    if (!SetInformationJobObject(job.get(),
                                  JobObjectExtendedLimitInformation,
                                  &limits,
                                  sizeof(limits))) {
-      const DWORD error = GetLastError();
-      CloseHandle(job);
-      CloseHandle(writePipe);
-      CloseHandle(readPipe);
-      return static_cast<int>(error);
+      return static_cast<int>(GetLastError());
     }
     PostLog(hwnd, L"7-Zip RAM limit: " + std::to_wstring(memoryLimitPercent) +
                       L"% of physical memory (" + FormatBytes(memoryLimitBytes) + L")");
@@ -1369,97 +1505,80 @@ int RunProcess(HWND hwnd,
                                       nullptr,
                                       &startup,
                                       &process);
-  CloseHandle(writePipe);
   if (!created) {
-    const DWORD error = GetLastError();
-    if (job != nullptr) {
-      CloseHandle(job);
-    }
-    CloseHandle(readPipe);
-    return static_cast<int>(error);
+    return static_cast<int>(GetLastError());
   }
+  RunningChild child(process.hProcess);
+  const ScopedWinHandle thread(process.hThread);
+  writePipe.reset();
 
-  if (job != nullptr && !AssignProcessToJobObject(job, process.hProcess)) {
-    const DWORD error = GetLastError();
-    TerminateProcess(process.hProcess, error);
-    CloseHandle(process.hThread);
-    CloseHandle(process.hProcess);
-    CloseHandle(job);
-    CloseHandle(readPipe);
-    return static_cast<int>(error);
+  if (job && !AssignProcessToJobObject(job.get(), child.Get())) {
+    return static_cast<int>(GetLastError());
   }
-  if (ResumeThread(process.hThread) == static_cast<DWORD>(-1)) {
-    const DWORD error = GetLastError();
-    TerminateProcess(process.hProcess, error);
-    CloseHandle(process.hThread);
-    CloseHandle(process.hProcess);
-    if (job != nullptr) {
-      CloseHandle(job);
-    }
-    CloseHandle(readPipe);
-    return static_cast<int>(error);
+  if (ResumeThread(thread.get()) == static_cast<DWORD>(-1)) {
+    return static_cast<int>(GetLastError());
   }
 
   char buffer[4096];
-  std::string tail;
+  SevenZipProgress progress;
   int lastPercent = -1;
+  int reportedPercent = -1;
   const auto startedAt = std::chrono::steady_clock::now();
   auto lastHeartbeatAt = startedAt;
-  UpdateProcessProgressStatus(hwnd, label, lastPercent, estimatedBytes, startedAt, process.hProcess, memoryLimitBytes);
+  UpdateProcessProgressStatus(hwnd, label, lastPercent, estimatedBytes, startedAt, child.Get(), memoryLimitBytes);
 
   while (true) {
     if (g_cancelRequested.load()) {
-      TerminateProcess(process.hProcess, 255);
+      TerminateProcess(child.Get(), 255);
       break;
     }
 
     DWORD available = 0;
-    while (PeekNamedPipe(readPipe, nullptr, 0, nullptr, &available, nullptr) && available > 0) {
+    while (PeekNamedPipe(readPipe.get(), nullptr, 0, nullptr, &available, nullptr) && available > 0) {
       DWORD bytesRead = 0;
       const DWORD toRead = std::min<DWORD>(available, sizeof(buffer));
-      if (!ReadFile(readPipe, buffer, toRead, &bytesRead, nullptr) || bytesRead == 0) {
+      if (!ReadFile(readPipe.get(), buffer, toRead, &bytesRead, nullptr) || bytesRead == 0) {
         break;
       }
-      ConsumeProcessOutput(buffer, bytesRead, tail, lastPercent);
+      progress.Consume({buffer, bytesRead}, lastPercent);
       available = 0;
     }
 
     const auto now = std::chrono::steady_clock::now();
     if (now - lastHeartbeatAt >= std::chrono::seconds(1)) {
+      reportedPercent = progress.Current(lastPercent);
       UpdateProcessProgressStatus(hwnd,
                                   label,
-                                  lastPercent,
+                                  reportedPercent,
                                   estimatedBytes,
                                   startedAt,
-                                  process.hProcess,
+                                  child.Get(),
                                   memoryLimitBytes);
       lastHeartbeatAt = now;
     }
 
-    const DWORD wait = WaitForSingleObject(process.hProcess, 100);
+    const DWORD wait = WaitForSingleObject(child.Get(), 100);
+    if (wait == WAIT_FAILED) return static_cast<int>(GetLastError());
     if (wait == WAIT_OBJECT_0) {
       DWORD remaining = 0;
-      while (PeekNamedPipe(readPipe, nullptr, 0, nullptr, &remaining, nullptr) && remaining > 0) {
+      while (PeekNamedPipe(readPipe.get(), nullptr, 0, nullptr, &remaining, nullptr) && remaining > 0) {
         DWORD bytesRead = 0;
         const DWORD toRead = std::min<DWORD>(remaining, sizeof(buffer));
-        if (!ReadFile(readPipe, buffer, toRead, &bytesRead, nullptr) || bytesRead == 0) {
+        if (!ReadFile(readPipe.get(), buffer, toRead, &bytesRead, nullptr) || bytesRead == 0) {
           break;
         }
-        ConsumeProcessOutput(buffer, bytesRead, tail, lastPercent);
+        progress.Consume({buffer, bytesRead}, lastPercent);
       }
       break;
     }
   }
 
-  WaitForSingleObject(process.hProcess, INFINITE);
+  if (WaitForSingleObject(child.Get(), INFINITE) == WAIT_FAILED) return static_cast<int>(GetLastError());
   DWORD exitCode = 0;
-  GetExitCodeProcess(process.hProcess, &exitCode);
-  CloseHandle(process.hThread);
-  CloseHandle(process.hProcess);
-  if (job != nullptr) {
-    CloseHandle(job);
+  if (!GetExitCodeProcess(child.Get(), &exitCode)) return static_cast<int>(GetLastError());
+  if (exitCode == 0 && !g_cancelRequested && lastPercent >= 0 && lastPercent != reportedPercent) {
+    UpdateProcessProgressStatus(hwnd, label, lastPercent, estimatedBytes, startedAt, child.Get(), memoryLimitBytes);
   }
-  CloseHandle(readPipe);
   return static_cast<int>(exitCode);
 }
 
@@ -1518,7 +1637,7 @@ PackerConfig ReadConfig(bool archiveFirst) {
   return config;
 }
 
-bool ValidateConfig(HWND hwnd, const PackerConfig& config) {
+bool ValidateConfig(HWND hwnd, const PackerConfig& config, bool createFolders = true) {
   std::error_code ec;
   if (config.releaseFolder.empty()) {
     PostLog(hwnd, L"Release folder is required.");
@@ -1536,25 +1655,9 @@ bool ValidateConfig(HWND hwnd, const PackerConfig& config) {
     PostLog(hwnd, L"Only Relative paths is supported; absolute archive entries cannot be installed safely.");
     return false;
   }
-  if (!config.parameters.empty()) {
-    int argumentCount = 0;
-    auto* arguments = CommandLineToArgvW((L"7z.exe " + config.parameters).c_str(), &argumentCount);
-    if (arguments == nullptr) {
-      PostLog(hwnd, L"Unable to parse additional 7-Zip parameters.");
-      return false;
-    }
-    bool fullPaths = false;
-    for (int i = 1; i < argumentCount; ++i) {
-      const auto argument = Lower(arguments[i]);
-      if (argument.starts_with(L"-spf") || argument.starts_with(L"/spf")) {
-        fullPaths = true;
-      }
-    }
-    LocalFree(arguments);
-    if (fullPaths) {
-      PostLog(hwnd, L"The -spf full-path switches are not supported; use Relative paths.");
-      return false;
-    }
+  if (ParseSevenZipOptions(config.parameters).fullPaths) {
+    PostLog(hwnd, L"The -spf full-path switches are not supported; use Relative paths.");
+    return false;
   }
   if (config.archiveFirst) {
     if (!std::filesystem::exists(config.sourceFolder, ec) || !std::filesystem::is_directory(config.sourceFolder, ec)) {
@@ -1567,6 +1670,7 @@ bool ValidateConfig(HWND hwnd, const PackerConfig& config) {
       return false;
     }
   }
+  if (!createFolders) return true;
   std::filesystem::create_directories(config.releaseFolder, ec);
   if (ec) {
     PostLog(hwnd, L"Unable to create release folder: " + Widen(ec.message()));
@@ -1662,6 +1766,60 @@ class PackageWorkspace {
   bool retained_{false};
 };
 
+constexpr auto kStagedDirectory = L"new";
+
+bool CheckLivePackageDirectory(HWND hwnd, const std::filesystem::path& target) {
+  const DWORD attributes = GetFileAttributesW(target.c_str());
+  if (attributes == INVALID_FILE_ATTRIBUTES) {
+    const DWORD error = GetLastError();
+    if (error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND) return true;
+  } else if ((attributes & FILE_ATTRIBUTE_DIRECTORY) && !(attributes & FILE_ATTRIBUTE_REPARSE_POINT)) {
+    return true;
+  }
+  PostLog(hwnd, L"Live package folder is redirected, inaccessible, or not a directory: " + target.wstring());
+  return false;
+}
+
+bool CheckWorkerPackagePaths(HWND hwnd, const PackerConfig& live) {
+  const auto target = PackageFolder(live);
+  if (!CheckPackagePath(hwnd, live.releaseFolder, true) || !CheckPackagePath(hwnd, target, true)) return false;
+  if (!CheckLivePackageDirectory(hwnd, target)) return false;
+  const auto root = std::filesystem::weakly_canonical(live.releaseFolder) / kWorkNamePattern;
+  const auto stage = root / kStagedDirectory;
+  const auto replacement = stage / live.archiveName;
+  const auto backup = root / "previous";
+  for (const auto& directory : {root, stage, replacement, backup}) {
+    if (!CheckPackagePath(hwnd, directory, true)) return false;
+  }
+  for (const auto& file : {root / "packer-workspace.txt", root / "promotion-journal.txt", replacement / kWorkNamePattern}) {
+    if (!CheckPackagePath(hwnd, file)) return false;
+  }
+  for (const auto& directory : {target, replacement, backup}) {
+    if (!CheckPackagePath(hwnd, directory / "manifest.json") ||
+        (live.copyInstaller && !CheckPackagePath(hwnd, directory / "modlist-installer.exe"))) return false;
+  }
+  if (live.archiveFirst) {
+    const auto archive = live.archiveName + SelectArchiveExtension(live);
+    if (SevenZipRequestsSplit(live)) {
+      // A 32-bit volume number and 7-Zip's optional collision suffix (.8 hex digits.tmp).
+      if (!CheckPackagePath(hwnd, target / (archive + L".4294967295")) ||
+          !CheckPackagePath(hwnd, replacement / (archive + L".4294967295.ffffffff.tmp"))) {
+        PostLog(hwnd, L"Split volumes require more room in the package path.");
+        return false;
+      }
+    } else if (!CheckPackagePath(hwnd, target / archive) ||
+               !CheckPackagePath(hwnd, replacement / (archive + L".tmp4294967295"))) {
+      return false;
+    }
+    for (const auto* extension : {L".7z", L".zip"}) {
+      for (const auto& file : FindArchiveOutputsAndTemps(target, live.archiveName + extension)) {
+        if (!CheckPackagePath(hwnd, file) || !CheckPackagePath(hwnd, backup / file.filename())) return false;
+      }
+    }
+  }
+  return true;
+}
+
 bool IsPlainPackageFile(const std::filesystem::path& path) {
   const auto attributes = GetFileAttributesW(path.c_str());
   return attributes != INVALID_FILE_ATTRIBUTES &&
@@ -1677,6 +1835,7 @@ bool SameWindowsPackagePath(const std::filesystem::path& left, const std::filesy
 bool PromotePackage(HWND hwnd, const PackerConfig& live, const PackerConfig& staged,
                     PackageWorkspace& workspace, const FileRenamer& renameFile) {
   const auto target = PackageFolder(live);
+  if (!CheckLivePackageDirectory(hwnd, target)) return false;
   const auto backup = workspace.Root() / "previous";
   std::filesystem::create_directory(backup);
   struct Move {
@@ -1789,12 +1948,14 @@ void Worker(HWND hwnd, PackerConfig config, const WorkerDependencies& dependenci
   try {
     bool ok = true;
     uint64_t unpackedSize = 0;
-    if (g_cancelRequested || !ResolveSevenZip(hwnd, config) || !ValidateConfig(hwnd, config)) return;
+    if (g_cancelRequested || !ValidateConfig(hwnd, config, false) ||
+        !CheckWorkerPackagePaths(hwnd, config) || !ResolveSevenZip(hwnd, config)) return;
     if (config.copyInstaller && !IsPlainPackageFile(dependencies.installerSourceFolder / "modlist-installer.exe")) {
       PostLog(hwnd, L"Unable to prepare setup: modlist-installer.exe was not found beside modlist-packer.exe.");
       return;
     }
     const auto liveConfig = config;
+    std::filesystem::create_directories(PackageFolder(config));
     std::unique_ptr<PackageWorkspace> workspace;
     if (config.archiveFirst) {
       unpackedSize = EstimateFolderBytes(hwnd, config.sourceFolder);
@@ -1811,7 +1972,7 @@ void Worker(HWND hwnd, PackerConfig config, const WorkerDependencies& dependenci
       return;
     }
     workspace = std::make_unique<PackageWorkspace>(hwnd, config.releaseFolder);
-    config.releaseFolder = workspace->Root() / "replacement";
+    config.releaseFolder = workspace->Root() / kStagedDirectory;
     PostLog(hwnd, L"Building replacement in owned workspace: " + workspace->Root().wstring());
     if (!PrepareInstallerSetup(hwnd, config, dependencies.installerSourceFolder)) return;
     if (config.archiveFirst) {

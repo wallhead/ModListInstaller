@@ -1,6 +1,5 @@
 #include "extractor/SevenZipExtractor.h"
 
-#include "paths/PathValidator.h"
 #include "app/RuntimePaths.h"
 #include "common/EmbeddedFile.h"
 #include "common/PathText.h"
@@ -238,12 +237,8 @@ std::optional<int> LastPercentIn(const std::string& text) {
 }
 
 std::wstring BuildCommandWide(const ExtractionConfig& config) {
-  std::wstring command = QuoteWide(config.sevenZipExe) + L" x " + QuoteWide(config.archiveFirstPart) +
-                         L" -o" + QuoteWide(config.installFolder) + L" -y -bsp1";
-  if (config.useSameDiskTemp) {
-    command += L" -w" + QuoteWide(SameDiskTempPath(config.installFolder));
-  }
-  return command;
+  return QuoteWide(config.sevenZipExe) + L" x " + QuoteWide(config.archiveFirstPart) +
+         L" -o" + QuoteWide(config.installFolder) + L" -y -bsp1";
 }
 
 int RunProcessAndCapture(const std::wstring& command,
@@ -428,7 +423,6 @@ Result<std::filesystem::path> SevenZipExtractor::LocateExecutable(const std::fil
 
 ExtractionResult SevenZipExtractor::Extract(const ExtractionConfig& config, ProgressCallback progressCallback) const {
   ExtractionResult result;
-  result.tempFolder = SameDiskTempPath(config.installFolder);
 
   std::error_code ec;
   if (!std::filesystem::exists(config.sevenZipExe, ec)) {
@@ -444,14 +438,6 @@ ExtractionResult SevenZipExtractor::Extract(const ExtractionConfig& config, Prog
     result.message = "Unable to create install folder: " + ec.message();
     return result;
   }
-  if (config.useSameDiskTemp) {
-    std::filesystem::create_directories(result.tempFolder, ec);
-    if (ec) {
-      result.message = "Unable to create same-disk temp folder: " + ec.message();
-      return result;
-    }
-  }
-
   const auto outputPath = MakeOutputCapturePath(config.sevenZipExe);
   result.outputLogPath = outputPath;
   const std::wstring command = BuildCommandWide(config);

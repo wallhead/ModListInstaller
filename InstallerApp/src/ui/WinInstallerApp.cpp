@@ -2240,7 +2240,6 @@ bool ExtractArchiveChain(HWND hwnd,
   extraction.archiveFirstPart = std::move(archiveFirstPart);
   extraction.installFolder = installFolder;
   extraction.cancelRequested = &g_stopRequested;
-  extraction.useSameDiskTemp = true;
 
   const bool splitArchive = IsFirstSplitArchivePart(extraction.archiveFirstPart);
   std::error_code sizeEc;
@@ -2372,7 +2371,7 @@ std::optional<uintmax_t> EstimateInstallBytes(const std::filesystem::path& path,
 void UpdateInstallProgress(InstallProgress& progress, uintmax_t bytes, bool force = false) {
   progress.doneBytes = std::min(progress.totalBytes, progress.doneBytes + bytes);
   const int percent = progress.totalBytes > 0
-                          ? static_cast<int>((progress.doneBytes * 100) / progress.totalBytes)
+                          ? std::min(99, static_cast<int>((progress.doneBytes * 100) / progress.totalBytes))
                           : 0;
   if (!force && percent == progress.lastPercent) {
     return;
@@ -2619,16 +2618,7 @@ bool InstallExtractedFiles(HWND hwnd, const std::filesystem::path& unpackFolder,
   PostProgress(hwnd, 95);
   PostStatus(hwnd, L"Установка 0%");
   if (IsSameFolder(unpackFolder, installFolder)) {
-    std::error_code ec;
-    std::filesystem::remove_all(modlist::SameDiskTempPath(installFolder), ec);
-    if (ec) {
-      PostLog(hwnd, L"Невозможно удалить временную папку: " + Widen(ec.message()));
-      return false;
-    }
     PostLog(hwnd, L"Папка установки является папкой распаковки; перемещение не требуется");
-    PostLog(hwnd, L"Установка выполнена");
-    PostProgress(hwnd, 100);
-    PostStatus(hwnd, L"Установка 100%");
     return true;
   }
   if (IsChildFolder(installFolder, unpackFolder)) {
@@ -2663,14 +2653,12 @@ bool InstallExtractedFiles(HWND hwnd, const std::filesystem::path& unpackFolder,
     return false;
   }
   for (const auto& entry : entries) {
-    if (entry.filename() != ".install_temp") {
-      const auto entryBytes = EstimateInstallBytes(entry, error);
-      if (!entryBytes.has_value()) {
-        PostLog(hwnd, error);
-        return false;
-      }
-      installProgress.totalBytes += *entryBytes;
+    const auto entryBytes = EstimateInstallBytes(entry, error);
+    if (!entryBytes.has_value()) {
+      PostLog(hwnd, error);
+      return false;
     }
+    installProgress.totalBytes += *entryBytes;
   }
   PostLog(hwnd, L"Размер сборки: " + FormatBytes(installProgress.totalBytes));
   if (!sameDrive) {
@@ -2688,30 +2676,17 @@ bool InstallExtractedFiles(HWND hwnd, const std::filesystem::path& unpackFolder,
       PostLog(hwnd, L"Установка остановлена пользователем");
       return false;
     }
-    if (entry.filename() == ".install_temp") {
-      std::filesystem::remove_all(entry, ec);
-      if (ec) {
-        PostLog(hwnd, L"Невозможно удалить временную папку: " + Widen(ec.message()));
-        return false;
+    const auto target = installFolder / entry.filename();
+    if (!InstallEntry(hwnd, entry, target, sameDrive, installProgress,
+                      manualRecoveryRequired, error)) {
+      PostLog(hwnd, error);
+      if (manualRecoveryRequired) {
+        PostManualInstallRequired(hwnd, unpackFolder, installFolder);
       }
-    } else {
-      const auto target = installFolder / entry.filename();
-      if (!InstallEntry(hwnd, entry, target, sameDrive, installProgress,
-                        manualRecoveryRequired, error)) {
-        PostLog(hwnd, error);
-        if (manualRecoveryRequired) {
-          PostManualInstallRequired(hwnd, unpackFolder, installFolder);
-        }
-        return false;
-      }
+      return false;
     }
   }
 
-  // The session removes its pinned staging root after finalization ends.
-
-  PostProgress(hwnd, 100);
-  PostStatus(hwnd, L"Установка 100%");
-  PostLog(hwnd, L"Установка выполнена");
   return true;
 }
 
@@ -2871,7 +2846,13 @@ void RunInstallWorker(HWND hwnd,
     if (!completed.ok()) {
       PostLog(hwnd, L"Не удалось завершить рабочую сессию: " + Widen(completed.error()));
       installed = false;
+    } else if (completed.value() == modlist::StagingCompletion::EmptyDirectoriesRetained) {
+      PostLog(hwnd, L"Staging retained: only empty directories remain at " + PathToDisplay(unpackFolder));
     }
+  }
+  if (installed) {
+    PostLog(hwnd, L"Установка выполнена");
+    PostStatus(hwnd, L"Установка 100%");
   }
   PostProgress(hwnd, installed ? 100 : 0);
   FinishWorker(hwnd, installed);
@@ -3502,7 +3483,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
       const auto finalFolder = FinalInstallFolder(std::filesystem::path(GetText(g_installEdit)));
       modlist::NativeInstallerViewState state;
       state.title = UiText("app_title", L"Modlist Installer Beta");
-      state.version = UiText("app_version", L"Modlist Installer v0.3.7 by WallHead");
+      state.version = UiText("app_version", L"Modlist Installer v0.3.8 by WallHead");
       state.unpackNote = UiText(
           "unpack_note",
           L"Установщик проверит пути в архиве и распакует файлы прямо в папку установки, если пути достаточно короткие. Иначе он использует временную папку, затем перенесет файлы.");

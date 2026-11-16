@@ -86,6 +86,9 @@ files. A selected final folder can still be overwritten after explicit confirmat
 Cleanup refuses redirected roots/ancestors, volume roots, nested links and changed
 folder identities. An active staging session cannot be cleaned by another session.
 Successful staged installation removes its owned empty staging folder and ownership metadata.
+If a move leaves behind only locked empty directories, installation succeeds with
+a log warning and keeps the ownership record for later cleanup. Leftover files
+or an unsafe staging tree still fail finalization.
 Old unmarked staging contents require manual inspection rather than automatic deletion.
 
 ## Ready Binary
@@ -96,7 +99,7 @@ The ready exe is placed at:
 InstallerApp\dist\modlist-installer.exe
 ```
 
-The v0.3.7 Windows installer statically links the Microsoft C/C++ runtime. It
+The Windows installer statically links the Microsoft C/C++ runtime. It
 does not require a separately installed VC++ Redistributable or WebView2.
 
 The runtime layout is:
@@ -137,6 +140,12 @@ run `scripts\test-install-worker.ps1` with a flat package, its source payload an
 fresh work/output parents. It runs the actual install worker in direct/staged
 modes without desktop automation, then compares complete payload hashes and empty
 directories outside the worker. It does not touch real Documents/game folders.
+
+For the installer finalization regressions, run `pwsh -File .\tests\test_install_finalize.ps1`
+after building `installer_workflow_tests`. The suite generates and removes its
+own small packages. It covers legitimate `.install_temp` entries on both
+extraction routes, locked empty staging directories, and refusal when files
+remain in staging.
 
 For an existing chunk-validated package, build `pipeline_smoke` and use
 `scripts\run-existing-smoke.ps1`. It resolves the first archive part through

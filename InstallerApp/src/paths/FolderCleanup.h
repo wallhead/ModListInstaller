@@ -29,6 +29,8 @@ Result<FolderCleanupTicket> PrepareFolderCleanup(
     FolderCleanupKind kind, const std::string& packageId = {});
 Result<void> ClearFolderContents(const FolderCleanupTicket& ticket, const FolderCleanupLimits& limits = {});
 
+enum class StagingCompletion { Removed, EmptyDirectoriesRetained };
+
 class StagingSession {
 public:
   struct Impl;
@@ -36,7 +38,7 @@ public:
   ~StagingSession();
   StagingSession(const StagingSession&) = delete;
   StagingSession& operator=(const StagingSession&) = delete;
-  Result<void> Complete();
+  Result<StagingCompletion> Complete();
 
 private:
   std::unique_ptr<Impl> impl_;

@@ -15,7 +15,6 @@ struct ExtractionConfig {
   std::filesystem::path archiveFirstPart;
   std::filesystem::path installFolder;
   const std::atomic_bool* cancelRequested{nullptr};
-  bool useSameDiskTemp{true};
 };
 
 struct ExtractionResult {
@@ -24,7 +23,6 @@ struct ExtractionResult {
   std::string command;
   std::string output;
   std::filesystem::path outputLogPath;
-  std::filesystem::path tempFolder;
   std::string message;
 };
 

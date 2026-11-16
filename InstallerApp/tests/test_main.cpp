@@ -320,12 +320,11 @@ void TestExtractorCommand() {
   config.sevenZipExe = "C:/Tools/7z.exe";
   config.archiveFirstPart = "D:/Downloads/modpack.7z.001";
   config.installFolder = "D:/Sky";
-  config.useSameDiskTemp = true;
   const auto command = SevenZipExtractor::BuildCommand(config);
   Expect(command.find(" -o\"D:/Sky\"") != std::string::npos, "7-Zip command should target install folder directly");
   Expect(command.find(" -bsp1") != std::string::npos, "7-Zip command should emit progress to stdout");
-  Expect(command.find(" -w\"") != std::string::npos && command.find(".install_temp\"") != std::string::npos,
-         "7-Zip command should use same-disk temp folder");
+  Expect(command.find(" -w") == std::string::npos && command.find(".install_temp") == std::string::npos,
+         "Extraction must not reserve a path in the archive payload namespace");
 }
 
 void TestUnicodeManifestPathSafety() {

@@ -64,6 +64,4 @@ private:
   size_t maxRecommendedInstallPathLength_;
 };
 
-std::filesystem::path SameDiskTempPath(const std::filesystem::path& installFolder);
-
 }  // namespace modlist

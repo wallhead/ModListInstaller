@@ -45,7 +45,7 @@ InstallerApp/
 8. For a legacy manifest or unavailable SDK component, verify the complete manifest first and extract the first archive volume with the command-line fallback:
 
 ```bat
-7z.exe x "D:\Downloads\modpack.7z.001" -o"D:\Sky" -y -w"D:\Sky\.install_temp"
+7z.exe x "D:\Downloads\modpack.7z.001" -o"D:\Sky" -y -bsp1
 ```
 
 9. Show success or a precise error.
@@ -59,6 +59,7 @@ InstallerApp/
 - Verification never trusts torrent completion alone.
 - The SDK decoder never receives a block before its manifest SHA256 passes.
 - The legacy command-line extractor never runs before the separate manifest verification pass succeeds.
+- Neither extraction backend reserves an on-disk work path inside the archive payload.
 
 ## Libtorrent
 

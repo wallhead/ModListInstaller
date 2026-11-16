@@ -14,7 +14,7 @@
 
 #ifndef FOLDER_CLEANUP_LEGACY_REPRO
 namespace native_barriers {
-std::function<void(HANDLE, const BY_HANDLE_FILE_INFORMATION&)> afterInspect;
+std::function<void(HANDLE, BY_HANDLE_FILE_INFORMATION&)> afterInspect;
 std::function<void(const std::wstring&)> beforeOpen;
 std::function<void()> afterFlush;
 std::function<void(HANDLE)> beforeEnumerate;
@@ -274,11 +274,82 @@ void TestIncompleteSessionPreservesPayload() {
   const auto folder = f.Folder("Unpacking");
   auto lease = modlist::BeginOwnedStaging(folder, f.root / "package", "package-v1");
   Expect(lease.ok(), "incomplete session setup failed");
-  const auto payload = f.File(folder);
+  const auto payload = f.File(f.Folder("Unpacking/nested"));
   Expect(!lease.value()->Complete().ok(), "nonempty staging completion accepted");
   lease.value().reset();
   Expect(fs::exists(payload) && fs::exists(modlist::StagingOwnerPath(folder)),
       "incomplete staging lost payload or recovery ownership");
+}
+void TestIncompleteSessionRejectsLinkedRemainder() {
+  Fixture f;
+  const auto folder = f.Folder("Unpacking");
+  auto lease = modlist::BeginOwnedStaging(folder, f.root / "package", "package-v1");
+  Expect(lease.ok(), "linked staging fixture setup failed");
+  const auto outside = f.Folder("outside");
+  const auto nested = f.Folder("Unpacking/nested");
+  f.Junction(nested / "linked", outside);
+  Expect(!lease.value()->Complete().ok(), "a linked directory was treated as an empty staging remainder");
+  lease.value().reset();
+  Expect(fs::is_directory(nested / "linked") && fs::is_empty(outside) &&
+      fs::exists(modlist::StagingOwnerPath(folder)), "refusing a linked remainder changed the owned tree");
+}
+bool IsOwnershipDirectory(HANDLE handle) {
+  wchar_t name[1024]{};
+  const DWORD length = GetFinalPathNameByHandleW(handle, name, 1024, VOLUME_NAME_DOS);
+  return length > 0 && length < 1024 && fs::path(name).filename() == L"staging-owner";
+}
+void TestRemainderChangesAfterScan() {
+  Fixture f;
+  const auto folder = f.Folder("Unpacking");
+  auto lease = modlist::BeginOwnedStaging(folder, f.root / "package", "package-v1");
+  Expect(lease.ok(), "stage remainder race setup failed");
+  const auto nested = f.Folder("Unpacking/nested");
+  const auto lateFile = nested / "late.txt";
+  native_barriers::Reset reset;
+  native_barriers::beforeEnumerate = [&](HANDLE handle) {
+    if (IsOwnershipDirectory(handle) && !fs::exists(lateFile)) {
+      f.File(nested, "late.txt");
+    }
+  };
+  const auto completed = lease.value()->Complete();
+  if (!fs::is_regular_file(lateFile)) throw std::runtime_error("the late staging file was not added: " + completed.error());
+  Expect(!completed.ok(), "staging changed after inspection but reported success");
+  lease.value().reset();
+  Expect(fs::exists(modlist::StagingOwnerPath(folder)), "staging race lost the ownership record");
+}
+void TestStagingAncestorRecheckedAfterOwnership() {
+  Fixture f;
+  const auto folder = f.Folder("parent/Unpacking");
+  const auto parent = folder.parent_path();
+  auto lease = modlist::BeginOwnedStaging(folder, f.root / "package", "package-v1");
+  Expect(lease.ok(), "staging ancestor setup failed");
+  f.Folder("parent/Unpacking/nested");
+
+  const HANDLE parentHandle = CreateFileW(parent.c_str(), FILE_READ_ATTRIBUTES,
+      FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+      FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+  BY_HANDLE_FILE_INFORMATION parentInfo{};
+  const bool identified = parentHandle != INVALID_HANDLE_VALUE && GetFileInformationByHandle(parentHandle, &parentInfo);
+  if (parentHandle != INVALID_HANDLE_VALUE) CloseHandle(parentHandle);
+  Expect(identified, "could not identify the staging parent");
+
+  native_barriers::Reset reset;
+  bool checkedOwnership = false;
+  native_barriers::beforeEnumerate = [&](HANDLE handle) {
+    checkedOwnership = checkedOwnership || IsOwnershipDirectory(handle);
+  };
+  // Model a changed ancestor attribute at the query boundary without redirecting any path.
+  native_barriers::afterInspect = [&](HANDLE, BY_HANDLE_FILE_INFORMATION& info) {
+    if (checkedOwnership && info.dwVolumeSerialNumber == parentInfo.dwVolumeSerialNumber &&
+        info.nFileIndexHigh == parentInfo.nFileIndexHigh && info.nFileIndexLow == parentInfo.nFileIndexLow) {
+      info.dwFileAttributes |= FILE_ATTRIBUTE_REPARSE_POINT;
+    }
+  };
+  const auto completed = lease.value()->Complete();
+  Expect(checkedOwnership, "staging completion did not check ownership");
+  Expect(!completed.ok(), "staging did not recheck a changed ancestor after ownership validation");
+  lease.value().reset();
+  Expect(fs::exists(modlist::StagingOwnerPath(folder)), "ancestor refusal lost ownership");
 }
 void TestLinkedAncestor() {
   Fixture f;
@@ -735,6 +806,9 @@ int wmain(int argc, wchar_t** argv) {
     run("foreign sidecar preservation", TestForeignSidecar);
     run("stale sidecar rejects replaced root", TestOwnedRootReplacement);
     run("incomplete session retains payload and ownership", TestIncompleteSessionPreservesPayload);
+    run("linked staging remainder is not a successful cleanup warning", TestIncompleteSessionRejectsLinkedRemainder);
+    run("staging change after scan refuses completion", TestRemainderChangesAfterScan);
+    run("staging ancestor rechecked after ownership validation", TestStagingAncestorRecheckedAfterOwnership);
     run("linked ancestor sentinel", TestLinkedAncestor);
     run("identity replacement sentinel", TestChangedIdentity);
     run("nested junction all-or-nothing preflight", TestNestedJunction);

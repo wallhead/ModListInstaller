@@ -1,4 +1,19 @@
+#define NOMINMAX
+#include <windows.h>
+#include <functional>
+
+namespace {
+std::function<void(HANDLE)> g_beforeProcessStatus;
+BOOL ObserveProcessIoCounters(HANDLE process, PIO_COUNTERS counters) {
+  if (g_beforeProcessStatus) g_beforeProcessStatus(process);
+  return GetProcessIoCounters(process, counters);
+}
+}  // namespace
+
+// Inject at the first production status update without adding a runtime hook to the packer.
+#define GetProcessIoCounters ObserveProcessIoCounters
 #include "../src/main.cpp"
+#undef GetProcessIoCounters
 
 #include <cwchar>
 #include <functional>
@@ -211,6 +226,285 @@ void DrainMessages() {
   while (PeekMessageW(&message, g_testWindow, 0, 0, PM_REMOVE)) {
     DispatchMessageW(&message);
   }
+}
+
+void NativeProgressRecords() {
+  SevenZipProgress progress;
+  int percent = -1;
+  auto feed = [&](std::string_view text) {
+    progress.Consume(text, percent);
+  };
+  feed("Scanning the drive for archives:\r\n  0");
+  feed("%\r    \r 3");
+  Require(progress.Current(percent) == 0, "Incomplete prefix changed current progress");
+  feed("7% 12 + a-name.esp");
+  Require(progress.Current(percent) == 37 && percent == 0, "Native current frame was not available before erase");
+  feed("\r                    \r");
+  Require(percent == 37, "Split Windows progress frame or its filename suffix was lost");
+  feed(" 98%\b\b\b\b    \b\b\b\b10");
+  feed("0%\b\b\b\b    \b\b\b\b");
+  Require(percent == 100, "Backspace-cleared progress frames were lost");
+}
+
+void NumericNoiseIsNotProgress() {
+  SevenZipProgress progress;
+  int percent = 37;
+  auto feed = [&](std::string_view text) {
+    progress.Consume(text, percent);
+  };
+  feed("+ mods/42%.esp\r\nwarning: 99% free\r\n");
+  const bool ignoredSmallNumbers = percent == 37;
+  feed(std::string(9000, '9'));
+  feed("%-a-mod.esp\r\n");
+  feed(" 85% " + std::string(9000, 'z') + "\r    \r");
+  feed(" 99% free\r");
+  feed("\n 101%\r     \r 1x%\r     \r");
+  Require(ignoredSmallNumbers && percent == 37, "Non-progress numeric text replaced the progress value");
+  feed(" 42%");
+  Require(progress.Current(percent) == 37, "A bare prefix in ordinary output became live progress");
+  feed(".esp\r\n 37%\r    \r 99% free");
+  Require(progress.Current(percent) == 37, "A verbose diagnostic after erase became live progress");
+}
+
+int EmitProgressProbe(bool stall) {
+  auto write = [](std::string_view bytes) {
+    DWORD written = 0;
+    return ::WriteFile(GetStdHandle(STD_OUTPUT_HANDLE), bytes.data(), static_cast<DWORD>(bytes.size()),
+                     &written, nullptr) && written == bytes.size();
+  };
+  constexpr std::string_view frame = " 37% 12 + mods/99%.esp";
+  if (!write("  0%\r    \r") || !write(frame.substr(0, 2))) return 1;
+  if (stall) Sleep(350);
+  if (!write(frame.substr(2))) return 1;
+  if (stall) Sleep(2700);
+  return write("\r" + std::string(frame.size(), ' ') + "\r 99%") ? 0 : 1;
+}
+
+void ProcessProgressProbe(bool stall) {
+  wchar_t exe[MAX_PATH]{};
+  const auto length = GetModuleFileNameW(nullptr, exe, MAX_PATH);
+  Require(length != 0 && length < MAX_PATH, "Unable to locate progress probe");
+  // The heartbeat callback runs before that heartbeat's status is queued. Record
+  // queued progress while the child is alive so final-drain updates cannot pass.
+  bool showedWhileRunning = false;
+  struct ResetObserver { ~ResetObserver() { g_beforeProcessStatus = {}; } } reset;
+  if (stall) {
+    g_beforeProcessStatus = [&](HANDLE child) {
+      DrainMessages();
+      showedWhileRunning |= g_lastProgress == 37 && WaitForSingleObject(child, 0) == WAIT_TIMEOUT;
+    };
+  }
+  Require(RunProcess(g_testWindow, Quote(exe) + (stall ? L" --progress-stall" : L" --progress-drain"),
+                     L"Progress probe", 0) == 0, "Progress probe failed");
+  DrainMessages();
+  if (stall) {
+    Require(showedWhileRunning, "Heartbeat missed a split progress frame before it was erased");
+  } else {
+    Require(g_lastProgress == 37, "Exit drain lost confirmed progress or reported the unfinished 99% frame");
+  }
+}
+
+struct InjectedStatusFailure : std::exception {};
+
+int HoldWorkspaceFile(const wchar_t* path, const wchar_t* readyEvent) {
+  HANDLE ready = OpenEventW(EVENT_MODIFY_STATE, FALSE, readyEvent);
+  if (!ready) return 1;
+  HANDLE file = CreateFileW(path, GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (file == INVALID_HANDLE_VALUE || !SetEvent(ready)) return 2;
+  // The parent terminates this controlled child; the timeout is a second containment measure.
+  Sleep(15000);
+  CloseHandle(file);
+  CloseHandle(ready);
+  return 0;
+}
+
+void ProcessStatusExceptionEndsChildBeforeWorkspaceCleanup(int memoryLimitPercent) {
+  auto config = Config("child-lifetime-" + std::to_string(memoryLimitPercent));
+  const auto package = PackageFolder(config);
+  WriteFile(package / "My Pack.7z.001", "previous archive");
+  WriteFile(package / "manifest.json", "previous manifest");
+  auto handleCount = [] {
+    DWORD count = 0;
+    Require(GetProcessHandleCount(GetCurrentProcess(), &count) != FALSE, "Unable to count process handles");
+    return count;
+  };
+  bool propagated = false;
+  bool endedBeforeCleanup = false;
+  DWORD before = 0;
+  DWORD after = 0;
+  std::filesystem::path root;
+  {
+    PackageWorkspace workspace(g_testWindow, config.releaseFolder);
+    root = workspace.Root();
+    const auto held = root / "child-lock";
+    const auto eventName = L"Local\\PackerTest-" + std::to_wstring(GetCurrentProcessId()) + L"-" +
+                           std::to_wstring(GetTickCount64());
+    struct EmergencyGuard {
+      HANDLE ready{nullptr};
+      HANDLE child{nullptr};
+      ~EmergencyGuard() {
+        g_beforeProcessStatus = {};
+        if (child) {
+          if (WaitForSingleObject(child, 0) == WAIT_TIMEOUT) TerminateProcess(child, 253);
+          WaitForSingleObject(child, INFINITE);
+          CloseHandle(child);
+        }
+        if (ready) CloseHandle(ready);
+      }
+    } guard;
+    guard.ready = CreateEventW(nullptr, TRUE, FALSE, eventName.c_str());
+    Require(guard.ready != nullptr && GetLastError() != ERROR_ALREADY_EXISTS, "Unable to reserve test readiness event");
+    wchar_t exe[MAX_PATH]{};
+    const auto exeLength = GetModuleFileNameW(nullptr, exe, MAX_PATH);
+    Require(exeLength != 0 && exeLength < MAX_PATH, "Unable to locate child fixture executable");
+    // Exclude any one-time Win32 process creation initialization from the handle baseline.
+    Require(RunProcess(g_testWindow, Quote(exe) + L" --process-test-exit", L"Warm process APIs", 0,
+                       memoryLimitPercent) == 0,
+            "Unable to warm up Win32 process creation");
+    g_beforeProcessStatus = [&](HANDLE process) {
+      Require(DuplicateHandle(GetCurrentProcess(), process, GetCurrentProcess(), &guard.child, 0, FALSE,
+                              DUPLICATE_SAME_ACCESS) != FALSE, "Unable to own an emergency child handle");
+      Require(WaitForSingleObject(guard.ready, 5000) == WAIT_OBJECT_0, "Controlled child never locked its file");
+      Require(WaitForSingleObject(guard.child, 0) == WAIT_TIMEOUT, "Controlled child was not running at injection");
+      throw InjectedStatusFailure{};
+    };
+    before = handleCount();
+    try {
+      RunProcess(g_testWindow, Quote(exe) + L" --hold-workspace-file " + Quote(held) + L" " + Quote(eventName),
+                 L"Controlled process", 0, memoryLimitPercent);
+    } catch (const InjectedStatusFailure&) {
+      propagated = true;
+    }
+    endedBeforeCleanup = guard.child && WaitForSingleObject(guard.child, 0) == WAIT_OBJECT_0;
+    after = handleCount();
+  }
+  Require(!std::filesystem::exists(root), "Workspace teardown left the controlled child's files behind");
+  Require(ReadFile(package / "My Pack.7z.001") == "previous archive" &&
+              ReadFile(package / "manifest.json") == "previous manifest", "Exception changed the live package");
+  Worker(g_testWindow, config);
+  DrainMessages();
+  Require(g_lastStatus == L"Package ready", "A real build after the injected exception did not succeed");
+  Require(propagated && endedBeforeCleanup && after == before + 1,
+          std::string(endedBeforeCleanup ? "Child ended before unwinding" : "Emergency guard had to reap the child") +
+          "; handle count before " + std::to_string(before) + ", after " + std::to_string(after) +
+          " (expected one extra emergency duplicate)");
+}
+
+void GeneratedPathBudget(bool archiveFirst, size_t parentLength, bool supported,
+                         const std::wstring& volume = L"8k", const std::wstring& parameters = L"",
+                         const std::string& variant = "", bool expectedSplit = true) {
+  auto config = Config((archiveFirst ? "path-build" : "path-manifest") + variant);
+  config.archiveFirst = archiveFirst;
+  config.volumeSize = volume;
+  config.parameters = parameters;
+  const auto stem = config.sourceFolder.parent_path();
+  Require(stem.native().size() + 1 < parentLength, "Fixture root too long for fixed path budget test");
+  config.releaseFolder = stem / std::wstring(parentLength - stem.native().size() - 1, supported ? L'a' : L'b');
+  const auto package = PackageFolder(config);
+  const std::string archiveName = archiveFirst && !expectedSplit ? "My Pack.7z" : "My Pack.7z.001";
+  const auto archive = package / archiveName;
+  const auto manifest = package / "manifest.json";
+  WriteFile(archive, "previous archive");
+  WriteFile(manifest, "previous manifest");
+  Require(config.releaseFolder.native().size() == parentLength && manifest.native().size() < MAX_PATH,
+          "Path fixture did not retain a conventional live package");
+  Worker(g_testWindow, config);
+  DrainMessages();
+  if (supported) {
+    Require(g_lastStatus == L"Package ready" &&
+                ReadFile(manifest).find("\"path\": \"" + archiveName + "\"") != std::string::npos,
+            "Worker did not publish the long-parent package");
+    Require((ReadFile(archive) != "previous archive") == archiveFirst, "Wrong archive disposition at long parent");
+  } else {
+    Require(g_lastStatus == L"Package build failed" && ReadFile(manifest) == "previous manifest" &&
+                ReadFile(archive) == "previous archive", "Unsupported paths did not preserve the previous package");
+    Require(std::any_of(g_messages.begin(), g_messages.end(), [](const auto& text) {
+              return text.find(L"path is too long") != std::wstring::npos;
+            }), "Missing early path-budget diagnostic");
+    if (parentLength == 190 && expectedSplit) {
+      Require(std::find(g_messages.begin(), g_messages.end(), L"Split volumes require more room in the package path.") !=
+                  g_messages.end(), "Missing split path-budget diagnostic");
+    }
+    Require(std::none_of(g_messages.begin(), g_messages.end(), [](const auto& text) {
+              return text == L"Creating archive..." || text.starts_with(L"Manifest hashing workers:");
+            }), "Path rejection happened after compression or hashing started");
+  }
+  Require(EntryNames(config.releaseFolder) == std::set<std::wstring>{L"My Pack"},
+          "Worker left a staging workspace behind");
+}
+
+void RedirectedLivePackageIsRejected() {
+  auto config = Config("path-junction");
+  const auto link = PackageFolder(config);
+  const auto target = config.releaseFolder.parent_path() / "owned-sentinel-directory";
+  WriteFile(target / "sentinel.txt", "owned sentinel bytes");
+  std::filesystem::create_directories(link);
+  struct ScopedJunction {
+    const std::filesystem::path& link;
+    ~ScopedJunction() { RemoveDirectoryW(link.c_str()); }
+  } cleanup{link};
+  const auto substitute = L"\\??\\" + target.wstring();
+  const auto display = target.wstring();
+  struct MountPoint {
+    DWORD tag;
+    WORD size, reserved, substituteOffset, substituteSize, printOffset, printSize;
+    wchar_t names[2 * MAX_PATH + 8];
+  } data{};
+  Require(substitute.size() < MAX_PATH && display.size() < MAX_PATH, "Junction fixture name is too long");
+  data.tag = IO_REPARSE_TAG_MOUNT_POINT;
+  data.substituteSize = static_cast<WORD>(substitute.size() * sizeof(wchar_t));
+  data.printOffset = data.substituteSize + sizeof(wchar_t);
+  data.printSize = static_cast<WORD>(display.size() * sizeof(wchar_t));
+  data.size = 8 + data.printOffset + data.printSize + sizeof(wchar_t);
+  std::copy(substitute.begin(), substitute.end(), data.names);
+  std::copy(display.begin(), display.end(), data.names + substitute.size() + 1);
+  HANDLE junction = CreateFileW(link.c_str(), GENERIC_WRITE, 0, nullptr, OPEN_EXISTING,
+                                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+  Require(junction != INVALID_HANDLE_VALUE, "Unable to open owned junction fixture");
+  DWORD returned = 0;
+  const BOOL set = DeviceIoControl(junction, FSCTL_SET_REPARSE_POINT, &data, data.size + 8,
+                                   nullptr, 0, &returned, nullptr);
+  CloseHandle(junction);
+  Require(set && (GetFileAttributesW(link.c_str()) & FILE_ATTRIBUTE_REPARSE_POINT) != 0, "Unable to create owned junction");
+  for (const bool archiveFirst : {true, false}) {
+    config.archiveFirst = archiveFirst;
+    // The baseline reaches only this read-only check, never the Worker.
+    Require(!CheckWorkerPackagePaths(g_testWindow, config), "Preflight accepted a redirected live package child");
+    DrainMessages();
+    g_messages.clear();
+    Worker(g_testWindow, config);
+    DrainMessages();
+    Require(g_lastStatus == L"Package build failed" &&
+                EntryNames(config.releaseFolder) == std::set<std::wstring>{L"My Pack"} &&
+                EntryNames(target) == std::set<std::wstring>{L"sentinel.txt"} &&
+                ReadFile(target / "sentinel.txt") == "owned sentinel bytes",
+            "A redirected live package changed the target or started staging");
+    Require(std::any_of(g_messages.begin(), g_messages.end(), [](const auto& line) {
+              return line.starts_with(L"Live package folder is redirected");
+            }) && std::none_of(g_messages.begin(), g_messages.end(), [](const auto& line) {
+              return line == L"Creating archive..." || line.starts_with(L"Manifest hashing workers:");
+            }), "Worker did not reject the redirected live child during preflight");
+  }
+}
+
+void ExistingArchiveBackupPathIsBudgeted() {
+  auto config = Config("path-backup");
+  const auto stem = config.sourceFolder.parent_path();
+  Require(stem.native().size() < 180, "Fixture root too long for backup path test");
+  config.releaseFolder = stem / std::wstring(180 - stem.native().size(), L'a');
+  const auto archive = PackageFolder(config) / (L"My Pack.7z." + std::wstring(55, L'1'));
+  Require(archive.native().size() < MAX_PATH, "Previous archive fixture exceeded MAX_PATH");
+  WriteFile(archive, "previous long volume");
+  Worker(g_testWindow, config);
+  DrainMessages();
+  Require(g_lastStatus == L"Package build failed" && ReadFile(archive) == "previous long volume" &&
+              EntryNames(config.releaseFolder) == std::set<std::wstring>{L"My Pack"},
+          "Unsupported backup path did not leave previous package untouched");
+  Require(std::any_of(g_messages.begin(), g_messages.end(), [](const auto& text) {
+            return text.find(L"path is too long") != std::wstring::npos && text.find(L"\\previous\\") != std::wstring::npos;
+          }) &&
+              std::find(g_messages.begin(), g_messages.end(), L"Creating archive...") == g_messages.end(),
+          "Existing volume's backup path was not checked before work");
 }
 
 void FixtureCleanupIsOwnedAndRunScoped() {
@@ -719,11 +1013,11 @@ void WorkerManifestOnlyPreservesPairAndArchives(const std::string& scenario) {
     output.close();
     for (const auto& entry : std::filesystem::directory_iterator(config.releaseFolder)) {
       if (!entry.path().filename().wstring().starts_with(L".packer-")) continue;
-      const auto candidate = entry.path() / "replacement" / config.archiveName;
+      const auto candidate = entry.path() / kStagedDirectory / config.archiveName;
       stagedPairOnly = true;
       for (const auto& file : std::filesystem::directory_iterator(candidate)) {
         const auto name = file.path().filename().wstring();
-        if (name != L"modlist-installer.exe" && !name.starts_with(L"manifest.json.packer-")) stagedPairOnly = false;
+        if (name != L"modlist-installer.exe" && !name.starts_with(L".packer-")) stagedPairOnly = false;
       }
     }
     if (scenario == "close-failure" || scenario == "cancel-after-close") {
@@ -1164,6 +1458,25 @@ void RealSingleZipCompression() {
           "ZIP manifest must use root-relative archive path");
 }
 
+void RealSevenZipVerboseNumericFilenames() {
+  auto config = Config("verbose-numeric");
+  config.parameters = L"-bb1";
+  const std::string digits(48, '9');
+  for (unsigned i = 0; i < 320; ++i) {
+    WriteFile(config.sourceFolder / (std::to_string(i) + "-" + digits + "%.esp"), "payload");
+  }
+  Worker(g_testWindow, config);
+  DrainMessages();
+  Require(g_lastStatus == L"Package ready", "Verbose compression failed on numeric filenames");
+  Require(ResolveSevenZip(g_testWindow, config), "Unable to locate 7-Zip for native progress capture");
+  const auto log = CaptureProcess(BuildSevenZipTestCommand(config) + L" -bb1",
+                                  config.sourceFolder.parent_path() / "native-progress.txt");
+  SevenZipProgress parser;
+  int progress = -1;
+  parser.Consume(log, progress);
+  Require(progress >= 0, "No progress was recognized in native Windows 7-Zip output");
+}
+
 void RealCyrillicPackingAndManifestRoundTrip() {
   auto config = Config("cyrillic-compression");
   const auto caseRoot = config.sourceFolder.parent_path();
@@ -1248,6 +1561,12 @@ Write-Output ('JSON roundtrip and independent full/chunk SHA-256 verified: ' + $
 }  // namespace
 
 int wmain(int argc, wchar_t* argv[]) {
+  if (argc == 2 && std::wstring_view(argv[1]) == L"--progress-stall") return EmitProgressProbe(true);
+  if (argc == 2 && std::wstring_view(argv[1]) == L"--progress-drain") return EmitProgressProbe(false);
+  if (argc == 2 && std::wstring_view(argv[1]) == L"--process-test-exit") return 0;
+  if (argc == 4 && std::wstring_view(argv[1]) == L"--hold-workspace-file") {
+    return HoldWorkspaceFile(argv[2], argv[3]);
+  }
   std::unique_ptr<OwnedFixtureTree> fixtureTree;
   try {
     bool keepFixtures = false;
@@ -1277,6 +1596,28 @@ int wmain(int argc, wchar_t* argv[]) {
     Require(g_testWindow != nullptr, "Unable to create test message window");
     std::cout << "Fixture root: " << Narrow(g_fixtureRoot.wstring()) << std::endl;
     const std::vector<std::pair<const char*, std::function<void()>>> tests{
+        {"native Windows and backspace progress records", NativeProgressRecords},
+        {"numeric filename and diagnostic text is not progress", NumericNoiseIsNotProgress},
+        {"heartbeat shows a split-read progress frame before erase", [] { ProcessProgressProbe(true); }},
+        {"exit drain reports only confirmed progress", [] { ProcessProgressProbe(false); }},
+        {"callback exception ends and waits for child before workspace teardown (job enabled)",
+         [] { ProcessStatusExceptionEndsChildBeforeWorkspaceCleanup(80); }},
+        {"callback exception ends and waits for child before workspace teardown (job disabled)",
+         [] { ProcessStatusExceptionEndsChildBeforeWorkspaceCleanup(0); }},
+        {"Build Package publishes with a 181-character release parent", [] { GeneratedPathBudget(true, 181, true); }},
+        {"Manifest Only publishes with a 181-character release parent", [] { GeneratedPathBudget(false, 181, true); }},
+        {"Build Package rejects unsupported paths before compression", [] { GeneratedPathBudget(true, 225, false); }},
+        {"Manifest Only rejects unsupported paths before hashing", [] { GeneratedPathBudget(false, 225, false); }},
+        {"existing archive backup paths are budgeted", ExistingArchiveBackupPathIsBudgeted},
+        {"190-character parent accepts explicit unsplit and quoted nonswitch text",
+         [] { GeneratedPathBudget(true, 190, true, L"none", L"-x!\"ignore -v8k\"", "-190-unsplit", false); }},
+        {"190-character parent rejects default split before compression",
+         [] { GeneratedPathBudget(true, 190, false, L"4092M - FAT", L"", "-190-default"); }},
+        {"190-character parent rejects quoted custom split before compression",
+         [] { GeneratedPathBudget(true, 190, false, L"none", L"\"-V8k\"", "-190-custom"); }},
+        {"custom split request selects its first part for the real integrity test",
+         [] { GeneratedPathBudget(true, 181, true, L"none", L"\"-V8k\"", "-181-custom"); }},
+        {"redirected live package child is rejected in both modes", RedirectedLivePackageIsRejected},
         {"fixture cleanup owns only this run and supports retention", FixtureCleanupIsOwnedAndRunScoped},
         {"flat preparation", FlatPreparation},
         {"portable installer preparation and refresh", PortableInstallerPreparation},
@@ -1319,6 +1660,7 @@ int wmain(int argc, wchar_t* argv[]) {
         {"packer log retains long output and compression defaults", PackerLogRetainsLongOutputAndDefaults},
         {"real compression, integrity test, extraction and manifest", RealCompressionTestAndManifest},
         {"real unsplit ZIP compression and manifest", RealSingleZipCompression},
+        {"real verbose 7-Zip and numeric-percent filenames", RealSevenZipVerboseNumericFilenames},
         {"real Cyrillic packing and parsed manifest roundtrip", RealCyrillicPackingAndManifestRoundTrip}};
     int failures = 0;
     for (const auto& [name, test] : tests) {

@@ -302,8 +302,4 @@ PathValidationResult PathValidator::ValidateBaseFolder(const std::filesystem::pa
   return result;
 }
 
-std::filesystem::path SameDiskTempPath(const std::filesystem::path& installFolder) {
-  return installFolder / ".install_temp";
-}
-
 }  // namespace modlist

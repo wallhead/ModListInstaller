@@ -86,8 +86,11 @@ struct PinnedFolder {
   std::vector<Handle> chain;
 };
 
+enum class RelativeOpenMode { Synchronous, AsynchronousWatch };
+
 Result<Handle> OpenRelative(HANDLE parent, const std::wstring& name, ACCESS_MASK access,
-    bool directory, ULONG disposition = FILE_OPEN, ULONG attributes = 0) {
+    bool directory, ULONG disposition = FILE_OPEN, ULONG attributes = 0,
+    RelativeOpenMode mode = RelativeOpenMode::Synchronous) {
   if (name.empty() || name == L"." || name == L".." || name.size() > 32767 ||
       name.find_first_of(L"\\/:") != std::wstring::npos || name.find(L'\0') != std::wstring::npos) {
     return Result<Handle>::Error("Native cleanup opens require exactly one child name");
@@ -103,10 +106,12 @@ Result<Handle> OpenRelative(HANDLE parent, const std::wstring& name, ACCESS_MASK
   InitializeObjectAttributes(&object, &child, OBJ_CASE_INSENSITIVE | OBJ_DONT_REPARSE, parent, nullptr);
   IO_STATUS_BLOCK statusBlock{};
   HANDLE raw = INVALID_HANDLE_VALUE;
+  const bool watch = mode == RelativeOpenMode::AsynchronousWatch;
   // RootDirectory is the pinned object, never a path that can resolve through a changed ancestor.
   // Attribute-only writes bypass sharing: reparse checks alone cannot anchor traversal.
   const NTSTATUS status = create(&raw, access | SYNCHRONIZE, &object, &statusBlock, nullptr, attributes,
-      FILE_SHARE_READ, disposition, FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT |
+      FILE_SHARE_READ | (watch ? FILE_SHARE_DELETE : 0), disposition,
+      FILE_OPEN_REPARSE_POINT | (watch ? 0 : FILE_SYNCHRONOUS_IO_NONALERT) |
       (directory ? FILE_DIRECTORY_FILE : FILE_NON_DIRECTORY_FILE), nullptr, 0);
   if (status < 0) return Result<Handle>::Error("Open pinned child without following reparses (NTSTATUS " + std::to_string(status) + ")");
   return Result<Handle>::Ok(Handle(raw));
@@ -183,6 +188,58 @@ Result<bool> DirectoryIsEmpty(HANDLE directory) {
   if (!read.ok()) return Result<bool>::Error(read.error());
   return Result<bool>::Ok(empty);
 }
+
+class StagingChangeWatch {
+ public:
+  ~StagingChangeWatch() { if (armed_) Stop(); }
+
+  Result<void> Start(const PinnedFolder& pinned) {
+    // An independent asynchronous handle to the same pinned directory. It must
+    // share delete access with the original session handle, which remains pinned.
+    const auto parent = pinned.chain[pinned.chain.size() - 2].value;
+    auto opened = OpenRelative(parent, pinned.folder.filename().native(), FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES,
+        true, FILE_OPEN, 0, RelativeOpenMode::AsynchronousWatch);
+    if (!opened.ok()) return Result<void>::Error(opened.error());
+    directory_ = std::move(opened.value());
+    const auto identity = Identify(directory_.value);
+    if (!identity.ok()) return Result<void>::Error(identity.error());
+    if (!(identity.value() == pinned.identity)) return Result<void>::Error("Staging watch identity changed");
+
+    const HANDLE event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!event) return Result<void>::Error(WinError("Create staging change event"));
+    event_ = Handle(event);
+    change_.hEvent = event;
+    armed_ = ReadDirectoryChangesW(directory_.value, buffer_, sizeof(buffer_), TRUE,
+        FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_DIR_NAME |
+        FILE_NOTIFY_CHANGE_ATTRIBUTES | FILE_NOTIFY_CHANGE_SECURITY,
+        nullptr, &change_, nullptr) != FALSE;
+    if (!armed_) return Result<void>::Error(WinError("Monitor staging contents"));
+    return Result<void>::Ok();
+  }
+
+  Result<void> CheckUnchanged() {
+    if (Stop()) return Result<void>::Ok();
+    return Result<void>::Error("Staging changed or could not be verified; ownership retained for recovery");
+  }
+
+ private:
+  bool Stop() noexcept {
+    // Reap the request before its event and buffer go out of scope. A normal
+    // completion, overflow or other error must not be mistaken for cancellation.
+    const BOOL canceled = CancelIoEx(directory_.value, &change_);
+    DWORD bytes = 0;
+    const BOOL completed = GetOverlappedResult(directory_.value, &change_, &bytes, TRUE);
+    const DWORD completionError = completed ? ERROR_SUCCESS : GetLastError();
+    armed_ = false;
+    directory_.Close();
+    return canceled && completionError == ERROR_OPERATION_ABORTED;
+  }
+
+  Handle directory_, event_;
+  OVERLAPPED change_{};
+  DWORD buffer_[1024]{};
+  bool armed_{false};
+};
 
 Result<PinnedFolder> PinFolder(const fs::path& folder, bool deleteRoot = false,
     bool createMissing = false, bool* createdLeaf = nullptr) {
@@ -326,15 +383,21 @@ Result<void> DeleteOpened(Handle& handle) {
   handle.Close();
   return Result<void>::Ok();
 }
+enum class TreeInspection { ForDeletion, EmptyDirectoriesOnly };
+
 Result<void> CollectTree(HANDLE folder, std::vector<Handle>& entries,
-    const FolderCleanupLimits& limits, size_t depth = 0) {
+    const FolderCleanupLimits& limits, TreeInspection inspection, size_t depth = 0) {
   if (depth > limits.maxDepth) return Result<void>::Error("Cleanup tree exceeds safe depth limit");
   return VisitDirectory(folder, [&](const DirectoryEntry& entry) {
     if (entries.size() >= limits.maxEntries) return Result<bool>::Error("Cleanup tree exceeds safe entry limit");
     if (entry.attributes & FILE_ATTRIBUTE_REPARSE_POINT) return Result<bool>::Error("Nested reparse point/junction found; cleanup refused");
     const bool directory = (entry.attributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
-    auto opened = OpenRelative(folder, entry.name, FILE_READ_ATTRIBUTES | DELETE |
-        (directory ? FILE_LIST_DIRECTORY : 0), directory);
+    if (inspection == TreeInspection::EmptyDirectoriesOnly && !directory) {
+      return Result<bool>::Error("Staging still contains files; ownership retained for recovery");
+    }
+    const auto access = FILE_READ_ATTRIBUTES | (directory ? FILE_LIST_DIRECTORY : 0) |
+        (inspection == TreeInspection::ForDeletion ? DELETE : 0);
+    auto opened = OpenRelative(folder, entry.name, access, directory);
     if (!opened.ok()) return Result<bool>::Error(opened.error());
     auto handle = std::move(opened.value());
     BY_HANDLE_FILE_INFORMATION info{};
@@ -349,7 +412,7 @@ Result<void> CollectTree(HANDLE folder, std::vector<Handle>& entries,
     const HANDLE child = handle.value;
     entries.push_back(std::move(handle));
     if (directory) {
-      const auto collected = CollectTree(child, entries, limits, depth + 1);
+      const auto collected = CollectTree(child, entries, limits, inspection, depth + 1);
       if (!collected.ok()) return Result<bool>::Error(collected.error());
     }
     return Result<bool>::Ok(true);
@@ -455,7 +518,7 @@ Result<void> ClearFolderContents(const FolderCleanupTicket& ticket, const Folder
   std::vector<Handle> entries;
   const FolderCleanupLimits bounded{std::min(limits.maxEntries, size_t{1000000}),
       std::min(limits.maxDepth, size_t{512})};
-  const auto collected = CollectTree(pinned.value().chain.back().value, entries, bounded);
+  const auto collected = CollectTree(pinned.value().chain.back().value, entries, bounded, TreeInspection::ForDeletion);
   if (!collected.ok()) return collected;
   const auto checked = CheckChain(pinned.value());
   if (!checked.ok()) return checked;
@@ -483,24 +546,50 @@ struct StagingSession::Impl {
 };
 StagingSession::StagingSession(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
 StagingSession::~StagingSession() = default;
-Result<void> StagingSession::Complete() {
-  if (!impl_ || !impl_->ownership.marker) return Result<void>::Error("Staging session is already closed");
-  const auto checked = CheckChain(impl_->pinned);
-  if (!checked.ok()) return checked;
-  const auto empty = DirectoryIsEmpty(impl_->pinned.chain.back().value);
-  if (!empty.ok()) return Result<void>::Error(empty.error());
+Result<StagingCompletion> StagingSession::Complete() {
+  using Outcome = Result<StagingCompletion>;
+  if (!impl_ || !impl_->ownership.marker) return Outcome::Error("Staging session is already closed");
+  auto& root = impl_->pinned.chain.back();
+  const auto empty = DirectoryIsEmpty(root.value);
+  if (!empty.ok()) return Outcome::Error(empty.error());
+
+  StagingChangeWatch watch;
+  std::vector<Handle> retainedDirectories;
   if (!empty.value()) {
-    return Result<void>::Error("Staging still contains payload; ownership retained for recovery");
+    // The move can finish even when empty source directories cannot be deleted.
+    // Inspect pinned objects without requesting delete access or changing ownership.
+    const auto watching = watch.Start(impl_->pinned);
+    if (!watching.ok()) return Outcome::Error(watching.error());
+    const auto collected = CollectTree(root.value, retainedDirectories, {}, TreeInspection::EmptyDirectoriesOnly);
+    if (!collected.ok()) return Outcome::Error(collected.error());
   }
   const auto cacheChain = CheckChain(impl_->ownership.metadata);
-  if (!cacheChain.ok()) return cacheChain;
+  if (!cacheChain.ok()) return Outcome::Error(cacheChain.error());
   const auto metadata = CheckOwnershipDirectory(impl_->ownership.metadata.chain.back().value);
-  if (!metadata.ok()) return metadata;
-  const auto removedRoot = DeleteOpened(impl_->pinned.chain.back());
-  if (!removedRoot.ok()) return removedRoot;
+  if (!metadata.ok()) return Outcome::Error(metadata.error());
+  for (const auto& directory : retainedDirectories) {
+    const auto plain = CheckPlainDirectory(directory.value);
+    if (!plain.ok()) return Outcome::Error(plain.error());
+  }
+  // The subtree watch does not cover its root or ancestors.
+  const auto checked = CheckChain(impl_->pinned);
+  if (!checked.ok()) return Outcome::Error(checked.error());
+  const auto identity = Identify(root.value);
+  if (!identity.ok()) return Outcome::Error(identity.error());
+  if (!(identity.value() == impl_->pinned.identity)) return Outcome::Error("Staging identity changed");
+  if (!empty.value()) {
+    const auto unchanged = watch.CheckUnchanged();
+    if (!unchanged.ok()) return Outcome::Error(unchanged.error());
+  }
+  if (!retainedDirectories.empty()) return Outcome::Ok(StagingCompletion::EmptyDirectoriesRetained);
+
+  const auto removedRoot = DeleteOpened(root);
+  if (!removedRoot.ok()) return Outcome::Error(removedRoot.error());
   const auto removedMarker = DeleteOpened(impl_->ownership.marker);
-  if (!removedMarker.ok()) return removedMarker;
-  return DeleteOpened(impl_->ownership.metadata.chain.back());
+  if (!removedMarker.ok()) return Outcome::Error(removedMarker.error());
+  const auto removedMetadata = DeleteOpened(impl_->ownership.metadata.chain.back());
+  if (!removedMetadata.ok()) return Outcome::Error(removedMetadata.error());
+  return Outcome::Ok(StagingCompletion::Removed);
 }
 fs::path StagingOwnerPath(const fs::path& folder) {
   auto normalized = folder.lexically_normal();

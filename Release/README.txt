@@ -1,4 +1,4 @@
-ModListInstaller v0.3.7
+ModListInstaller v0.3.8
 
 Keep modlist-packer.exe and modlist-installer.exe together. Run the packer to
 create <selected release parent>\<archive name>.
@@ -25,8 +25,9 @@ the installer checks all archive entry paths. If every full destination path
 fits within 240 UTF-16 code units, it extracts directly into the final folder.
 Otherwise, or when archive metadata cannot be inspected, it uses the install
 drive's short Unpacking path and then moves the files into the final folder.
-Successful staged installs remove the empty Unpacking folder. Direct installs
-do not create or clean the unused Unpacking folder.
+Staged installs remove the empty Unpacking folder when possible. If only locked
+empty directories remain, the installer logs a warning and keeps its ownership
+record for later cleanup. Direct installs leave the unused folder untouched.
 The installer refuses to clear staging leftovers it cannot identify as its own.
 Do not choose a final install folder that overlaps the downloaded package itself;
 choose another installation root or move the package elsewhere first.
@@ -38,6 +39,7 @@ that folder and starting installation again.
 The packer builds and verifies replacements before publishing them, so a failed
 build does not remove the previous package. Rebuilding an existing package
 requires enough free space to hold the replacement while the original is intact.
+If the release path is too long, choose a shorter release parent or archive name.
 
 When installation starts, the installer finds the Windows Documents known
 folder and creates these folders if they are missing:
