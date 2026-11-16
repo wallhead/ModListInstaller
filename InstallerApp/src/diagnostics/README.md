@@ -84,6 +84,12 @@ sharing. No data is uploaded automatically.
 Pipeline counters distinguish block/cache waits, hashing, output file creation,
 directory checks, writes, and closes. Timings overlap and must not be summed.
 Read/write counters are process/OS-request bytes, not physical device traffic.
+Extraction callbacks only publish an in-memory progress snapshot. The existing
+sampler logs changed snapshots about once per second and always logs the latest
+available snapshot at stage completion, including failure or cancellation.
+Intermediate callback updates may be coalesced. Stage duration and final process
+totals are frozen before waiting for sampler shutdown and final log delivery;
+slow log draining can delay the report but does not extend the measured stage.
 
 ## Command Line / Developer Tests
 
@@ -107,3 +113,6 @@ two short, existing, disposable parent folders. It checks automatic nested-folde
 creation, non-destructive invalid-path failures, and runs 64 MiB comparisons in
 both orders, checks output metadata without content rereads, rejects wrong-sized copies,
 tests native-child cancellation and report-write failure, and retains its data.
+Diagnostics unit tests also block log delivery behind event barriers while
+publishing progress. Integration tests check final counters/progress, pipeline
+cancellation and stage timing with deliberately delayed final progress delivery.

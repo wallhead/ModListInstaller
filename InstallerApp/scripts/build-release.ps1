@@ -14,6 +14,10 @@ try {
   xmake run installer_ui_tests
   if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+  & "$PSScriptRoot\test-runtime-dependencies.ps1" -Binary @(
+    ".\build\windows\x64\release\modlist-installer-gui.exe",
+    ".\resources\7z.exe", ".\resources\7z.dll")
+
   New-Item -ItemType Directory -Path ".\dist" -Force | Out-Null
   Copy-Item ".\build\windows\x64\release\modlist-installer-gui.exe" ".\dist\modlist-installer.exe" -Force
 

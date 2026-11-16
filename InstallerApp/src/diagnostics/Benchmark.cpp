@@ -1,5 +1,6 @@
 #define NOMINMAX
 #include "diagnostics/Diagnostics.h"
+#include "diagnostics/PipelineProgressSnapshot.h"
 #include "common/PathText.h"
 #include "extractor/PipelinedSevenZipExtractor.h"
 #include "extractor/SevenZipExtractor.h"
@@ -143,8 +144,9 @@ class Stage {
 public:
   std::atomic<uint64_t> bytes{0}, files{0};
   Stage(Run& run, std::string name, uint64_t total, HANDLE process = GetCurrentProcess(),
-        ProgressBasis basis = ProgressBasis::LogicalBytes, PipelineExtractionDiagnostics* pipeline = nullptr)
-      : run_(run), name_(std::move(name)), total_(total), process_(process), basis_(basis), pipeline_(pipeline),
+        ProgressBasis basis = ProgressBasis::LogicalBytes, PipelineExtractionDiagnostics* pipeline = nullptr,
+        PipelineProgressSnapshot* pipelineProgress = nullptr)
+      : run_(run), name_(std::move(name)), total_(total), process_(process), basis_(basis), pipeline_(pipeline), pipelineProgress_(pipelineProgress),
         start_(Clock::now()), last_(start_), cpuStart_(CpuTicks(process)), cpuLast_(cpuStart_), ioStart_(Io(process)), ioLast_(ioStart_) {
     run_.log.Line("START " + name_ + "; planned_bytes=" + std::to_string(total_));
     Progress progress{name_,"Started",0,total_};progress.basis=basis_;run_.Emit(std::move(progress));
@@ -154,19 +156,21 @@ public:
     });
   }
   ~Stage() {if(!recorded_) Finish("failed");}
-  double Seconds() const {return std::chrono::duration<double>(Clock::now()-start_).count();}
   void Finish(const std::string& status = "ok",std::optional<uint64_t> completedBytes={},std::optional<uint64_t> completedFiles={}) {
     if(recorded_)return;
+    // Sink draining (including an in-flight sampler) is not extraction work.
+    const auto finishedAt=Clock::now();
+    const double seconds=std::chrono::duration<double>(finishedAt-start_).count();
+    const auto io=Io(process_);const auto cpu=CpuTicks(process_);
     {std::lock_guard lock(waitMutex_);finished_=true;}stop_.notify_all();if(sampler_.joinable())sampler_.join();
     if(completedBytes)bytes=*completedBytes;if(completedFiles)files=*completedFiles;
-    Sample(true);recorded_=true;
-    const double seconds=Seconds(); const auto io=Io(process_);
+    Sample(true,finishedAt);recorded_=true;
     const uint64_t count=bytes.load();const uint64_t fileCount=files.load();
     const double average=seconds>0?static_cast<double>(count)/MiB/seconds:0;
     run_.stages.emplace_back(J::Object{{"name",J(name_)},{"status",J(status)},{"seconds",J(seconds)},
       {"logical_bytes",Number(count)},{"files",Number(fileCount)},{"average_mib_s",J(average)},
       {"peak_sampled_mib_s",hasSpeedSample_?J(peak_):J()},{"files_per_second",J(seconds>0?fileCount/seconds:0)},
-      {"cpu_seconds",J(CounterDelta(CpuTicks(process_),cpuStart_)/10000000.0)},
+      {"cpu_seconds",J(CounterDelta(cpu,cpuStart_)/10000000.0)},
       {"peak_working_set_mib",J(peakWorking_)},{"peak_private_mib",J(peakPrivate_)},
       {"process_read_bytes",Number(CounterDelta(io.ReadTransferCount,ioStart_.ReadTransferCount))},
       {"process_write_bytes",Number(CounterDelta(io.WriteTransferCount,ioStart_.WriteTransferCount))},
@@ -175,8 +179,8 @@ public:
     run_.log.Line(summary.str());
   }
 private:
-  void Sample(bool final) {
-    const auto now=Clock::now();const double elapsed=std::chrono::duration<double>(now-start_).count();
+  void Sample(bool final,Clock::time_point now=Clock::now()) {
+    const double elapsed=std::chrono::duration<double>(now-start_).count();
     const double interval=std::chrono::duration<double>(now-last_).count();
     const auto io=Io(process_);const auto cpu=CpuTicks(process_);
     PROCESS_MEMORY_COUNTERS_EX memory{};memory.cb=sizeof(memory);GetProcessMemoryInfo(process_,reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&memory),sizeof(memory));
@@ -194,6 +198,7 @@ private:
       run_.log.samples << Stamp() << ',' << name_ << ',' << elapsed << ',' << current << ',' << count << ',' << speed << ',' << cpuPercent << ',' << memory.WorkingSetSize/MiB << ',' << memory.PrivateUsage/MiB << ','
         << readRate << ',' << writeRate << "\r\n";
       run_.log.samples.flush();}
+    if(pipelineProgress_)pipelineProgress_->Sample(final);
     const bool child=basis_!=ProgressBasis::LogicalBytes;
     std::string activity=final?"Finished":"";
     if(child && !final) {
@@ -217,7 +222,7 @@ private:
     run_.Emit(std::move(progress));
     last_=now;lastBytes_=current;cpuLast_=cpu;ioLast_=io;
   }
-  Run& run_;std::string name_;uint64_t total_;HANDLE process_;ProgressBasis basis_;PipelineExtractionDiagnostics* pipeline_;
+  Run& run_;std::string name_;uint64_t total_;HANDLE process_;ProgressBasis basis_;PipelineExtractionDiagnostics* pipeline_;PipelineProgressSnapshot* pipelineProgress_;
   Clock::time_point start_,last_;uint64_t cpuStart_,cpuLast_;IO_COUNTERS ioStart_,ioLast_;
   uint64_t lastBytes_{0};double peak_{0},peakWorking_{0},peakPrivate_{0},lastActivityLog_{0};
   std::mutex waitMutex_;std::condition_variable stop_;bool finished_{false},recorded_{false},hasSpeedSample_{false};std::thread sampler_;
@@ -498,13 +503,10 @@ Outcome RunBenchmark(const Config& config,std::atomic_bool& cancel,ProgressCallb
         if(native)Child(*run,executable.value(),L"x "+Quote(parts.front())+L" -o"+Quote(output)+L" -y -aoa -mmt="+std::to_wstring(config.threads)+L" -bb0 -bsp0",archives,outcome.logFolder/(suffix+".log"),"extract_"+suffix,total,fileCount,ProgressBasis::ChildOutput);
         else {
           PipelineExtractionDiagnostics metrics;PipelinedExtractionConfig extraction;extraction.sevenZipLibrary=library.value();extraction.archiveFolder=archives;extraction.installFolder=output;extraction.manifest=&manifest;extraction.cancelRequested=&cancel;extraction.decoderThreads=config.threads;extraction.diagnostics=&metrics;
-          Stage stage(*run,"extract_"+suffix,total,GetCurrentProcess(),ProgressBasis::LogicalBytes,&metrics);
-          uint64_t lastValidated=0;int lastPercent=-1;
+          PipelineProgressSnapshot progressLog([&](const auto& line){log->Line(line);});
+          Stage stage(*run,"extract_"+suffix,total,GetCurrentProcess(),ProgressBasis::LogicalBytes,&metrics,&progressLog);
           const auto result=pipeline.Extract(extraction,[&](const auto& progress){
-            if(progress.validatedBytes!=lastValidated || progress.extractionPercent!=lastPercent) {
-              lastValidated=progress.validatedBytes;lastPercent=progress.extractionPercent;
-              log->Line("PIPELINE archive="+PathToUtf8(progress.validationArchive)+"; validation_bytes="+std::to_string(progress.validatedBytes)+"; extraction_percent="+std::to_string(progress.extractionPercent));
-            }
+            progressLog.Publish(progress);
           });
           pipelineRecords.emplace_back(J::Object{{"round",Number(round)},{"counters",PipelineMetrics(metrics)}});
           report["pipeline_diagnostics"]=J(pipelineRecords);

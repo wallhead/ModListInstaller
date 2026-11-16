@@ -3,6 +3,7 @@
 #include <cwchar>
 #include <functional>
 #include <iostream>
+#include <map>
 #include <set>
 #include <stdexcept>
 #include <string_view>
@@ -13,6 +14,8 @@ std::filesystem::path g_fixtureRoot;
 std::filesystem::path g_installerSource;
 HWND g_testWindow = nullptr;
 std::vector<std::wstring> g_messages;
+std::wstring g_lastStatus;
+int g_lastProgress{-1};
 
 void Require(bool condition, const std::string& message) {
   if (!condition) {
@@ -193,6 +196,11 @@ LRESULT CALLBACK TestWindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
   if (message == kLogMessage || message == kStatusMessage) {
     std::unique_ptr<std::wstring> text(reinterpret_cast<std::wstring*>(lParam));
     g_messages.push_back(*text);
+    if (message == kStatusMessage) g_lastStatus = *text;
+    return 0;
+  }
+  if (message == kProgressMessage) {
+    g_lastProgress = static_cast<int>(wParam);
     return 0;
   }
   return DefWindowProcW(hwnd, message, wParam, lParam);
@@ -380,6 +388,545 @@ void EmbeddedCacheRepairsSameSizeTampering() {
   Require(std::filesystem::last_write_time(*cache) == timestamp, "Valid cache was needlessly rewritten");
 }
 
+void EmbeddedCodecAndLicenseAreDeployedAndRepaired() {
+  std::wstring error;
+  const auto cache = ExtractEmbeddedSevenZip(error);
+  Require(cache.has_value(), "Embedded extraction failed: " + Narrow(error));
+  const auto folder = cache->parent_path();
+  for (const auto& [id, name] : std::vector<std::pair<int, const char*>>{
+           {202, "7z.dll"}, {203, "7zip-License.txt"}}) {
+    const auto resource = FindResourceW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(id), MAKEINTRESOURCEW(10));
+    Require(resource != nullptr, std::string("Missing embedded dependency: ") + name);
+    const auto loaded = LoadResource(GetModuleHandleW(nullptr), resource);
+    const auto size = SizeofResource(GetModuleHandleW(nullptr), resource);
+    const auto data = static_cast<const char*>(LockResource(loaded));
+    Require(data != nullptr && size > 0, "Invalid dependency resource");
+    const std::string expected(data, size);
+    Require(ReadFile(folder / name) == expected, "Dependency not deployed byte-for-byte");
+    auto damaged = expected;
+    damaged[damaged.size() / 2] ^= 1;
+    WriteFile(folder / name, damaged);
+    Require(ExtractEmbeddedSevenZip(error).has_value(), "Dependency repair failed: " + Narrow(error));
+    Require(ReadFile(folder / name) == expected, "Same-size dependency corruption was trusted");
+    std::filesystem::remove(folder / name);
+    Require(ExtractEmbeddedSevenZip(error).has_value() && ReadFile(folder / name) == expected,
+            "Missing dependency was not repaired");
+  }
+}
+
+void WorkerMissingInstallerPreservesPreviousPackage() {
+  auto config = Config("worker-missing-installer");
+  config.copyInstaller = true;
+  WorkerDependencies dependencies;
+  dependencies.installerSourceFolder = g_fixtureRoot / "worker-missing-installer" / "missing-portable";
+  const auto package = PackageFolder(config);
+  WriteFile(package / "My Pack.7z.001", "previous valid archive bytes");
+  WriteFile(package / "manifest.json", "previous valid manifest bytes");
+  WriteFile(package / "notes.txt", "unrelated user notes");
+  Worker(g_testWindow, config, dependencies);
+  DrainMessages();
+  Require(std::filesystem::exists(package / "My Pack.7z.001") &&
+              std::filesystem::exists(package / "manifest.json"),
+          "Missing installer destroyed previous archive/manifest before build");
+  Require(ReadFile(package / "My Pack.7z.001") == "previous valid archive bytes" &&
+              ReadFile(package / "manifest.json") == "previous valid manifest bytes" &&
+              ReadFile(package / "notes.txt") == "unrelated user notes",
+          "Failed Worker modified previous package bytes");
+  Require(std::find(g_messages.begin(), g_messages.end(), L"Package ready.") == g_messages.end(),
+          "Failed Worker reported success");
+}
+
+void WorkerBuildFailuresPreservePreviousPackage() {
+  for (const auto* scenario : {"compression-error", "cancel-before-start"}) {
+    auto config = Config(std::string("worker-") + scenario);
+    const auto package = PackageFolder(config);
+    WriteFile(package / "My Pack.zip.001", "old archive first volume");
+    WriteFile(package / "My Pack.zip.002", "old archive second volume");
+    WriteFile(package / "manifest.json", "old manifest");
+    WriteFile(package / "modlist-installer.exe", "old installer");
+    WriteFile(package / "notes.txt", "user notes");
+    WriteFile(package / "data" / "keep.txt", "legacy user data");
+    if (std::string_view(scenario) == "compression-error") config.parameters = L"-invalid-switch";
+    else g_cancelRequested = true;
+    Worker(g_testWindow, config);
+    DrainMessages();
+    for (const auto& [name, expected] : std::vector<std::pair<const char*, const char*>>{
+             {"My Pack.zip.001", "old archive first volume"}, {"My Pack.zip.002", "old archive second volume"},
+             {"manifest.json", "old manifest"}, {"modlist-installer.exe", "old installer"},
+             {"notes.txt", "user notes"}, {"data/keep.txt", "legacy user data"}}) {
+      Require(ReadFile(package / name) == expected, std::string(scenario) + " changed previous package bytes");
+    }
+    Require(std::find(g_messages.begin(), g_messages.end(), L"Package ready.") == g_messages.end(),
+            "Failed/cancelled Worker reported success");
+    g_cancelRequested = false;
+  }
+}
+
+void ManifestCloseFailurePreservesPreviousManifest() {
+  auto config = Config("manifest-close-failure");
+  const auto package = PackageFolder(config);
+  WriteFile(package / "My Pack.7z", "archive bytes");
+  WriteFile(package / "manifest.json", "previous manifest");
+  bool closeReached = false;
+  const bool ok = WriteManifest(g_testWindow, config, 23, [&](std::ofstream& output) {
+    closeReached = true;
+    output.close();
+    output.setstate(std::ios::badbit);
+  });
+  DrainMessages();
+  Require(closeReached && !ok, "Writer ignored the close failure");
+  Require(ReadFile(package / "manifest.json") == "previous manifest", "Close failure replaced old manifest");
+  Require(std::none_of(g_messages.begin(), g_messages.end(), [](const auto& text) {
+    return text == L"Manifest complete" || text.starts_with(L"Manifest written:");
+  }), "Failed manifest close reported success");
+  Require(EntryNames(package) == std::set<std::wstring>{L"My Pack.7z", L"manifest.json"},
+          "Failed manifest write retained a temporary file");
+}
+
+void ManifestPublicationFailurePreservesPreviousManifest() {
+  auto config = Config("manifest-publish-failure");
+  const auto package = PackageFolder(config);
+  WriteFile(package / "My Pack.7z", "archive bytes");
+  WriteFile(package / "manifest.json", "previous manifest");
+  HANDLE locked = CreateFileW((package / "manifest.json").c_str(), GENERIC_READ, FILE_SHARE_READ,
+                              nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+  Require(locked != INVALID_HANDLE_VALUE, "Unable to lock manifest for replacement-failure test");
+  const bool ok = WriteManifest(g_testWindow, config, 23);
+  CloseHandle(locked);
+  DrainMessages();
+  Require(!ok && ReadFile(package / "manifest.json") == "previous manifest",
+          "Failed manifest replacement damaged previous manifest or reported success");
+  Require(std::none_of(g_messages.begin(), g_messages.end(), [](const auto& message) {
+    return message.starts_with(L"Manifest written:") || message == L"Manifest complete";
+  }), "Failed manifest publication reported success");
+  Require(EntryNames(package) == std::set<std::wstring>{L"My Pack.7z", L"manifest.json"},
+          "Failed manifest replacement retained a temporary file");
+}
+
+std::map<std::filesystem::path, std::string> PackageBytes(const std::filesystem::path& package) {
+  std::map<std::filesystem::path, std::string> bytes;
+  for (const auto& entry : std::filesystem::recursive_directory_iterator(package)) {
+    if (entry.is_regular_file()) bytes.emplace(std::filesystem::relative(entry.path(), package), ReadFile(entry.path()));
+  }
+  return bytes;
+}
+
+void SeedPreviousPackage(const PackerConfig& config) {
+  const auto package = PackageFolder(config);
+  WriteFile(package / "My Pack.zip.001", "old archive first volume");
+  WriteFile(package / "My Pack.zip.002", "old archive second volume");
+  WriteFile(package / "manifest.json", "old manifest");
+  WriteFile(package / "modlist-installer.exe", "old installer");
+  WriteFile(package / "notes.txt", "user notes");
+  WriteFile(package / "Other.7z", "unrelated archive");
+  WriteFile(package / "My Pack.7z.001.bak", "user archive backup");
+  WriteFile(package / "data" / "keep.txt", "legacy user data");
+}
+
+void RequireNoSuccess() {
+  DrainMessages();
+  Require(std::find(g_messages.begin(), g_messages.end(), L"Package ready.") == g_messages.end(),
+          "Unsuccessful Worker reported package success");
+}
+
+void WorkerCompletionPolicyRespectsCommitPoint() {
+  struct Case {
+    bool committed;
+    bool cancelled;
+    const wchar_t* status;
+    int progress;
+  };
+  for (const auto& test : std::vector<Case>{{true, true, L"Package ready", 100},
+                                         {true, false, L"Package ready", 100},
+                                         {false, true, L"Stopped", 0},
+                                         {false, false, L"Package build failed", 0}}) {
+    g_messages.clear();
+    g_lastStatus.clear();
+    g_lastProgress = -1;
+    ReportWorkerOutcome(g_testWindow, test.committed, test.cancelled);
+    DrainMessages();
+    Require(g_lastStatus == test.status && g_lastProgress == test.progress,
+            "Completion policy misreported committed=" + std::to_string(test.committed) +
+                ", cancelled=" + std::to_string(test.cancelled));
+    const bool readyLogged = std::find(g_messages.begin(), g_messages.end(), L"Package ready.") != g_messages.end();
+    Require(readyLogged == test.committed, "Completion log disagrees with the publication commit point");
+  }
+}
+
+void WorkerPublicationFailuresPreservePreviousPackage() {
+  for (const auto* scenario : {"close-failure", "cancel-after-close", "backup-failure", "promotion-failure",
+                               "cancel-during-promotion", "throw-during-promotion"}) {
+    auto config = Config(std::string("publication-") + scenario);
+    config.copyInstaller = true;
+    SeedPreviousPackage(config);
+    const auto previous = PackageBytes(PackageFolder(config));
+    WorkerDependencies dependencies;
+    dependencies.installerSourceFolder = config.sourceFolder.parent_path() / "portable";
+    WriteFile(dependencies.installerSourceFolder / "modlist-installer.exe", "new inert installer placeholder");
+    bool reached = false;
+    if (std::string_view(scenario) == "close-failure" || std::string_view(scenario) == "cancel-after-close") {
+      dependencies.closeManifest = [&](std::ofstream& output) {
+        output.close();
+        reached = true;
+        if (std::string_view(scenario) == "close-failure") output.setstate(std::ios::badbit);
+        else g_cancelRequested = true;
+      };
+    } else {
+      dependencies.renameFile = [&](const auto& from, const auto& to, std::error_code& ec) {
+        const bool backup = to.parent_path().filename() == "previous";
+        const bool promotion = to.parent_path() == PackageFolder(config) &&
+            from.parent_path().filename() == config.archiveName;
+        const auto name = std::string_view(scenario);
+        if (!reached && ((name == "backup-failure" && backup && from.filename() == "manifest.json") ||
+                         (name != "backup-failure" && promotion && to.filename() == "manifest.json"))) {
+          reached = true;
+          if (name == "throw-during-promotion") throw std::runtime_error("injected filesystem failure");
+          if (name == "cancel-during-promotion") {
+            RenamePackageFile(from, to, ec);
+            g_cancelRequested = true;
+          } else ec = std::make_error_code(std::errc::permission_denied);
+          return;
+        }
+        RenamePackageFile(from, to, ec);
+      };
+    }
+    Worker(g_testWindow, config, dependencies);
+    RequireNoSuccess();
+    Require(reached, std::string(scenario) + " did not reach its real Worker boundary");
+    Require(PackageBytes(PackageFolder(config)) == previous, std::string(scenario) + " changed previous bytes");
+    Require(EntryNames(config.releaseFolder) == std::set<std::wstring>{config.archiveName},
+            "Successful rollback retained an unnecessary workspace");
+    Require(!g_workerRunning, "Failed Worker left running state set");
+    const bool cancelled = std::string_view(scenario).starts_with("cancel-");
+    Require(g_lastStatus == (cancelled ? L"Stopped" : L"Package build failed") && g_lastProgress == 0,
+            std::string(scenario) + " left stale success/progress UI after rollback");
+    g_cancelRequested = false;
+    g_messages.clear();
+  }
+}
+
+void WorkerRollbackFailureRetainsRecoverablePreviousBytes() {
+  auto config = Config("rollback-failure");
+  SeedPreviousPackage(config);
+  const auto previous = PackageBytes(PackageFolder(config));
+  WorkerDependencies dependencies;
+  bool promotionFailed = false;
+  bool rollbackFailed = false;
+  dependencies.renameFile = [&](const auto& from, const auto& to, std::error_code& ec) {
+    if ((!promotionFailed && to == PackageFolder(config) / "manifest.json") ||
+        (from.parent_path().filename() == "previous" && from.filename() == "My Pack.zip.001")) {
+      if (promotionFailed) rollbackFailed = true;
+      promotionFailed = true;
+      ec = std::make_error_code(std::errc::permission_denied);
+      return;
+    }
+    RenamePackageFile(from, to, ec);
+  };
+  Worker(g_testWindow, config, dependencies);
+  RequireNoSuccess();
+  Require(promotionFailed && rollbackFailed, "Did not exercise failed publication and failed rollback");
+  Require(g_lastStatus == L"Package build failed" && g_lastProgress == 0,
+          "Failed rollback left stale success/progress UI");
+  std::filesystem::path recovery;
+  for (const auto& entry : std::filesystem::directory_iterator(config.releaseFolder)) {
+    if (entry.path().filename().wstring().starts_with(L".packer-")) recovery = entry.path();
+  }
+  Require(!recovery.empty() && std::filesystem::is_regular_file(recovery / "promotion-journal.txt") &&
+              std::filesystem::is_regular_file(recovery / "packer-workspace.txt"),
+          "Failed rollback did not retain identifiable recovery artifacts");
+  for (const auto& [path, expected] : previous) {
+    const auto live = PackageFolder(config) / path;
+    const auto saved = recovery / "previous" / path;
+    Require((std::filesystem::is_regular_file(live) && ReadFile(live) == expected) ||
+                (std::filesystem::is_regular_file(saved) && ReadFile(saved) == expected),
+            "Failed rollback lost previous bytes: " + path.string());
+  }
+  Require(std::any_of(g_messages.begin(), g_messages.end(), [&](const auto& message) {
+    return message.find(L"RECOVERY REQUIRED") != std::wstring::npos &&
+        message.find(recovery.wstring()) != std::wstring::npos;
+  }), "Failed rollback did not report the recovery path");
+  std::cout << "Recovery fixture: " << Narrow(recovery.wstring()) << '\n';
+}
+
+void WorkerSuccessReplacesOnlyGeneratedOutputs() {
+  auto config = Config("successful-replacement");
+  SeedPreviousPackage(config);
+  config.copyInstaller = true;
+  WorkerDependencies dependencies;
+  dependencies.installerSourceFolder = g_fixtureRoot / "successful-replacement" / "portable";
+  WriteFile(dependencies.installerSourceFolder / "modlist-installer.exe", "new inert installer fixture, not runnable");
+  Worker(g_testWindow, config, dependencies);
+  DrainMessages();
+  const auto package = PackageFolder(config);
+  Require(std::find(g_messages.begin(), g_messages.end(), L"Package ready.") != g_messages.end(),
+          "Successful replacement never reported ready");
+  Require(!std::filesystem::exists(package / "My Pack.zip.001") &&
+              !std::filesystem::exists(package / "My Pack.zip.002"), "Success left stale selected archive parts");
+  Require(ReadFile(package / "manifest.json").find("\"path\": \"My Pack.7z.001\"") != std::string::npos,
+          "Replacement manifest does not describe the new archive");
+  Require(ReadFile(package / "modlist-installer.exe") == "new inert installer fixture, not runnable",
+          "Replacement did not publish prepared installer");
+  Require(ReadFile(package / "notes.txt") == "user notes" && ReadFile(package / "Other.7z") == "unrelated archive" &&
+              ReadFile(package / "My Pack.7z.001.bak") == "user archive backup" &&
+              ReadFile(package / "data" / "keep.txt") == "legacy user data", "Success changed unrelated files");
+  Require(EntryNames(config.releaseFolder) == std::set<std::wstring>{config.archiveName},
+          "Success retained its backup/workspace");
+  Require(ResolveSevenZip(g_testWindow, config) &&
+              RunProcess(g_testWindow, BuildSevenZipTestCommand(config), L"Verify replacement", 0) == 0,
+          "Successful replacement is not a valid archive");
+}
+
+void WorkerReplacesCaseOnlyArchiveNames() {
+  size_t index = 0;
+  for (const auto* oldName : {L"MY PACK.7Z.001", L"My Pack.7Z.001", L"MY PACK.ZIP", L"My Pack.ZIP"}) {
+    auto config = Config("case-replacement-" + std::to_string(index++));
+    const bool zip = std::wstring_view(oldName).ends_with(L"ZIP");
+    config.format = zip ? L"zip" : L"7z";
+    config.volumeSize = zip ? L"none" : L"8k";
+    const auto package = PackageFolder(config);
+    WriteFile(package / oldName, "previous archive with case-only spelling");
+    WriteFile(package / "MANIFEST.JSON", "previous manifest");
+    WriteFile(package / "notes.txt", "unrelated notes");
+    Worker(g_testWindow, config);
+    DrainMessages();
+    Require(std::find(g_messages.begin(), g_messages.end(), L"Package ready.") != g_messages.end(),
+            "Case-only archive spelling prevented replacement: " + Narrow(oldName));
+    Require(ReadFile(package / "notes.txt") == "unrelated notes", "Case-only rebuild changed unrelated files");
+    Require(EntryNames(package) == std::set<std::wstring>{zip ? L"My Pack.zip" : L"My Pack.7z.001",
+                                                        L"manifest.json", L"notes.txt"},
+            "Case-only rebuild left stale selected archive files");
+    Require(ResolveSevenZip(g_testWindow, config) &&
+                RunProcess(g_testWindow, BuildSevenZipTestCommand(config), L"Verify case-only replacement", 0) == 0,
+            "Case-only replacement did not publish a valid archive");
+    g_messages.clear();
+  }
+}
+
+void WorkerManifestOnlyPreservesPairAndArchives(const std::string& scenario) {
+  auto config = Config("manifest-only-" + scenario);
+  config.archiveFirst = false;
+  config.copyInstaller = scenario != "success-no-installer";
+  SeedPreviousPackage(config);
+  const auto package = PackageFolder(config);
+  WriteFile(package / "My Pack.7z.tmp", "untouched previous interrupted archive");
+  const auto previous = PackageBytes(package);
+  WorkerDependencies dependencies;
+  dependencies.installerSourceFolder = config.sourceFolder.parent_path() / "portable";
+  WriteFile(dependencies.installerSourceFolder / "modlist-installer.exe", "new inert Manifest Only installer");
+  bool injected = false;
+  bool stagedPairOnly = false;
+  dependencies.closeManifest = [&](std::ofstream& output) {
+    output.close();
+    for (const auto& entry : std::filesystem::directory_iterator(config.releaseFolder)) {
+      if (!entry.path().filename().wstring().starts_with(L".packer-")) continue;
+      const auto candidate = entry.path() / "replacement" / config.archiveName;
+      stagedPairOnly = true;
+      for (const auto& file : std::filesystem::directory_iterator(candidate)) {
+        const auto name = file.path().filename().wstring();
+        if (name != L"modlist-installer.exe" && !name.starts_with(L"manifest.json.packer-")) stagedPairOnly = false;
+      }
+    }
+    if (scenario == "close-failure" || scenario == "cancel-after-close") {
+      injected = true;
+      if (scenario == "close-failure") output.setstate(std::ios::badbit);
+      else g_cancelRequested = true;
+    }
+  };
+  if (scenario == "promotion-failure" || scenario == "cancel-during-promotion") {
+    dependencies.renameFile = [&](const auto& from, const auto& to, std::error_code& ec) {
+      const bool publish = SameWindowsPackagePath(to.parent_path(), package) &&
+          from.parent_path().filename() == config.archiveName;
+      if (!injected && publish && to.filename() ==
+          (scenario == "promotion-failure" ? "manifest.json" : "modlist-installer.exe")) {
+        injected = true;
+        if (scenario == "promotion-failure") ec = std::make_error_code(std::errc::permission_denied);
+        else {
+          RenamePackageFile(from, to, ec);
+          g_cancelRequested = true;
+        }
+        return;
+      }
+      RenamePackageFile(from, to, ec);
+    };
+  }
+  std::vector<HANDLE> locks;
+  std::map<std::filesystem::path, std::filesystem::file_time_type> archiveTimes;
+  // Deny archive writes/deletes: Manifest Only must hash in place, never copy or promote them.
+  for (const auto* name : {"My Pack.zip.001", "My Pack.zip.002", "My Pack.7z.tmp"}) {
+    const auto path = package / name;
+    archiveTimes.emplace(path, std::filesystem::last_write_time(path));
+    HANDLE file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+                              OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    Require(file != INVALID_HANDLE_VALUE, "Unable to lock untouched Manifest Only archive");
+    locks.push_back(file);
+  }
+  if (scenario == "locked-manifest") {
+    HANDLE file = CreateFileW((package / "manifest.json").c_str(), GENERIC_READ, FILE_SHARE_READ,
+                              nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    Require(file != INVALID_HANDLE_VALUE, "Unable to lock Manifest Only's previous manifest");
+    locks.push_back(file);
+  }
+  Worker(g_testWindow, config, dependencies);
+  for (HANDLE file : locks) CloseHandle(file);
+  DrainMessages();
+  Require(stagedPairOnly, "Manifest Only must stage the pair without any copied/hardlinked archives");
+  if (scenario.starts_with("success")) {
+    Require(std::find(g_messages.begin(), g_messages.end(), L"Package ready.") != g_messages.end(),
+            "Manifest Only failed while live archives were locked against mutation");
+    auto expected = previous;
+    if (config.copyInstaller) expected["modlist-installer.exe"] = "new inert Manifest Only installer";
+    expected["manifest.json"] = ReadFile(package / "manifest.json");
+    Require(expected["manifest.json"].find("\"path\": \"My Pack.zip.001\"") != std::string::npos &&
+                expected["manifest.json"].find("\"path\": \"My Pack.zip.002\"") != std::string::npos,
+            "Staged Manifest Only writer did not hash the live archive set");
+    Require(PackageBytes(package) == expected, "Manifest Only success changed files outside the installer/manifest pair");
+    Require(g_lastStatus == L"Package ready" && g_lastProgress == 100, "Manifest Only success did not finish its UI state");
+  } else {
+    RequireNoSuccess();
+    Require(PackageBytes(package) == previous, "Manifest Only " + scenario + " changed previous installer/manifest/archive bytes");
+    if (scenario != "locked-manifest") Require(injected, "Manifest Only did not reach its injected failure/cancel boundary");
+    Require(g_lastStatus == (scenario.starts_with("cancel-") ? L"Stopped" : L"Package build failed") &&
+                g_lastProgress == 0, "Manifest Only left stale success/progress UI after failure/cancellation");
+  }
+  for (const auto& [path, timestamp] : archiveTimes) {
+    Require(std::filesystem::last_write_time(path) == timestamp, "Manifest Only rewrote an untouched archive");
+  }
+  Require(EntryNames(config.releaseFolder) == std::set<std::wstring>{config.archiveName},
+          "Manifest Only retained a workspace after success/complete rollback");
+}
+
+void PublicationNeverClobbersAnUnexpectedFile() {
+  const auto folder = g_fixtureRoot / "rename-collision";
+  WriteFile(folder / "from", "generated output");
+  WriteFile(folder / "to", "unrelated collision");
+  std::error_code ec;
+  RenamePackageFile(folder / "from", folder / "to", ec);
+  Require(static_cast<bool>(ec), "Publication silently replaced an unexpected destination");
+  Require(ReadFile(folder / "from") == "generated output" && ReadFile(folder / "to") == "unrelated collision",
+          "Publication collision lost bytes");
+}
+
+void WorkerLockedManifestRollsBackRealFilesystemFailure() {
+  auto config = Config("locked-manifest");
+  SeedPreviousPackage(config);
+  const auto previous = PackageBytes(PackageFolder(config));
+  HANDLE locked = CreateFileW((PackageFolder(config) / "manifest.json").c_str(), GENERIC_READ,
+                              FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+  Require(locked != INVALID_HANDLE_VALUE, "Unable to lock previous manifest");
+  Worker(g_testWindow, config);
+  CloseHandle(locked);
+  RequireNoSuccess();
+  Require(PackageBytes(PackageFolder(config)) == previous, "Real Windows sharing failure lost old package bytes");
+  Require(EntryNames(config.releaseFolder) == std::set<std::wstring>{config.archiveName},
+          "Real filesystem rollback did not finish");
+}
+
+void WorkerUnavailableCodecCachePreservesPreviousPackage() {
+  std::wstring error;
+  const auto exe = ExtractEmbeddedSevenZip(error);
+  Require(exe.has_value(), "Unable to prepare codec cache fixture");
+  const auto dll = exe->parent_path() / "7z.dll";
+  const auto expected = ReadFile(dll);
+  auto damaged = expected;
+  damaged[0] ^= 1;
+  WriteFile(dll, damaged);
+  HANDLE locked = CreateFileW(dll.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                              FILE_ATTRIBUTE_NORMAL, nullptr);
+  Require(locked != INVALID_HANDLE_VALUE, "Unable to lock corrupt codec cache");
+  auto config = Config("unavailable-codec");
+  SeedPreviousPackage(config);
+  const auto previous = PackageBytes(PackageFolder(config));
+  Worker(g_testWindow, config);
+  CloseHandle(locked);
+  const bool repaired = ExtractEmbeddedSevenZip(error).has_value() && ReadFile(dll) == expected;
+  RequireNoSuccess();
+  Require(repaired, "Unable to restore the private cache after codec failure");
+  Require(PackageBytes(PackageFolder(config)) == previous, "Unavailable codec cache changed previous package");
+}
+
+void WorkerInsufficientSpacePreservesPreviousPackage() {
+  auto config = Config("insufficient-space");
+  SeedPreviousPackage(config);
+  const auto previous = PackageBytes(PackageFolder(config));
+  const auto sparse = config.sourceFolder / "oversized-sparse-fixture.bin";
+  HANDLE file = CreateFileW(sparse.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_NEW,
+                            FILE_ATTRIBUTE_NORMAL, nullptr);
+  Require(file != INVALID_HANDLE_VALUE, "Unable to create sparse space-policy fixture");
+  DWORD returned = 0;
+  const BOOL marked = DeviceIoControl(file, FSCTL_SET_SPARSE, nullptr, 0, nullptr, 0, &returned, nullptr);
+  LARGE_INTEGER size{};
+  size.QuadPart = static_cast<LONGLONG>(std::filesystem::space(config.releaseFolder).available + 64ull * 1024 * 1024);
+  const bool resized = marked && SetFilePointerEx(file, size, nullptr, FILE_BEGIN) && SetEndOfFile(file);
+  CloseHandle(file);
+  Require(resized, "Unable to prepare a sparse file larger than available free space");
+  Worker(g_testWindow, config);
+  std::filesystem::remove(sparse);
+  RequireNoSuccess();
+  Require(PackageBytes(PackageFolder(config)) == previous, "Space preflight modified previous bytes");
+  Require(std::any_of(g_messages.begin(), g_messages.end(), [](const auto& message) {
+    return message.starts_with(L"Insufficient free space");
+  }), "Worker did not reject insufficient replacement space during preflight");
+  Require(EntryNames(config.releaseFolder) == std::set<std::wstring>{config.archiveName},
+          "Space preflight unnecessarily created a workspace");
+}
+
+void WorkerCancellationDuringCompressionPreservesPreviousPackage() {
+  auto config = Config("cancel-compression");
+  SeedPreviousPackage(config);
+  const auto previous = PackageBytes(PackageFolder(config));
+  std::string payload(1024 * 1024, '\0');
+  uint32_t state = 0x654321;
+  for (auto& byte : payload) {
+    state ^= state << 13; state ^= state >> 17; state ^= state << 5;
+    byte = static_cast<char>(state);
+  }
+  WriteFile(config.sourceFolder / "payload.bin", payload);
+  config.threads = L"1";
+  config.volumeSize = L"none";
+  std::atomic_bool finished{false};
+  std::thread worker([&] { Worker(g_testWindow, config); finished = true; });
+  bool cancelled = false;
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+  while (!finished && std::chrono::steady_clock::now() < deadline) {
+    DrainMessages();
+    if (std::find(g_messages.begin(), g_messages.end(), L"Starting 7-Zip...") != g_messages.end()) {
+      g_cancelRequested = true;
+      cancelled = true;
+    }
+    Sleep(1);
+  }
+  if (!finished) g_cancelRequested = true;
+  worker.join();
+  RequireNoSuccess();
+  Require(cancelled, "Did not reach real compression cancellation boundary");
+  Require(PackageBytes(PackageFolder(config)) == previous, "Compression cancellation changed previous package bytes");
+  Require(EntryNames(config.releaseFolder) == std::set<std::wstring>{config.archiveName},
+          "Cancelled compression retained an unnecessary workspace");
+}
+
+void WorkerDoesNotCleanAWorkspaceWithChangedOwnership() {
+  auto config = Config("changed-workspace-owner");
+  SeedPreviousPackage(config);
+  const auto previous = PackageBytes(PackageFolder(config));
+  WorkerDependencies dependencies;
+  std::filesystem::path workspace;
+  dependencies.closeManifest = [&](std::ofstream& output) {
+    output.close();
+    for (const auto& entry : std::filesystem::directory_iterator(config.releaseFolder)) {
+      if (entry.path().filename().wstring().starts_with(L".packer-")) workspace = entry.path();
+    }
+    Require(!workspace.empty(), "No owned workspace reached the writer");
+    WriteFile(workspace / "packer-workspace.txt", "not this operation's workspace");
+    WriteFile(workspace / "keep.txt", "ownership changed: preserve this file");
+    g_cancelRequested = true;
+  };
+  Worker(g_testWindow, config, dependencies);
+  RequireNoSuccess();
+  Require(PackageBytes(PackageFolder(config)) == previous, "Ownership change affected previous package");
+  Require(std::filesystem::exists(workspace / "keep.txt"), "Cleanup deleted a workspace after ownership changed");
+  Require(ReadFile(workspace / "keep.txt") == "ownership changed: preserve this file", "Cleanup changed sentinel bytes");
+}
+
 void RealSevenZipFullPathMetadata() {
   auto config = Config("full-path-metadata");
   config.volumeSize = L"none";
@@ -546,6 +1093,8 @@ void UnsafeArchiveNamesAreRejectedBeforeWriting() {
 
 void RealCompressionTestAndManifest() {
   auto config = Config("compression");
+  WriteFile(config.sourceFolder / "empty.dat", "");
+  std::filesystem::create_directory(config.sourceFolder / "empty-directory");
   std::string payload(16 * 1024, '\0');
   uint32_t state = 0x12345678;
   for (auto& byte : payload) {
@@ -586,6 +1135,8 @@ void RealCompressionTestAndManifest() {
   Require(RunProcess(g_testWindow, command, L"Extract fixture archive", 0) == 0, "Generated archive could not be extracted");
   Require(ReadFile(extracted / "nested" / "payload.bin") == payload, "Compression changed payload bytes or relative paths");
   Require(ReadFile(extracted / "nested" / "readme.txt") == "Small modlist payload\r\n", "Archive lost a nested source file");
+  Require(ReadFile(extracted / "empty.dat").empty() && std::filesystem::is_directory(extracted / "empty-directory"),
+          "Archive lost an empty file/directory");
   const auto manifest = ReadFile(package / "manifest.json");
   Require(manifest.find("\"path\": \"My Pack.7z.001\"") != std::string::npos, "Manifest archive paths must be root-relative filenames");
   Require(manifest.find("\"unpacked_size\": 16407") != std::string::npos, "Worker did not retain scanned unpacked size");
@@ -598,6 +1149,8 @@ void RealCompressionTestAndManifest() {
 
 void RealSingleZipCompression() {
   auto config = Config("zip-compression");
+  WriteFile(config.sourceFolder / "empty.dat", "");
+  std::filesystem::create_directory(config.sourceFolder / "empty-directory");
   config.format = L"zip";
   config.volumeSize = L"none";
   Worker(g_testWindow, config);
@@ -740,6 +1293,29 @@ int wmain(int argc, wchar_t* argv[]) {
         {"unsafe path mode and parameter rejection", UnsafePathModesAreRejectedBeforeWriting},
         {"owned strings are not queued without a window", NullTargetsDoNotQueueOwnedStrings},
         {"same-size embedded cache tamper regeneration", EmbeddedCacheRepairsSameSizeTampering},
+        {"embedded codec/license deployment and byte repair", EmbeddedCodecAndLicenseAreDeployedAndRepaired},
+        {"Worker missing installer preserves previous package", WorkerMissingInstallerPreservesPreviousPackage},
+        {"Worker compressor failure/cancel preserve previous bytes", WorkerBuildFailuresPreservePreviousPackage},
+        {"manifest close failure preserves previous manifest", ManifestCloseFailurePreservesPreviousManifest},
+        {"manifest replacement failure preserves previous manifest", ManifestPublicationFailurePreservesPreviousManifest},
+        {"Worker publication errors/cancellation restore previous bytes", WorkerPublicationFailuresPreservePreviousPackage},
+        {"Worker completion policy preserves committed success after late Stop", WorkerCompletionPolicyRespectsCommitPoint},
+        {"Worker failed rollback retains recoverable previous bytes", WorkerRollbackFailureRetainsRecoverablePreviousBytes},
+        {"Worker success replaces generated files only", WorkerSuccessReplacesOnlyGeneratedOutputs},
+        {"Worker case-only archive names and extensions replace successfully", WorkerReplacesCaseOnlyArchiveNames},
+        {"Manifest Only stages pair without mutating locked live archives", [] { WorkerManifestOnlyPreservesPairAndArchives("success"); }},
+        {"Manifest Only copying disabled preserves existing installer", [] { WorkerManifestOnlyPreservesPairAndArchives("success-no-installer"); }},
+        {"Manifest Only close failure preserves original pair", [] { WorkerManifestOnlyPreservesPairAndArchives("close-failure"); }},
+        {"Manifest Only close cancellation preserves original pair", [] { WorkerManifestOnlyPreservesPairAndArchives("cancel-after-close"); }},
+        {"Manifest Only real manifest lock preserves original pair", [] { WorkerManifestOnlyPreservesPairAndArchives("locked-manifest"); }},
+        {"Manifest Only publication failure restores original pair", [] { WorkerManifestOnlyPreservesPairAndArchives("promotion-failure"); }},
+        {"Manifest Only publication cancellation restores original pair", [] { WorkerManifestOnlyPreservesPairAndArchives("cancel-during-promotion"); }},
+        {"publication never clobbers an unexpected file", PublicationNeverClobbersAnUnexpectedFile},
+        {"Worker rolls back real Windows sharing failure", WorkerLockedManifestRollsBackRealFilesystemFailure},
+        {"Worker codec-cache failure preserves previous package", WorkerUnavailableCodecCachePreservesPreviousPackage},
+        {"Worker space preflight preserves previous package", WorkerInsufficientSpacePreservesPreviousPackage},
+        {"Worker cancellation during compression preserves previous package", WorkerCancellationDuringCompressionPreservesPreviousPackage},
+        {"Worker cleanup refuses changed workspace ownership", WorkerDoesNotCleanAWorkspaceWithChangedOwnership},
         {"packer log retains long output and compression defaults", PackerLogRetainsLongOutputAndDefaults},
         {"real compression, integrity test, extraction and manifest", RealCompressionTestAndManifest},
         {"real unsplit ZIP compression and manifest", RealSingleZipCompression},
@@ -748,6 +1324,8 @@ int wmain(int argc, wchar_t* argv[]) {
     for (const auto& [name, test] : tests) {
       g_cancelRequested = false;
       g_messages.clear();
+      g_lastStatus.clear();
+      g_lastProgress = -1;
       try {
         test();
         std::cout << "PASS: " << name << '\n';

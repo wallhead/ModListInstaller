@@ -19,11 +19,13 @@
 #include <deque>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iomanip>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -144,12 +146,12 @@ std::filesystem::path LocalToolCacheFolder() {
   return ModuleFolder() / "tools" / "7zip";
 }
 
-std::optional<std::filesystem::path> ExtractEmbeddedSevenZip(std::wstring& error) {
+bool ExtractEmbeddedTool(int resourceId, const wchar_t* name, std::wstring& error) {
   HMODULE module = GetModuleHandleW(nullptr);
-  HRSRC resource = FindResourceW(module, MAKEINTRESOURCEW(IDR_7ZIP_EXE), MAKEINTRESOURCEW(10));
+  HRSRC resource = FindResourceW(module, MAKEINTRESOURCEW(resourceId), MAKEINTRESOURCEW(10));
   if (resource == nullptr) {
     error = L"Embedded 7-Zip resource was not found.";
-    return std::nullopt;
+    return false;
   }
 
   HGLOBAL loaded = LoadResource(module, resource);
@@ -157,7 +159,7 @@ std::optional<std::filesystem::path> ExtractEmbeddedSevenZip(std::wstring& error
   const void* data = LockResource(loaded);
   if (loaded == nullptr || data == nullptr || size == 0) {
     error = L"Embedded 7-Zip resource could not be loaded.";
-    return std::nullopt;
+    return false;
   }
 
   const auto outputFolder = LocalToolCacheFolder();
@@ -165,10 +167,10 @@ std::optional<std::filesystem::path> ExtractEmbeddedSevenZip(std::wstring& error
   std::filesystem::create_directories(outputFolder, ec);
   if (ec) {
     error = L"Unable to create embedded 7-Zip cache folder: " + Widen(ec.message());
-    return std::nullopt;
+    return false;
   }
 
-  const auto outputPath = outputFolder / "7z.exe";
+  const auto outputPath = outputFolder / name;
   bool writeFile = true;
   if (std::filesystem::exists(outputPath, ec) && !ec) {
     const auto existingSize = std::filesystem::file_size(outputPath, ec);
@@ -186,18 +188,27 @@ std::optional<std::filesystem::path> ExtractEmbeddedSevenZip(std::wstring& error
   if (writeFile) {
     std::ofstream output(outputPath, std::ios::binary | std::ios::trunc);
     if (!output) {
-      error = L"Unable to write embedded 7-Zip executable.";
-      return std::nullopt;
+      error = L"Unable to write embedded 7-Zip component: " + outputPath.wstring();
+      return false;
     }
     output.write(static_cast<const char*>(data), size);
     output.close();
     if (!output) {
-      error = L"Unable to finish writing embedded 7-Zip executable.";
-      return std::nullopt;
+      error = L"Unable to finish writing embedded 7-Zip component: " + outputPath.wstring();
+      return false;
     }
   }
 
-  return outputPath;
+  return true;
+}
+
+std::optional<std::filesystem::path> ExtractEmbeddedSevenZip(std::wstring& error) {
+  if (!ExtractEmbeddedTool(IDR_7ZIP_EXE, L"7z.exe", error) ||
+      !ExtractEmbeddedTool(IDR_7ZIP_DLL, L"7z.dll", error) ||
+      !ExtractEmbeddedTool(IDR_7ZIP_LICENSE, L"7zip-License.txt", error)) {
+    return std::nullopt;
+  }
+  return LocalToolCacheFolder() / "7z.exe";
 }
 
 std::wstring GetText(HWND hwnd) {
@@ -1033,7 +1044,21 @@ std::optional<ArchiveSet> SelectArchiveSet(HWND hwnd, const PackerConfig& config
   return std::nullopt;
 }
 
-bool WriteManifest(HWND hwnd, const PackerConfig& config, uint64_t unpackedSize) {
+using ManifestCloser = std::function<void(std::ofstream&)>;
+
+void CloseManifest(std::ofstream& output) {
+  output.close();
+}
+
+std::wstring UniqueWorkName() {
+  static std::atomic_uint sequence{0};
+  return L".packer-" + std::to_wstring(GetCurrentProcessId()) + L"-" +
+      std::to_wstring(GetTickCount64()) + L"-" + std::to_wstring(sequence.fetch_add(1));
+}
+
+bool WriteManifest(HWND hwnd, const PackerConfig& config, uint64_t unpackedSize,
+                   const ManifestCloser& closeManifest = CloseManifest,
+                   const std::filesystem::path& outputFolder = {}) {
   const auto archiveSet = SelectArchiveSet(hwnd, config);
   if (!archiveSet.has_value()) {
     PostLog(hwnd, L"No archive parts found in: " + PackageFolder(config).wstring());
@@ -1126,14 +1151,27 @@ bool WriteManifest(HWND hwnd, const PackerConfig& config, uint64_t unpackedSize)
   }
 
   std::error_code ec;
-  std::filesystem::create_directories(packageFolder, ec);
+  const auto manifestFolder = outputFolder.empty() ? packageFolder : outputFolder;
+  std::filesystem::create_directories(manifestFolder, ec);
   if (ec) {
     PostLog(hwnd, L"Unable to create package folder: " + Widen(ec.message()));
     return false;
   }
 
-  const auto manifestPath = packageFolder / "manifest.json";
-  std::ofstream output(manifestPath, std::ios::binary | std::ios::trunc);
+  const auto manifestPath = manifestFolder / "manifest.json";
+  const auto temporaryPath = manifestFolder / (L"manifest.json" + UniqueWorkName() + L".tmp");
+  HANDLE temporary = CreateFileW(temporaryPath.c_str(), GENERIC_WRITE, 0, nullptr,
+                                 CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (temporary == INVALID_HANDLE_VALUE) {
+    PostLog(hwnd, L"Unable to create temporary manifest: " + temporaryPath.wstring());
+    return false;
+  }
+  CloseHandle(temporary);
+  struct TemporaryManifest {
+    std::filesystem::path path;
+    ~TemporaryManifest() { std::error_code ignored; std::filesystem::remove(path, ignored); }
+  } cleanup{temporaryPath};
+  std::ofstream output(temporaryPath, std::ios::binary | std::ios::trunc);
   if (!output) {
     PostLog(hwnd, L"Unable to write manifest: " + manifestPath.wstring());
     return false;
@@ -1166,8 +1204,14 @@ bool WriteManifest(HWND hwnd, const PackerConfig& config, uint64_t unpackedSize)
   }
   output << "  ]\n";
   output << "}\n";
+  closeManifest(output);
   if (!output) {
     PostLog(hwnd, L"Unable to finish manifest write.");
+    return false;
+  }
+  if (g_cancelRequested || !MoveFileExW(temporaryPath.c_str(), manifestPath.c_str(),
+                                       MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+    PostLog(hwnd, L"Unable to publish completed manifest (or operation cancelled).");
     return false;
   }
 
@@ -1552,87 +1596,276 @@ bool ResolveSevenZip(HWND hwnd, PackerConfig& config) {
   return true;
 }
 
-void Worker(HWND hwnd, PackerConfig config) {
-  g_workerRunning = true;
-  g_cancelRequested = false;
-  PostProgress(hwnd, 0);
+using FileRenamer = std::function<void(const std::filesystem::path&, const std::filesystem::path&,
+                                      std::error_code&)>;
 
-  if (!ResolveSevenZip(hwnd, config) || !ValidateConfig(hwnd, config)) {
-    g_workerRunning = false;
-    PostMessageW(hwnd, kWorkerFinishedMessage, 0, 0);
-    return;
+void RenamePackageFile(const std::filesystem::path& from, const std::filesystem::path& to,
+                       std::error_code& ec) {
+  ec.clear();
+  if (!MoveFileExW(from.c_str(), to.c_str(), MOVEFILE_WRITE_THROUGH)) {
+    ec = std::error_code(static_cast<int>(GetLastError()), std::system_category());
+  }
+}
+
+struct WorkerDependencies {
+  std::filesystem::path installerSourceFolder{ModuleFolder()};
+  ManifestCloser closeManifest{CloseManifest};
+  FileRenamer renameFile{RenamePackageFile};
+};
+
+class PackageWorkspace {
+ public:
+  PackageWorkspace(HWND hwnd, const std::filesystem::path& releaseFolder) : hwnd_(hwnd) {
+    root_ = std::filesystem::canonical(releaseFolder) / UniqueWorkName();
+    if (!std::filesystem::create_directory(root_)) throw std::runtime_error("Unable to reserve package workspace");
+    markerText_ = "ModlistPacker owned workspace\n" + Narrow(root_.wstring()) + '\n';
+    std::ofstream marker(root_ / "packer-workspace.txt", std::ios::binary);
+    marker << markerText_;
+    marker.close();
+    if (!marker) throw std::runtime_error("Unable to mark package workspace: " + Narrow(root_.wstring()));
   }
 
-  if (config.archiveFirst && !RemovePreviousPackageOutputs(hwnd, config)) {
-    g_workerRunning = false;
-    PostMessageW(hwnd, kWorkerFinishedMessage, 0, 0);
-    return;
+  ~PackageWorkspace() {
+    if (retained_) return;
+    try {
+      if (std::filesystem::canonical(root_) != root_) throw std::runtime_error("Workspace identity changed");
+      auto check = [](const std::filesystem::path& path) {
+        const auto attributes = GetFileAttributesW(path.c_str());
+        if (attributes == INVALID_FILE_ATTRIBUTES || (attributes & FILE_ATTRIBUTE_REPARSE_POINT)) {
+          throw std::runtime_error("Workspace contains a redirected or inaccessible path");
+        }
+      };
+      check(root_);
+      check(root_ / "packer-workspace.txt");
+      std::ifstream marker(root_ / "packer-workspace.txt", std::ios::binary);
+      if (!marker || std::string(std::istreambuf_iterator<char>(marker), {}) != markerText_) {
+        throw std::runtime_error("Workspace ownership marker changed");
+      }
+      marker.close();
+      for (const auto& entry : std::filesystem::recursive_directory_iterator(root_)) check(entry.path());
+      std::filesystem::remove_all(root_);
+    } catch (const std::exception& error) {
+      PostLog(hwnd_, L"Package workspace retained: " + root_.wstring() + L" - " + Widen(error.what()));
+    }
   }
 
-  if (!PrepareInstallerSetup(hwnd, config)) {
-    g_workerRunning = false;
-    PostMessageW(hwnd, kWorkerFinishedMessage, 0, 0);
-    return;
+  const std::filesystem::path& Root() const { return root_; }
+  void Retain() {
+    retained_ = true;
+    PostLog(hwnd_, L"RECOVERY REQUIRED. Previous files and promotion journal retained at: " + root_.wstring());
   }
+
+ private:
+  HWND hwnd_;
+  std::filesystem::path root_;
+  std::string markerText_;
+  bool retained_{false};
+};
+
+bool IsPlainPackageFile(const std::filesystem::path& path) {
+  const auto attributes = GetFileAttributesW(path.c_str());
+  return attributes != INVALID_FILE_ATTRIBUTES &&
+      (attributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) == 0;
+}
+
+bool SameWindowsPackagePath(const std::filesystem::path& left, const std::filesystem::path& right) {
+  const auto a = std::filesystem::absolute(left).lexically_normal().make_preferred().wstring();
+  const auto b = std::filesystem::absolute(right).lexically_normal().make_preferred().wstring();
+  return CompareStringOrdinal(a.c_str(), -1, b.c_str(), -1, TRUE) == CSTR_EQUAL;
+}
+
+bool PromotePackage(HWND hwnd, const PackerConfig& live, const PackerConfig& staged,
+                    PackageWorkspace& workspace, const FileRenamer& renameFile) {
+  const auto target = PackageFolder(live);
+  const auto backup = workspace.Root() / "previous";
+  std::filesystem::create_directory(backup);
+  struct Move {
+    std::filesystem::path from;
+    std::filesystem::path to;
+    bool done{false};
+  };
+  std::vector<Move> oldFiles;
+  std::vector<Move> newFiles;
+  auto addOld = [&](const std::filesystem::path& file) {
+    if (!IsPlainPackageFile(file)) throw std::runtime_error("Previous package output is not a plain file");
+    if (std::none_of(oldFiles.begin(), oldFiles.end(), [&](const Move& move) { return SameWindowsPackagePath(move.from, file); })) {
+      oldFiles.push_back({file, backup / file.filename()});
+    }
+  };
+  if (live.archiveFirst) {
+    for (const auto* extension : {L".7z", L".zip"}) {
+      for (const auto& file : FindArchiveOutputsAndTemps(target, live.archiveName + extension)) addOld(file);
+    }
+  }
+  const auto manifest = target / "manifest.json";
+  if (std::filesystem::exists(manifest)) addOld(manifest);
+  for (const auto& entry : std::filesystem::directory_iterator(PackageFolder(staged))) {
+    if (!IsPlainPackageFile(entry.path())) throw std::runtime_error("Staged output is not a plain file");
+    if (!live.archiveFirst && entry.path().filename() != "manifest.json" &&
+        entry.path().filename() != "modlist-installer.exe") {
+      throw std::runtime_error("Manifest Only cannot promote archive or unrelated files");
+    }
+    const auto destination = target / entry.path().filename();
+    if (std::filesystem::exists(destination)) {
+      if (entry.path().filename() == "modlist-installer.exe") addOld(destination);
+      else if (std::none_of(oldFiles.begin(), oldFiles.end(), [&](const Move& move) { return SameWindowsPackagePath(move.from, destination); })) {
+        throw std::runtime_error("Publication would overwrite an unrelated output");
+      }
+    }
+    newFiles.push_back({entry.path(), destination});
+  }
+  // Publish the manifest last so incomplete promotion cannot advertise a ready replacement.
+  std::sort(newFiles.begin(), newFiles.end(), [](const Move& a, const Move& b) {
+    if ((a.to.filename() == "manifest.json") != (b.to.filename() == "manifest.json")) {
+      return b.to.filename() == "manifest.json";
+    }
+    return a.to < b.to;
+  });
+  std::ofstream journal(workspace.Root() / "promotion-journal.txt", std::ios::binary);
+  journal << "Package: " << Narrow(target.wstring()) << "\nRestore previous/ files to the package if rollback was interrupted.\n";
+  for (const auto& move : oldFiles) journal << "OLD " << Narrow(move.from.wstring()) << " -> " << Narrow(move.to.wstring()) << '\n';
+  for (const auto& move : newFiles) journal << "NEW " << Narrow(move.from.wstring()) << " -> " << Narrow(move.to.wstring()) << '\n';
+  journal.close();
+  if (!journal) throw std::runtime_error("Unable to close promotion journal");
 
   bool ok = true;
-  uint64_t unpackedSize = 0;
-  if (config.archiveFirst) {
-    PostLog(hwnd, L"Creating archive...");
-    PostLog(hwnd, L"Archive output folder: " + PackageFolder(config).wstring());
-    PostLog(hwnd, L"7-Zip command: " + BuildSevenZipCommand(config));
-    unpackedSize = EstimateFolderBytes(hwnd, config.sourceFolder);
-    if (unpackedSize > 0) {
-      PostLog(hwnd, L"Packing input size estimate (uncompressed source): " + FormatBytes(unpackedSize));
-    }
-    if (!g_cancelRequested) {
-      PostStatus(hwnd, L"Starting 7-Zip...");
-      const int exitCode = RunProcess(hwnd,
-                                      BuildSevenZipCommand(config),
-                                      L"Packing archive",
-                                      unpackedSize,
-                                      config.memoryLimitPercent);
-      if (exitCode != 0) {
-        PostLog(hwnd, L"7-Zip failed with exit code " + std::to_wstring(exitCode));
-        ok = false;
-      } else {
-        PostLog(hwnd, L"Archive creation completed.");
-      }
-    }
-    if (ok && config.testArchive && !g_cancelRequested) {
-      PostLog(hwnd, L"Testing archive...");
-      PostStatus(hwnd, L"Starting archive test...");
-      uint64_t archiveBytes = 0;
-      for (const auto& file : FindArchivePartsForBase(PackageFolder(config), config.archiveName + SelectArchiveExtension(config))) {
+  try {
+    for (auto* moves : {&oldFiles, &newFiles}) {
+      for (auto& move : *moves) {
+        if (g_cancelRequested) { ok = false; break; }
         std::error_code ec;
-        archiveBytes += std::filesystem::file_size(file, ec);
+        renameFile(move.from, move.to, ec);
         if (ec) {
-          ec.clear();
+          PostLog(hwnd, L"Package promotion failed: " + move.from.wstring() + L" - " + Widen(ec.message()));
+          ok = false;
+          break;
+        }
+        move.done = true;
+      }
+      if (!ok) break;
+    }
+    if (g_cancelRequested) ok = false;
+  } catch (const std::exception& error) {
+    PostLog(hwnd, L"Package promotion failed: " + Widen(error.what()));
+    ok = false;
+  }
+  if (ok) return true;
+
+  bool restored = true;
+  for (auto* moves : {&newFiles, &oldFiles}) {
+    for (auto it = moves->rbegin(); it != moves->rend(); ++it) {
+      if (!it->done) continue;
+      try {
+        std::error_code ec;
+        renameFile(it->to, it->from, ec);
+        if (ec) restored = false;
+      } catch (...) { restored = false; }
+    }
+  }
+  if (!restored) workspace.Retain();
+  else PostLog(hwnd, L"Previous package restored after unsuccessful promotion.");
+  return false;
+}
+
+void ReportWorkerOutcome(HWND hwnd, bool committed, bool cancelled) {
+  PostProgress(hwnd, committed ? 100 : 0);
+  const std::wstring status = committed ? L"Package ready" : cancelled ? L"Stopped" : L"Package build failed";
+  PostStatus(hwnd, status);
+  PostLog(hwnd, status + L".");
+}
+
+void Worker(HWND hwnd, PackerConfig config, const WorkerDependencies& dependencies = {}) {
+  g_workerRunning = true;
+  PostProgress(hwnd, 0);
+  struct Finished {
+    HWND hwnd;
+    bool committed{false};
+    ~Finished() {
+      ReportWorkerOutcome(hwnd, committed, g_cancelRequested.load());
+      g_workerRunning = false;
+      PostMessageW(hwnd, kWorkerFinishedMessage, 0, 0);
+    }
+  } finished{hwnd};
+  try {
+    bool ok = true;
+    uint64_t unpackedSize = 0;
+    if (g_cancelRequested || !ResolveSevenZip(hwnd, config) || !ValidateConfig(hwnd, config)) return;
+    if (config.copyInstaller && !IsPlainPackageFile(dependencies.installerSourceFolder / "modlist-installer.exe")) {
+      PostLog(hwnd, L"Unable to prepare setup: modlist-installer.exe was not found beside modlist-packer.exe.");
+      return;
+    }
+    const auto liveConfig = config;
+    std::unique_ptr<PackageWorkspace> workspace;
+    if (config.archiveFirst) {
+      unpackedSize = EstimateFolderBytes(hwnd, config.sourceFolder);
+      if (g_cancelRequested) return;
+    }
+    // Manifest Only reserves metadata/installer space, without copying its live archive inputs.
+    const auto available = std::filesystem::space(config.releaseFolder).available;
+    const uint64_t overhead = std::max<uint64_t>(16ull * 1024 * 1024, unpackedSize / 16);
+    const uint64_t installerSize = config.copyInstaller
+        ? std::filesystem::file_size(dependencies.installerSourceFolder / "modlist-installer.exe") : 0;
+    if (available < overhead || installerSize > available - overhead ||
+        unpackedSize > available - overhead - installerSize) {
+      PostLog(hwnd, L"Insufficient free space for a replacement alongside the previous package; previous package unchanged.");
+      return;
+    }
+    workspace = std::make_unique<PackageWorkspace>(hwnd, config.releaseFolder);
+    config.releaseFolder = workspace->Root() / "replacement";
+    PostLog(hwnd, L"Building replacement in owned workspace: " + workspace->Root().wstring());
+    if (!PrepareInstallerSetup(hwnd, config, dependencies.installerSourceFolder)) return;
+    if (config.archiveFirst) {
+      PostLog(hwnd, L"Creating archive...");
+      PostLog(hwnd, L"Archive output folder: " + PackageFolder(config).wstring());
+      PostLog(hwnd, L"7-Zip command: " + BuildSevenZipCommand(config));
+      if (unpackedSize > 0) {
+        PostLog(hwnd, L"Packing input size estimate (uncompressed source): " + FormatBytes(unpackedSize));
+      }
+      if (!g_cancelRequested) {
+        PostStatus(hwnd, L"Starting 7-Zip...");
+        const int exitCode = RunProcess(hwnd,
+                                        BuildSevenZipCommand(config),
+                                        L"Packing archive",
+                                        unpackedSize,
+                                        config.memoryLimitPercent);
+        if (exitCode != 0) {
+          PostLog(hwnd, L"7-Zip failed with exit code " + std::to_wstring(exitCode));
+          ok = false;
+        } else {
+          PostLog(hwnd, L"Archive creation completed.");
         }
       }
-      const int testExitCode = RunProcess(hwnd, BuildSevenZipTestCommand(config), L"Testing archive", archiveBytes);
-      if (testExitCode != 0) {
-        PostLog(hwnd, L"7-Zip test failed with exit code " + std::to_wstring(testExitCode));
-        ok = false;
-      } else {
-        PostLog(hwnd, L"Archive test completed.");
+      if (ok && config.testArchive && !g_cancelRequested) {
+        PostLog(hwnd, L"Testing archive...");
+        PostStatus(hwnd, L"Starting archive test...");
+        uint64_t archiveBytes = 0;
+        for (const auto& file : FindArchivePartsForBase(PackageFolder(config), config.archiveName + SelectArchiveExtension(config))) {
+          std::error_code ec;
+          archiveBytes += std::filesystem::file_size(file, ec);
+          if (ec) {
+            ec.clear();
+          }
+        }
+        const int testExitCode = RunProcess(hwnd, BuildSevenZipTestCommand(config), L"Testing archive", archiveBytes);
+        if (testExitCode != 0) {
+          PostLog(hwnd, L"7-Zip test failed with exit code " + std::to_wstring(testExitCode));
+          ok = false;
+        } else {
+          PostLog(hwnd, L"Archive test completed.");
+        }
       }
     }
-  }
 
-  if (ok && !g_cancelRequested) {
-    ok = WriteManifest(hwnd, config, unpackedSize);
+    if (ok && !g_cancelRequested) {
+      const auto& manifestInput = config.archiveFirst ? config : liveConfig;
+      ok = WriteManifest(hwnd, manifestInput, unpackedSize, dependencies.closeManifest, PackageFolder(config));
+    }
+    if (ok && !g_cancelRequested && workspace) {
+      finished.committed = PromotePackage(hwnd, liveConfig, config, *workspace, dependencies.renameFile);
+    }
+  } catch (const std::exception& error) {
+    PostLog(hwnd, L"Package build failed: " + Widen(error.what()));
   }
-
-  if (g_cancelRequested) {
-    PostLog(hwnd, L"Stopped.");
-    PostStatus(hwnd, L"Stopped");
-  } else if (ok) {
-    PostLog(hwnd, L"Package ready.");
-    PostStatus(hwnd, L"Package ready");
-  }
-  g_workerRunning = false;
-  PostMessageW(hwnd, kWorkerFinishedMessage, 0, 0);
 }
 
 HWND CreateLabel(HWND parent, const wchar_t* text, int x, int y, int w, int h) {
@@ -1670,7 +1903,9 @@ void StartWork(HWND hwnd, bool archiveFirst) {
     return;
   }
   EnableRunningControls(hwnd, true);
-  std::thread(Worker, hwnd, ReadConfig(archiveFirst)).detach();
+  g_cancelRequested = false;
+  g_workerRunning = true;
+  std::thread([hwnd, config = ReadConfig(archiveFirst)] { Worker(hwnd, config); }).detach();
 }
 
 void SetDefaults(HWND hwnd) {

@@ -29,6 +29,21 @@ InstallerApp\build\windows\x64\release\modlist-installer-gui.exe
 
 Place it beside `manifest.json` and the archive parts in an archive-named folder. Theme, translations, 7-Zip, and its license are embedded in the executable. The GUI does not use torrent files.
 
+Windows builds statically link the Microsoft C/C++ runtime; end users do not need
+the VC++ Redistributable for the installer, packer or embedded 7-Zip tools. xmake
+uses `MT` consistently, including the optional release-built static dependencies;
+CMake uses the static runtime matching its Release/Debug configuration. Release
+scripts check the actual EXE and embedded-tool DLL imports before distribution.
+The check can also be run directly with
+`scripts/test-runtime-dependencies.ps1 -Binary <exe-or-dll>` (requires Visual C++
+build tools on the build machine, not the end user's PC).
+
+The verified SDK path supports 7z and ZIP, split or unsplit, using the matching
+format handler. Hash metadata alone does not establish format support. Archive
+open and extraction must return `S_OK`; correctly hashed nonarchives and failed
+handler opens cannot be reported as successful empty installations. Genuinely
+opened empty archives remain valid.
+
 The `Install` button runs the install pipeline on a background thread:
 
 - load `manifest.json` beside the executable (or the legacy `data\package\manifest.json` layout)
@@ -59,6 +74,20 @@ For example, choosing `D:\Folder1\folder2\folder3` always installs into `D:\Fold
 
 The chosen extraction and install folders must be empty before installation begins. On different volumes, the installer also requires enough destination space for the full unpacked payload. Manifests without `unpacked_size` remain supported and use the archive size as an approximate compatibility fallback.
 
+Staging ownership is recorded in a locked `staging-owner\owner` file in the
+stage-specific Local AppData runtime cache, not inside or beside the payload.
+This avoids drive-root file permissions and collisions with valid archive names.
+Claims are persisted as pending before the final empty/identity check, then committed.
+Pending or truncated records never authorize cleanup; nonempty pending claims need
+manual inspection. Installation and cleanup refuse overlap with the runtime cache.
+Only leftovers with matching package/directory ownership are eligible for staging
+cleanup; arbitrary existing `Unpacking` contents are never adopted as installer
+files. A selected final folder can still be overwritten after explicit confirmation.
+Cleanup refuses redirected roots/ancestors, volume roots, nested links and changed
+folder identities. An active staging session cannot be cleaned by another session.
+Successful staged installation removes its owned empty staging folder and ownership metadata.
+Old unmarked staging contents require manual inspection rather than automatic deletion.
+
 ## Ready Binary
 
 The ready exe is placed at:
@@ -66,6 +95,9 @@ The ready exe is placed at:
 ```text
 InstallerApp\dist\modlist-installer.exe
 ```
+
+The v0.3.7 Windows installer statically links the Microsoft C/C++ runtime. It
+does not require a separately installed VC++ Redistributable or WebView2.
 
 The runtime layout is:
 
@@ -99,6 +131,26 @@ SHA-256 validation remains enabled.
 See [diagnostic instructions](src/diagnostics/README.md) for disk-space requirements,
 cache/timing caveats, retained data, and the logs to collect. It is not part of a
 normal installer release.
+
+For a small packer-to-installer regression, build `installer_workflow_tests` and
+run `scripts\test-install-worker.ps1` with a flat package, its source payload and
+fresh work/output parents. It runs the actual install worker in direct/staged
+modes without desktop automation, then compares complete payload hashes and empty
+directories outside the worker. It does not touch real Documents/game folders.
+
+For an existing chunk-validated package, build `pipeline_smoke` and use
+`scripts\run-existing-smoke.ps1`. It resolves the first archive part through
+`ManifestLoader`, not `files[]` order. Legacy sequential manifests are rejected
+before timing. Input package files remain read-only: the corruption test copies
+the whole package into a fresh folder below `Reports` and changes only that copy.
+Allow additional free space equal to the archive size for this retained fixture;
+fixture-copy failure stops the test and never falls back to changing the input.
+Keep outputs/reports outside the package, use a new output parent, and retain
+separate output space for all extraction attempts.
+
+Build `pipeline_smoke` and `smoke_script_driver`, then run
+`tests\test_smoke_helpers.ps1` for small source-safety/archive-selection regression
+tests, including copy failure and forced process termination.
 
 ## Change Theme And Text
 

@@ -1,7 +1,7 @@
 {
   "window_title": "Modlist Installer Beta",
   "app_title": "Modlist Installer Beta",
-  "app_version": "Modlist Installer v0.3.6 by WallHead",
+  "app_version": "Modlist Installer v0.3.7 by WallHead",
   "unpack_note": "Установщик проверит пути в архиве и распакует файлы прямо в папку установки, если пути достаточно короткие. Иначе он использует временную папку, затем перенесет файлы.",
   "unpack_drive_label": "Диск для распаковки",
   "install_folder_label": "Папка установки",
@@ -28,6 +28,9 @@
   "drive_unavailable_title": "Диск недоступен",
   "drive_unavailable_message": "Не найден доступный диск для распаковки.",
   "cleanup_title": "Очистить папки?",
+  "cleanup_safe_intro": "Подтвердите удаление файлов из указанных папок:",
+  "cleanup_owned_staging": "Рабочая папка этого пакета (подтверждена меткой владельца):",
+  "cleanup_explicit_final": "Выбранная итоговая папка будет полностью перезаписана. Все её файлы будут удалены:",
   "cleanup_intro": "После предыдущей неудачной или остановленной установки остались файлы:",
   "cleanup_unpack_folder": "Папка распаковки:",
   "cleanup_install_folder": "Папка установки:",

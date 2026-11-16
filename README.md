@@ -18,10 +18,10 @@ PackerApp/dist/modlist-packer.exe
 Ready-to-use versioned release archives are written to:
 
 ```text
-Release/ModlistInstaller-v0.3.6.zip
+Release/ModlistInstaller-v0.3.7.zip
 ```
 
-Download [v0.3.6](https://github.com/wallhead/ModListInstaller/releases/tag/v0.3.6), extract the ZIP, and run `modlist-packer.exe` inside its folder. The archive includes the matching installer, README, and 7-Zip license. No external UI files or browser runtime are needed. Published older ZIPs retain their original layout; current releases use the flat layout below.
+Download [v0.3.7](https://github.com/wallhead/ModListInstaller/releases/tag/v0.3.7), extract the ZIP, and run `modlist-packer.exe` inside its folder. The archive includes the matching installer, README, and 7-Zip license. No separate VC++ Redistributable, browser runtime, or external UI files are needed. Published older ZIPs retain their original layout; current releases use the flat layout below.
 
 ## Installer Runtime Layout
 
@@ -51,7 +51,7 @@ The installer reads `manifest.json` and archive parts beside its executable. UI 
 - Longer paths or unavailable archive metadata use the short `<drive>:\Unpacking` staging folder on the install volume.
 - Unpacked payload size recorded in new manifests for accurate free-space checks.
 - Same-volume installs reserve extraction space once; cross-volume installs also check the destination for the full payload.
-- Existing files in the unpack or final install folder require explicit confirmation before their contents are permanently removed and installation restarts.
+- Cleanup of installer-owned staging leftovers or an existing final install requires confirmation. Unowned staging, redirected folders and changed folder identities are refused.
 - Before installation, the installer uses the Windows Documents known folder and ensures `My Games\Skyrim Special Edition` and `My Games\Fallout4` exist.
 - Live validation, extraction, and install progress with status text.
 - Same-drive installs use move/cut semantics automatically when possible.
@@ -72,7 +72,7 @@ Use Relative paths when packing. Absolute paths (`-spf` and `-spf2`) are rejecte
 4. Run its `modlist-installer.exe` and select an install root.
 5. Press `Install`. The final folder is `<install root>\<archive_name>`; the installer chooses direct extraction or `<drive>:\Unpacking` after checking the archive paths.
 
-If the chosen extraction folder or the final `<install root>\<archive_name>` folder contains files, the installer offers to permanently clear the affected folders before installing. Direct installs do not check or clear the unused `<drive>:\Unpacking` folder. The install root itself may contain other folders. The packer removes older outputs for the selected archive name before building, and rejects source and release folders that overlap.
+If the final `<install root>\<archive_name>` contains files, the installer asks before clearing it. For staged installs it offers to clear only leftovers it can identify as belonging to that package; direct installs leave the unused `<drive>:\Unpacking` folder alone. The packer builds a replacement before publishing it, preserves the existing package on build failure, and rejects overlapping source and release folders.
 
 ## Build
 

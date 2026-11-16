@@ -22,6 +22,10 @@ try {
     throw "Installer exe not found: $InstallerExe. Run InstallerApp\scripts\build-release.ps1 first."
   }
 
+  & (Join-Path $RepoRoot "InstallerApp\scripts\test-runtime-dependencies.ps1") -Binary @(
+    ".\build\windows\x64\release\modlist-packer.exe", $InstallerExe,
+    ".\resources\7zip\7z.exe", ".\resources\7zip\7z.dll")
+
   Copy-Item -LiteralPath $InstallerExe -Destination ".\dist\modlist-installer.exe" -Force
 
   Get-Item ".\dist\modlist-packer.exe", ".\dist\modlist-installer.exe"

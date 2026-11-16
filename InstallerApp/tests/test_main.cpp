@@ -16,10 +16,12 @@
 
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <chrono>
 #include <iomanip>
 #include <iostream>
 #include <sstream>
+#include <set>
 #include <stdexcept>
 #include <vector>
 
@@ -741,6 +743,153 @@ void TestInstallerHidesManualUnpackControls() {
          "Native view still paints the manual unpack target");
 }
 
+Manifest WriteFormatContractManifest(const std::filesystem::path& folder, uint64_t unpackedSize) {
+  std::vector<std::filesystem::path> parts;
+  for (const auto& entry : std::filesystem::directory_iterator(folder)) {
+    if (entry.is_regular_file() && entry.path().filename() != "manifest.json") parts.push_back(entry.path());
+  }
+  std::sort(parts.begin(), parts.end());
+  Expect(!parts.empty(), "Format fixture has no archive files");
+  std::ofstream json(folder / "manifest.json", std::ios::binary);
+  json << "{\"schema\":\"modlist-manifest-chunks-v1\",\"archive_name\":\"Fixture\","
+       << "\"unpacked_size\":" << unpackedSize << ",\"hash\":{\"algorithm\":\"sha256\",\"chunk_size\":65536},\"files\":[";
+  for (size_t index = 0; index < parts.size(); ++index) {
+    if (index) json << ',';
+    json << "{\"path\":\"" << PathToUtf8(parts[index].filename()) << "\",\"size\":"
+         << std::filesystem::file_size(parts[index]) << ",\"sha256\":\""
+         << Sha256::FileHexDigest(parts[index]).value() << "\",\"chunks\":[";
+    const auto hashes = ChunkHashes(parts[index], 65536);
+    for (size_t chunk = 0; chunk < hashes.size(); ++chunk) {
+      if (chunk) json << ',';
+      json << '"' << hashes[chunk] << '"';
+    }
+    json << "]}";
+  }
+  json << "]}";
+  json.close();
+  Expect(static_cast<bool>(json), "Cannot complete format fixture manifest");
+  const auto loaded = ManifestLoader{}.LoadFromFile(folder / "manifest.json");
+  Expect(loaded.ok(), loaded.error().c_str());
+  return loaded.value();
+}
+
+void TestArchiveFormatContract() {
+  const auto root = std::filesystem::temp_directory_path() /
+      (L"mi-format-" + std::to_wstring(GetCurrentProcessId()) + L"-" + std::to_wstring(GetTickCount64()));
+  Expect(std::filesystem::create_directory(root), "Format test root already exists");
+  const auto source = root / "source";
+  std::filesystem::create_directories(source / "empty" / "nested");
+  const auto unicode = std::filesystem::path(L"\u0422\u0435\u0441\u0442.txt");
+  { std::ofstream text(source / unicode, std::ios::binary); text << "archive contract"; }
+  { std::ofstream empty(source / "empty.bin", std::ios::binary); }
+  std::vector<char> payload(2 * 1024 * 1024);
+  uint32_t state = 421;
+  for (auto& ch : payload) {
+    state ^= state << 13; state ^= state >> 17; state ^= state << 5;
+    ch = static_cast<char>(state);
+  }
+  { std::ofstream file(source / "payload.bin", std::ios::binary); file.write(payload.data(), payload.size()); }
+  const auto sevenZip = std::filesystem::current_path() / "resources" / "7z.exe";
+  PipelinedSevenZipExtractor extractor;
+  const auto library = extractor.LocateLibrary(root / "sdk");
+  Expect(library.ok(), library.error().c_str());
+  bool failed = false;
+  const auto run = [&](const char* name, const std::function<void()>& test) {
+    try { test(); std::cout << "PASS format contract: " << name << '\n'; }
+    catch (const std::exception& error) { failed = true; std::cerr << "FAIL format contract: " << name << ": " << error.what() << '\n'; }
+  };
+  for (const auto* extension : {".7z", ".zip"}) {
+    run(extension, [&] {
+      const auto folder = root / (std::string("invalid") + extension);
+      std::filesystem::create_directory(folder);
+      { std::ofstream junk(folder / (std::string("Fixture") + extension), std::ios::binary); junk << "not an archive"; }
+      const auto manifest = WriteFormatContractManifest(folder, 14);
+      PipelinedExtractionConfig config;
+      config.sevenZipLibrary = library.value(); config.archiveFolder = folder;
+      config.installFolder = root / (std::string("invalid-output") + extension); config.manifest = &manifest;
+      const auto result = extractor.Extract(config);
+      Expect(!result.ok, "Correctly hashed nonarchive was reported as a successful extraction");
+      Expect(!std::filesystem::exists(config.installFolder), "Rejected archive created an output folder");
+      Expect(!extractor.PlanExtraction(config, config.installFolder, root / "staging").ok(),
+             "Nonarchive was accepted for archive path inspection");
+    });
+  }
+  struct FormatCase { const char* name; const wchar_t* type; const wchar_t* extension; bool split; };
+  for (const auto& item : {FormatCase{"7z", L"7z", L".7z", false},
+                           FormatCase{"7z-split", L"7z", L".7z", true},
+                           FormatCase{"zip", L"zip", L".zip", false},
+                           FormatCase{"zip-split", L"zip", L".zip", true},
+                           FormatCase{"ZIP-uppercase", L"zip", L".ZIP", false}}) {
+    run(item.name, [&] {
+      const auto folder = root / item.name;
+      std::filesystem::create_directory(folder);
+      const auto archive = folder / (std::wstring(L"Fixture") + item.extension);
+      const auto args = L"a " + QuoteCommandArgument(archive) + L" * -t" + item.type +
+          L" -mx=1 -mmt=2 -y -bb0 -bsp0" + (item.split ? L" -v1m" : L"");
+      Expect(RunProcess(sevenZip, args, source), "Cannot create archive format fixture");
+      const auto manifest = WriteFormatContractManifest(folder, payload.size() + 16);
+      Expect(!item.split || manifest.files.size() > 1, "Split format fixture has one volume");
+      Expect(PipelinedSevenZipExtractor::CanUse(manifest), "Advertised archive format cannot use verified extraction");
+      PipelinedExtractionConfig config;
+      config.sevenZipLibrary = library.value(); config.archiveFolder = folder;
+      config.installFolder = root / (std::string(item.name) + "-output"); config.manifest = &manifest;
+      const auto plan = extractor.PlanExtraction(config, config.installFolder, root / "staging");
+      Expect(plan.ok() && plan.value().direct && plan.value().entryCount == 5,
+             "Format handler did not inspect the expected files and directories");
+      PipelineExtractionProgress final;
+      const auto result = extractor.Extract(config, [&](const auto& progress) { final = progress; });
+      Expect(result.ok, result.message.c_str());
+      Expect(final.validatedBytes == final.validationTotalBytes && final.extractionPercent == 100,
+             "Format extraction did not finish full input validation");
+      std::set<std::filesystem::path> actual;
+      for (const auto& entry : std::filesystem::recursive_directory_iterator(config.installFolder))
+        actual.insert(entry.path().lexically_relative(config.installFolder));
+      const std::set<std::filesystem::path> expected = {unicode, "payload.bin", "empty.bin", "empty", "empty/nested"};
+      Expect(actual == expected, "Successful extraction did not install the exact payload inventory");
+      for (const auto& relative : {unicode, std::filesystem::path("payload.bin"), std::filesystem::path("empty.bin")}) {
+        Expect(Sha256::FileHexDigest(source / relative).value() == Sha256::FileHexDigest(config.installFolder / relative).value(),
+               "Extracted payload differs from its source");
+      }
+    });
+  }
+  run("wrong handler", [&] {
+    const auto folder = root / "mislabeled";
+    std::filesystem::create_directory(folder);
+    std::filesystem::copy_file(root / "zip" / "Fixture.zip", folder / "Fixture.7z");
+    const auto manifest = WriteFormatContractManifest(folder, payload.size() + 16);
+    PipelinedExtractionConfig config;
+    config.sevenZipLibrary = library.value(); config.archiveFolder = folder;
+    config.installFolder = root / "mislabeled-output"; config.manifest = &manifest;
+    Expect(!extractor.Extract(config).ok && !std::filesystem::exists(config.installFolder),
+           "Wrong-format input was accepted as a zero-item installation");
+    Expect(!extractor.PlanExtraction(config, config.installFolder, root / "staging").ok(),
+           "Wrong-format input was accepted for path inspection");
+  });
+  for (const auto* format : {L"7z", L"zip"}) {
+    run("genuine empty archive", [&] {
+      const auto folder = root / (std::wstring(L"empty-") + format);
+      const auto emptySource = root / (std::wstring(L"empty-source-") + format);
+      std::filesystem::create_directory(folder);
+      std::filesystem::create_directory(emptySource);
+      const auto archive = folder / (std::wstring(L"Fixture.") + format);
+      Expect(RunProcess(sevenZip, L"a " + QuoteCommandArgument(archive) + L" * -t" + format + L" -y -bb0 -bsp0", emptySource),
+             "Cannot create a genuinely empty archive");
+      const auto manifest = WriteFormatContractManifest(folder, 0);
+      PipelinedExtractionConfig config;
+      config.sevenZipLibrary = library.value(); config.archiveFolder = folder;
+      config.installFolder = root / (std::wstring(L"empty-output-") + format); config.manifest = &manifest;
+      const auto plan = extractor.PlanExtraction(config, config.installFolder, root / "staging");
+      Expect(plan.ok() && plan.value().entryCount == 0, "A valid empty archive must open with zero entries");
+      PipelineExtractionProgress final;
+      const auto result = extractor.Extract(config, [&](const auto& progress) { final = progress; });
+      Expect(result.ok && std::filesystem::is_empty(config.installFolder), "A genuine opened empty archive was rejected");
+      Expect(final.validatedBytes == final.validationTotalBytes, "Empty archive input was not fully verified");
+    });
+  }
+  std::cout << "Format fixtures retained: " << root << '\n';
+  Expect(!failed, "Archive format contract regression failed");
+}
+
 void TestPipelinedExtractor() {
   const auto root = std::filesystem::temp_directory_path() / "modlist_pipeline_integration";
   std::filesystem::remove_all(root);
@@ -1211,6 +1360,7 @@ int main() {
     TestInstallMoveFailureProvidesManualRecoveryPaths();
     TestInstallerHidesManualUnpackControls();
     TestPipelineDoesNotForcePerFileFlush();
+    TestArchiveFormatContract();
     TestPipelinedExtractor();
 #endif
     TestPackageDiscovery();

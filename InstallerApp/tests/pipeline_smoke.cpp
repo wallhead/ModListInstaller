@@ -1,6 +1,7 @@
 #include "extractor/PipelinedSevenZipExtractor.h"
 #include "manifest/Manifest.h"
 #include "verifier/Sha256.h"
+#include "common/PathText.h"
 
 #include <windows.h>
 #include <atomic>
@@ -12,19 +13,27 @@
 #include <stdexcept>
 #include <vector>
 
+void WriteJsonString(std::ostream& out, const std::string& value) {
+  out << '"';
+  for (const unsigned char ch : value) {
+    if (ch == '"' || ch == '\\') out << '\\' << ch;
+    else if (ch < 0x20) {
+      out << "\\u" << std::hex << std::setw(4) << std::setfill('0')
+          << static_cast<unsigned>(ch) << std::dec;
+    } else out << ch;
+  }
+  out << '"';
+}
+
 int wmain(int argc, wchar_t** argv) {
   try {
     if (argc < 3 || argc > 4) {
-      throw std::runtime_error("Usage: pipeline_smoke <manifest.json> <new-output-folder> [cancel-percent]");
+      throw std::runtime_error("Usage: pipeline_smoke <manifest.json> <new-output-folder> [cancel-percent], or --describe-package <manifest.json>");
     }
-    const std::filesystem::path manifestPath(argv[1]);
-    const std::filesystem::path output(argv[2]);
-    if (!manifestPath.is_absolute() || !output.is_absolute() || std::filesystem::exists(output)) {
-      throw std::runtime_error("Use absolute paths and an output folder that does not exist");
-    }
-    const int cancelPercent = argc == 4 ? std::stoi(argv[3]) : -1;
-    if (argc == 4 && (cancelPercent < 1 || cancelPercent > 99)) {
-      throw std::runtime_error("Cancellation percentage must be between 1 and 99");
+    const bool describe = argc == 3 && std::wstring_view(argv[1]) == L"--describe-package";
+    const std::filesystem::path manifestPath(argv[describe ? 2 : 1]);
+    if (!manifestPath.is_absolute()) {
+      throw std::runtime_error("Use an absolute manifest path");
     }
     modlist::ManifestLoader loader;
     auto manifest = loader.LoadFromFile(manifestPath);
@@ -32,6 +41,22 @@ int wmain(int argc, wchar_t** argv) {
       throw std::runtime_error(manifest.error());
     }
     modlist::PipelinedSevenZipExtractor extractor;
+    if (describe) {
+      std::cout.imbue(std::locale::classic());
+      std::cout << "{\"first_archive_part\":";
+      WriteJsonString(std::cout, modlist::GenericPathToUtf8(manifest.value().extract.firstArchivePart));
+      std::cout << ",\"pipeline_supported\":" << (extractor.CanUse(manifest.value()) ? "true" : "false")
+                << ",\"payload_bytes\":" << manifest.value().unpackedSize << "}\n";
+      return 0;
+    }
+    const std::filesystem::path output(argv[2]);
+    if (!output.is_absolute() || std::filesystem::exists(output)) {
+      throw std::runtime_error("Use absolute paths and an output folder that does not exist");
+    }
+    const int cancelPercent = argc == 4 ? std::stoi(argv[3]) : -1;
+    if (argc == 4 && (cancelPercent < 1 || cancelPercent > 99)) {
+      throw std::runtime_error("Cancellation percentage must be between 1 and 99");
+    }
     if (!extractor.CanUse(manifest.value())) {
       throw std::runtime_error("Manifest requires full chunked validation");
     }

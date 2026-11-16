@@ -8,6 +8,7 @@
 #include "extractor/SevenZipExtractor.h"
 #include "manifest/Manifest.h"
 #include "paths/PathValidator.h"
+#include "paths/FolderCleanup.h"
 #include "paths/WindowsFileMove.h"
 #include "resource.h"
 #include "ui/NativeInstallerView.h"
@@ -115,6 +116,8 @@ std::wstring g_archiveFolderName;
 struct PendingFolderCleanup {
   std::filesystem::path unpackFolder;
   std::filesystem::path installFolder;
+  std::optional<modlist::FolderCleanupTicket> unpackTicket;
+  std::optional<modlist::FolderCleanupTicket> installTicket;
 
   bool empty() const {
     return unpackFolder.empty() && installFolder.empty();
@@ -415,6 +418,14 @@ std::wstring PackageOverlapMessage(const std::filesystem::path& target) {
       L"Пакет: " + PathToDisplay(ExeFolder()) + L"\nИтоговый путь: " + PathToDisplay(target) +
       L"\n\nВыберите другую папку установки или сначала переместите папку пакета в другое место. "
       L"Например, пакет D:\\Games\\Sky нельзя установить в D:\\Games\\Sky; выберите другой корневой каталог.";
+}
+
+std::optional<std::wstring> RuntimeOverlapError(const std::filesystem::path& folder) {
+  if (!folder.empty() && modlist::InstallationOverlapsRuntime(folder)) {
+    return L"Папка установки или распаковки пересекается со служебной папкой установщика.\n\n" +
+        PathToDisplay(folder) + L"\n\nВыберите папку вне служебного кэша ModlistInstaller и не содержащую его.";
+  }
+  return std::nullopt;
 }
 
 bool PackageManifestFileExists() {
@@ -1385,13 +1396,13 @@ void SendUiError(const std::wstring& title, const std::wstring& message) {
 
 void SendUiCleanupConfirm(const PendingFolderCleanup& folders) {
   std::wstring message = UiText(
-      "cleanup_intro", L"После предыдущей неудачной или остановленной установки остались файлы:");
+      "cleanup_intro", L"Подтвердите удаление файлов из указанных папок:");
   if (!folders.unpackFolder.empty()) {
-    message += L"\n\n" + UiText("cleanup_unpack_folder", L"Папка распаковки:") +
+    message += L"\n\n" + UiText("cleanup_owned_staging", L"Рабочая папка этого пакета (подтверждена меткой владельца):") +
                L"\n" + PathToDisplay(folders.unpackFolder);
   }
   if (!folders.installFolder.empty()) {
-    message += L"\n\n" + UiText("cleanup_install_folder", L"Папка установки:") +
+    message += L"\n\n" + UiText("cleanup_explicit_final", L"Выбранная итоговая папка будет полностью перезаписана. Все её файлы будут удалены:") +
                L"\n" + PathToDisplay(folders.installFolder);
   }
   message += L"\n\n" + UiText("cleanup_question", L"Очистить указанные папки и продолжить установку?");
@@ -1904,7 +1915,7 @@ std::optional<std::wstring> FolderMustBeEmptyError(const std::filesystem::path& 
     return label + L": невозможно проверить содержимое - " + Widen(ec.message());
   }
   if (!empty) {
-    return label + L" должна быть пустой. Удалите файлы от предыдущей или незавершённой установки.";
+    return label + L" должна быть пустой. Выберите другую папку или проверьте её содержимое.";
   }
   return std::nullopt;
 }
@@ -2599,6 +2610,12 @@ bool InstallEntry(HWND hwnd,
 }
 
 bool InstallExtractedFiles(HWND hwnd, const std::filesystem::path& unpackFolder, const std::filesystem::path& installFolder) {
+  for (const auto& folder : {unpackFolder, installFolder}) {
+    if (const auto error = RuntimeOverlapError(folder); error.has_value()) {
+      PostLog(hwnd, *error);
+      return false;
+    }
+  }
   PostProgress(hwnd, 95);
   PostStatus(hwnd, L"Установка 0%");
   if (IsSameFolder(unpackFolder, installFolder)) {
@@ -2690,11 +2707,7 @@ bool InstallExtractedFiles(HWND hwnd, const std::filesystem::path& unpackFolder,
     }
   }
 
-  std::filesystem::remove(unpackFolder, ec);
-  if (ec) {
-    PostLog(hwnd, L"Установка выполнена, но невозможно удалить папку распаковки: " +
-                      Widen(ec.message()));
-  }
+  // The session removes its pinned staging root after finalization ends.
 
   PostProgress(hwnd, 100);
   PostStatus(hwnd, L"Установка 100%");
@@ -2709,6 +2722,13 @@ void RunInstallWorker(HWND hwnd,
   g_workerRunning = true;
   PostProgress(hwnd, 0);
   PostLog(hwnd, L"Начало проверки...");
+  for (const auto& folder : {unpackFolder, installFolder}) {
+    if (const auto error = RuntimeOverlapError(folder); error.has_value()) {
+      PostLog(hwnd, *error);
+      FinishWorker(hwnd);
+      return;
+    }
+  }
 
   std::optional<modlist::Manifest> manifest;
   {
@@ -2796,6 +2816,26 @@ void RunInstallWorker(HWND hwnd,
     PostLog(hwnd, L"Распаковка и установка находятся на одном томе; вторая полная копия не требуется.");
   }
 
+  std::unique_ptr<modlist::StagingSession> stagingSession;
+  if (!IsSameFolder(unpackFolder, installFolder)) {
+    const auto packageId = modlist::Sha256::FileHexDigest(ManifestPath());
+    if (!packageId.ok()) {
+      PostLog(hwnd, L"Не удалось определить владельца рабочей папки: " + Widen(packageId.error()));
+      FinishWorker(hwnd);
+      return;
+    }
+    std::error_code createError;
+    std::filesystem::create_directories(unpackFolder, createError);
+    auto session = modlist::BeginOwnedStaging(unpackFolder, ExeFolder(), packageId.value());
+    if (createError || !session.ok()) {
+      PostLog(hwnd, L"Невозможно безопасно занять рабочую папку распаковки: " +
+          Widen(createError ? createError.message() : session.error()));
+      FinishWorker(hwnd);
+      return;
+    }
+    stagingSession = std::move(session.value());
+  }
+
   bool extracted = false;
   if (usePipeline) {
     modlist::PipelinedExtractionConfig extraction;
@@ -2825,7 +2865,14 @@ void RunInstallWorker(HWND hwnd,
     return;
   }
 
-  const bool installed = InstallExtractedFiles(hwnd, unpackFolder, installFolder);
+  bool installed = InstallExtractedFiles(hwnd, unpackFolder, installFolder);
+  if (installed && stagingSession) {
+    const auto completed = stagingSession->Complete();
+    if (!completed.ok()) {
+      PostLog(hwnd, L"Не удалось завершить рабочую сессию: " + Widen(completed.error()));
+      installed = false;
+    }
+  }
   PostProgress(hwnd, installed ? 100 : 0);
   FinishWorker(hwnd, installed);
 }
@@ -2845,11 +2892,46 @@ bool ValidateFolders(const SpaceRequirements& requirements = {},
     errors.push_back(message);
     ok = false;
   };
+  auto queueCleanup = [&](const std::filesystem::path& folder, bool staging) {
+    std::string packageIdentity;
+    if (staging) {
+      const auto packageId = modlist::Sha256::FileHexDigest(ManifestPath());
+      if (!packageId.ok()) {
+        addError(L"Не удалось проверить владельца рабочей папки распаковки: " + Widen(packageId.error()));
+        return;
+      }
+      packageIdentity = packageId.value();
+    }
+    const auto ticket = modlist::PrepareFolderCleanup(folder, ExeFolder(), staging
+        ? modlist::FolderCleanupKind::OwnedStaging
+        : modlist::FolderCleanupKind::ExplicitFinalOverwrite, packageIdentity);
+    if (!ticket.ok()) {
+      addError((staging
+          ? L"Рабочая папка не подтверждена как неактивная папка этого пакета. Автоматическая очистка запрещена. Выберите другой диск или проверьте файлы вручную:\n"
+          : L"Небезопасно перезаписывать итоговую папку. Ссылки, точки подключения и изменившиеся пути не допускаются:\n") +
+          PathToDisplay(folder) + L"\n\n" + Widen(ticket.error()));
+      return;
+    }
+    if (staging) {
+      pendingCleanup.unpackFolder = folder;
+      pendingCleanup.unpackTicket = ticket.value();
+    } else {
+      pendingCleanup.installFolder = folder;
+      pendingCleanup.installTicket = ticket.value();
+    }
+    ok = false;
+  };
 
   const auto installText = GetText(g_installEdit);
   const auto selectedInstallRoot = std::filesystem::path(installText);
   const auto installFolder = FinalInstallFolder(selectedInstallRoot);
   const auto unpackFolder = extractionFolder.empty() ? SelectedUnpackFolder() : extractionFolder;
+  for (const auto& folder : {unpackFolder, installFolder}) {
+    if (const auto error = RuntimeOverlapError(folder); error.has_value()) {
+      SendUiError(UiText("path_error_title", L"Ошибка пути"), *error);
+      return false;
+    }
+  }
   if ((!installFolder.empty() && modlist::InstallationOverlapsPackage(installFolder, ExeFolder())) ||
       (!unpackFolder.empty() && modlist::InstallationOverlapsPackage(unpackFolder, ExeFolder()))) {
     SendUiError(UiText("path_error_title", L"Ошибка пути"),
@@ -2872,12 +2954,7 @@ bool ValidateFolders(const SpaceRequirements& requirements = {},
         if (allowCleanupPrompt && IsExistingNonEmptyDirectory(unpackFolder)) {
           AppendLog(message);
           cleanupErrors.push_back(message);
-          if (IsSameFolder(unpackFolder, installFolder)) {
-            pendingCleanup.installFolder = installFolder;
-          } else {
-            pendingCleanup.unpackFolder = unpackFolder;
-          }
-          ok = false;
+          queueCleanup(unpackFolder, !IsSameFolder(unpackFolder, installFolder));
         } else {
           addError(message);
         }
@@ -2907,8 +2984,7 @@ bool ValidateFolders(const SpaceRequirements& requirements = {},
         if (allowCleanupPrompt && IsExistingNonEmptyDirectory(installFolder)) {
           AppendLog(message);
           cleanupErrors.push_back(message);
-          pendingCleanup.installFolder = installFolder;
-          ok = false;
+          queueCleanup(installFolder, false);
         } else {
           addError(message);
         }
@@ -3066,6 +3142,10 @@ void StartInstall(HWND hwnd) {
                 L"Выберите полную папку установки на диске.");
     return;
   }
+  if (const auto error = RuntimeOverlapError(installFolder); error.has_value()) {
+    SendUiError(UiText("path_error_title", L"Ошибка пути"), *error);
+    return;
+  }
   if (modlist::InstallationOverlapsPackage(installFolder, ExeFolder())) {
     SendUiError(UiText("path_error_title", L"Ошибка пути"),
                 PackageOverlapMessage(installFolder));
@@ -3107,46 +3187,6 @@ void StartInstall(HWND hwnd) {
   }).detach();
 }
 
-std::optional<std::wstring> ClearFolderContents(const std::filesystem::path& folder,
-                                                const std::wstring& label) {
-  std::error_code existsEc;
-  if (!std::filesystem::exists(folder, existsEc)) {
-    if (existsEc) {
-      return L"Невозможно проверить " + label + L":\n" + PathToDisplay(folder) +
-             L"\n\n" + Widen(existsEc.message());
-    }
-    return std::nullopt;
-  }
-
-  std::error_code directoryEc;
-  if (!std::filesystem::is_directory(folder, directoryEc) || directoryEc) {
-    return label + L" больше не является папкой:\n" + PathToDisplay(folder);
-  }
-
-  std::error_code readEc;
-  std::vector<std::filesystem::path> entries;
-  auto iterator = std::filesystem::directory_iterator(folder, readEc);
-  const auto end = std::filesystem::directory_iterator();
-  while (!readEc && iterator != end) {
-    entries.push_back(iterator->path());
-    iterator.increment(readEc);
-  }
-  if (readEc) {
-    return L"Невозможно прочитать " + label + L":\n" + PathToDisplay(folder) +
-           L"\n\n" + Widen(readEc.message());
-  }
-
-  for (const auto& entry : entries) {
-    std::error_code removeEc;
-    std::filesystem::remove_all(entry, removeEc);
-    if (removeEc) {
-      return L"Невозможно удалить:\n" + PathToDisplay(entry) +
-             L"\n\n" + Widen(removeEc.message());
-    }
-  }
-  return std::nullopt;
-}
-
 void ConfirmPendingFolderCleanup(HWND hwnd) {
   if (g_workerRunning) {
     SendUiError(UiText("installer_busy_title", L"Установщик занят"),
@@ -3172,6 +3212,7 @@ void ConfirmPendingFolderCleanup(HWND hwnd) {
        IsSameFolder(pending.unpackFolder, currentUnpackFolder) &&
        IsSameFolder(currentUnpackFolder.parent_path(), currentUnpackFolder.root_path()) &&
        !modlist::InstallationOverlapsPackage(currentUnpackFolder, ExeFolder()) &&
+       !modlist::InstallationOverlapsRuntime(currentUnpackFolder) &&
        !IsSameFolder(currentUnpackFolder, currentUnpackFolder.root_path()) &&
        currentUnpackFolder.filename() == kUnpackFolderName);
   const bool safeInstall =
@@ -3180,6 +3221,7 @@ void ConfirmPendingFolderCleanup(HWND hwnd) {
        IsSameFolder(pending.installFolder, currentInstallFolder) &&
        IsSameFolder(currentInstallFolder.parent_path(), selectedRoot) &&
        !modlist::InstallationOverlapsPackage(currentInstallFolder, ExeFolder()) &&
+       !modlist::InstallationOverlapsRuntime(currentInstallFolder) &&
        !IsSameFolder(currentInstallFolder, currentInstallFolder.root_path()));
   if (!safeUnpack || !safeInstall) {
     AppendLog(L"Очистка отменена: выбранные папки изменились.");
@@ -3190,10 +3232,14 @@ void ConfirmPendingFolderCleanup(HWND hwnd) {
 
   if (!pending.unpackFolder.empty()) {
     AppendLog(L"Пользователь подтвердил очистку: " + PathToDisplay(currentUnpackFolder));
-    if (const auto error = ClearFolderContents(currentUnpackFolder, L"папку распаковки");
-        error.has_value()) {
-      AppendLog(*error);
-      SendUiError(UiText("cleanup_error_title", L"Ошибка очистки"), *error);
+    const auto cleared = pending.unpackTicket.has_value()
+        ? modlist::ClearFolderContents(*pending.unpackTicket)
+        : modlist::Result<void>::Error("Missing staging cleanup identity");
+    if (!cleared.ok()) {
+      const auto error = L"Рабочая папка распаковки не очищена:\n" +
+          PathToDisplay(currentUnpackFolder) + L"\n\n" + Widen(cleared.error());
+      AppendLog(error);
+      SendUiError(UiText("cleanup_error_title", L"Ошибка очистки"), error);
       return;
     }
     AppendLog(L"Папка распаковки очищена.");
@@ -3201,10 +3247,14 @@ void ConfirmPendingFolderCleanup(HWND hwnd) {
 
   if (!pending.installFolder.empty()) {
     AppendLog(L"Пользователь подтвердил очистку: " + PathToDisplay(currentInstallFolder));
-    if (const auto error = ClearFolderContents(currentInstallFolder, L"папку установки");
-        error.has_value()) {
-      AppendLog(*error);
-      SendUiError(UiText("cleanup_error_title", L"Ошибка очистки"), *error);
+    const auto cleared = pending.installTicket.has_value()
+        ? modlist::ClearFolderContents(*pending.installTicket)
+        : modlist::Result<void>::Error("Missing final-folder cleanup identity");
+    if (!cleared.ok()) {
+      const auto error = L"Перезапись итоговой папки отменена:\n" +
+          PathToDisplay(currentInstallFolder) + L"\n\n" + Widen(cleared.error());
+      AppendLog(error);
+      SendUiError(UiText("cleanup_error_title", L"Ошибка очистки"), error);
       return;
     }
     AppendLog(L"Папка установки очищена.");
@@ -3225,6 +3275,11 @@ void RunUnpackWorker(HWND hwnd, std::filesystem::path archiveFirstPart, std::fil
   g_workerRunning = true;
   PostProgress(hwnd, 0);
   PostLog(hwnd, L"Распаковка архива: " + PathToDisplay(archiveFirstPart));
+  if (const auto error = RuntimeOverlapError(unpackFolder); error.has_value()) {
+    PostLog(hwnd, *error);
+    FinishWorker(hwnd);
+    return;
+  }
 
   if (const auto emptyError = FolderMustBeEmptyError(unpackFolder, L"Папка распаковки");
       emptyError.has_value()) {
@@ -3257,6 +3312,22 @@ void RunUnpackWorker(HWND hwnd, std::filesystem::path archiveFirstPart, std::fil
     return;
   }
 
+  const auto packageId = modlist::Sha256::FileHexDigest(ManifestPath());
+  if (!packageId.ok()) {
+    PostLog(hwnd, L"Не удалось определить владельца рабочей папки: " + Widen(packageId.error()));
+    FinishWorker(hwnd);
+    return;
+  }
+  std::error_code createError;
+  std::filesystem::create_directories(unpackFolder, createError);
+  auto stagingSession = modlist::BeginOwnedStaging(unpackFolder, ExeFolder(), packageId.value());
+  if (createError || !stagingSession.ok()) {
+    PostLog(hwnd, L"Невозможно безопасно занять рабочую папку распаковки: " +
+        Widen(createError ? createError.message() : stagingSession.error()));
+    FinishWorker(hwnd);
+    return;
+  }
+
   const bool extracted = ExtractArchiveChain(hwnd, extractor, sevenZip.value(), std::move(archiveFirstPart), std::move(unpackFolder));
   PostProgress(hwnd, extracted ? 100 : 0);
   g_workerRunning = false;
@@ -3273,6 +3344,10 @@ void UnpackOnly(HWND hwnd) {
   const auto installFolder = std::filesystem::path(GetText(g_installEdit));
   if (unpackFolder.empty() || installFolder.empty()) {
     AppendLog(L"Выберите папку для установки перед распаковкой.");
+    return;
+  }
+  if (const auto error = RuntimeOverlapError(unpackFolder); error.has_value()) {
+    SendUiError(UiText("path_error_title", L"Ошибка пути"), *error);
     return;
   }
 
@@ -3427,7 +3502,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
       const auto finalFolder = FinalInstallFolder(std::filesystem::path(GetText(g_installEdit)));
       modlist::NativeInstallerViewState state;
       state.title = UiText("app_title", L"Modlist Installer Beta");
-      state.version = UiText("app_version", L"Modlist Installer v0.3.6 by WallHead");
+      state.version = UiText("app_version", L"Modlist Installer v0.3.7 by WallHead");
       state.unpackNote = UiText(
           "unpack_note",
           L"Установщик проверит пути в архиве и распакует файлы прямо в папку установки, если пути достаточно короткие. Иначе он использует временную папку, затем перенесет файлы.");

@@ -20,6 +20,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <cwctype>
 #include <cstring>
 #include <fstream>
 #include <iomanip>
@@ -222,6 +223,19 @@ bool EndsWithDigits(const std::string& value) {
          std::all_of(value.end() - 3, value.end(), [](unsigned char c) {
            return c >= '0' && c <= '9';
          });
+}
+
+const GUID* ArchiveFormat(const Manifest& manifest) {
+  auto path = manifest.extract.firstArchivePart;
+  const auto extension = GenericPathToUtf8(path.extension());
+  if (extension.size() == 4 && extension.front() == '.' && EndsWithDigits(extension)) {
+    path = path.stem();
+  }
+  auto format = path.extension().wstring();
+  std::transform(format.begin(), format.end(), format.begin(), [](wchar_t ch) { return std::towlower(ch); });
+  if (format == L".7z") return &kClsid7zFormat;
+  if (format == L".zip") return &kClsidZipFormat;
+  return nullptr;
 }
 
 std::vector<const ManifestFile*> ArchiveVolumes(const Manifest& manifest) {
@@ -1304,7 +1318,7 @@ uint64_t ManifestBytes(const Manifest& manifest) {
 }  // namespace
 
 bool PipelinedSevenZipExtractor::CanUse(const Manifest& manifest) {
-  if (manifest.hashChunkSize == 0 || manifest.hashChunkSize > kMaxPipelineChunkSize) {
+  if (ArchiveFormat(manifest) == nullptr || manifest.hashChunkSize == 0 || manifest.hashChunkSize > kMaxPipelineChunkSize) {
     return false;
   }
   const auto volumes = ArchiveVolumes(manifest);
@@ -1348,6 +1362,10 @@ Result<ExtractionPathPlan> PipelinedSevenZipExtractor::PlanExtraction(
   if (config.manifest == nullptr || ArchiveVolumes(*config.manifest).empty()) {
     return PlanResult::Error("No archive volumes are available for path inspection");
   }
+  const auto format = ArchiveFormat(*config.manifest);
+  if (format == nullptr) {
+    return PlanResult::Error("Native archive inspection supports only 7z and ZIP packages");
+  }
   HMODULE library = LoadLibraryExW(config.sevenZipLibrary.c_str(), nullptr,
       LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
   if (library == nullptr) {
@@ -1363,7 +1381,7 @@ Result<ExtractionPathPlan> PipelinedSevenZipExtractor::PlanExtraction(
     return PlanResult::Error("7z.dll does not export CreateObject");
   }
   IInArchive* rawArchive = nullptr;
-  const auto created = createObject(&kClsid7zFormat, &kIidInArchive,
+  const auto created = createObject(format, &kIidInArchive,
                                     reinterpret_cast<void**>(&rawArchive));
   ComPtr<IInArchive> archive(rawArchive);
   if (FAILED(created) || !archive) {
@@ -1376,7 +1394,7 @@ Result<ExtractionPathPlan> PipelinedSevenZipExtractor::PlanExtraction(
   }
   ComPtr<IArchiveOpenCallback> callback(new ArchiveOpenCallback());
   const UInt64 start = 0;
-  if (FAILED(archive->Open(stream.Get(), &start, callback.Get()))) {
+  if (archive->Open(stream.Get(), &start, callback.Get()) != S_OK) {
     archive->Close();
     return PlanResult::Error("Unable to read archive paths; short staging folder will be used");
   }
@@ -1418,7 +1436,7 @@ ExtractionResult PipelinedSevenZipExtractor::Extract(
 
   IInArchive* rawArchive = nullptr;
   const HRESULT createResult = createObject(
-      &kClsid7zFormat, &kIidInArchive, reinterpret_cast<void**>(&rawArchive));
+      ArchiveFormat(*config.manifest), &kIidInArchive, reinterpret_cast<void**>(&rawArchive));
   ComPtr<IInArchive> archive(rawArchive);
   if (FAILED(createResult) || !archive) {
     result.message = "Unable to create the 7-Zip archive handler";
@@ -1441,7 +1459,7 @@ ExtractionResult PipelinedSevenZipExtractor::Extract(
   ComPtr<IArchiveOpenCallback> openCallback(new ArchiveOpenCallback());
   const UInt64 maxCheckStartPosition = 0;
   HRESULT operation = archive->Open(stream.Get(), &maxCheckStartPosition, openCallback.Get());
-  if (FAILED(operation)) {
+  if (operation != S_OK) {
     result.message = rawStream->Error().empty()
         ? "7-Zip could not open the verified virtual archive"
         : rawStream->Error();
@@ -1497,8 +1515,8 @@ ExtractionResult PipelinedSevenZipExtractor::Extract(
     ComPtr<IArchiveExtractCallback> extractCallback(rawExtractCallback);
     operation = archive->Extract(
         nullptr, std::numeric_limits<UInt32>::max(), 0, extractCallback.Get());
-    const bool allValidated = SUCCEEDED(operation) && rawStream->VerifyAll();
-    if (SUCCEEDED(operation) && allValidated && rawExtractCallback->Errors() == 0) {
+    const bool allValidated = operation == S_OK && rawStream->VerifyAll();
+    if (operation == S_OK && allValidated && rawExtractCallback->Errors() == 0) {
       reporter->FinishExtraction();
       result.ok = true;
       result.exitCode = 0;

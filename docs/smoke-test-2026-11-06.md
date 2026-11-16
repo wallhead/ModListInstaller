@@ -186,3 +186,93 @@ source files were not changed. No commits, pushes or releases were made.
   old/new scheduler performance comparison is claimed.
 - Generated source, outputs, cancellation/corruption partial outputs and reports
   are retained in their isolated test folders. No existing user data was removed.
+
+## Tooling Review Fix Verification
+
+This later pass addresses R1-R3 from the review of `0e6c612`. It does not change
+the production scheduler, decoder thread budget, validation guarantees or UI.
+The earlier large-workload measurements above remain historical results, not
+fresh results from this pass.
+
+### Source Safety And Archive Selection
+
+`run-existing-smoke.ps1` now copies every referenced archive into a fresh
+corruption fixture and mutates only a newly created destination file handle.
+The original inputs are opened read-only; no restoration is needed after a
+crash. Copy failure stops the helper with an error. This full copy needs extra
+space equal to the archive size below the reports folder.
+
+`pipeline_smoke --describe-package` uses the real `ManifestLoader` without
+extracting or writing files. Both comparison paths use its first-part selection,
+independent of manifest entry order. Explicit legacy first-part selection is
+honored by description, but non-chunk legacy input is rejected by this pipeline
+benchmark before creating output/report folders.
+
+The description uses JSON to preserve whitespace and UTF-8 in archive names.
+Readiness markers in the test driver are published atomically after their
+metadata is closed, so a forced-stop test cannot observe incomplete metadata.
+
+Regression tests used a disposable 64 MiB split archive (nine volumes). Passed:
+normal success/SHA rejection, reversed `files[]`, leading-space archive names,
+injected corruption-run failure, a source-sharing violation that prevents fixture copying, forced
+termination during corrupt extraction, explicit legacy first-part description,
+and invalid explicit first-part rejection. All original input file hashes,
+including each archive volume and manifest, were unchanged after every run.
+Only the copied fixture contains the deliberate one-byte change. Copy failure
+never starts the corrupt extractor or falls back to the original package.
+
+Before the fixes, the source-safety test failed because the corrupt extractor
+received the original manifest, and the reordered-manifest test failed with a
+native 7-Zip exit code of 2. Both now pass. Fixtures and logs are retained at:
+`C:/Users/user/AppData/Local/Temp/mi-smoke-helper-d44208381f4743a79ce62a3ca194d1f2`.
+
+### Diagnostics Callback And Packaged EXE
+
+Extraction callbacks now publish memory-only progress. The sampler copies the
+snapshot under its lock, releases the lock, then logs it. Tests deliberately
+block both a log mutex and the sampler's sink while the callback publishes;
+publishing/cancellation still complete before log delivery is released. Final
+partial/completed progress is retained. The pre-fix callback failed the blocked
+sink test. Another pre-fix integration test showed final delivery extending the
+measured stage; finish time and process totals are now frozen before draining.
+
+Packaged EXE:
+`E:/Test builds/Modlist-Diagnostics-20261106-review-fixes/modlist-diagnostics.exe`.
+SHA-256: `77AB8E6EEA24978FAA1AC88F77723459633D0BC2D3D15E74A2DCD5220FA4C197`.
+Three CLI smoke runs used E: source and D: output, 64 MiB/515 files, four decoder
+threads and both extraction orders. Each then ran the quiet pipeline against
+the exact same archive/manifest. All final counts and compressed validation
+totals agreed. An independent external SHA-256 comparison checked the copy,
+four diagnostic extraction trees and quiet output against the source in each
+run (18 trees total), including file/directory sets and empty directories.
+
+| Run | Diagnostic pipeline 1/2 (s) | Native 1/2 (s) | Quiet pipeline (s) |
+| --- | ---: | ---: | ---: |
+| 1 | 0.604 / 0.602 | 0.824 / 0.664 | 0.570 |
+| 2 | 0.625 / 0.562 | 0.726 / 0.612 | 0.606 |
+| 3 | 0.590 / 0.574 | 0.593 / 0.609 | 0.592 |
+
+These are short warm-cache functional checks, not a reliable speedup estimate.
+Other small integration tests were running on the host during part of the pass.
+Each EXE report folder contains `results.json`, `quiet-metrics.txt` and
+`independent-content-verification.json`. Logs are below the packaged EXE's
+`logs` folder. Generated data remain below
+`E:/Test builds/ReviewFix-Packaged-20261106` and
+`D:/MI-ReviewFix-Packaged-20261106`.
+
+The all-target xmake Release build and core, scheduler, UI, diagnostics unit,
+diagnostics integration and all 20 packer tests passed. Integration covers native
+and pipeline API cancellation, delayed final progress, report-write failure and
+invalid paths. The external SHA verifier self-test also passed. Cancellation in
+the packaged desktop GUI was not exercised. No full 10 GiB workload or affected
+tester-PC performance result is claimed. The distributed installer remains
+unchanged, with SHA-256
+`A69D2C5399CB6E078F5C6F240D8702C10DAFA2CB19ACC0455E4FAC0B1DCF8474`.
+No commit, push or release was made for these tooling fixes.
+Independent review found two additional small defects (whitespace decoding and
+early readiness publication), both fixed before the final verification. The
+follow-up review found no remaining actionable issue. Description tests also
+round-trip a legacy explicit first part containing whitespace, a JSON control
+escape and UTF-8. Mid-copy termination, cancellation after nonzero diagnostic
+output and a blocked sampler inside the real Stage finish path were not directly
+injected; callback/snapshot isolation is covered by the blocked-sink unit tests.

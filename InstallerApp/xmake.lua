@@ -1,8 +1,14 @@
 set_project("ModlistInstaller")
-set_version("0.3.6")
+set_version("0.3.7")
 
 add_rules("mode.debug", "mode.release")
 set_languages("c++20")
+
+-- The portable package must not require an installed VC++ redistributable.
+-- Keep the existing optional release-built static dependencies on the same CRT.
+if is_plat("windows") then
+    set_runtimes("MT")
+end
 
 option("use_libtorrent")
     set_default(false)
@@ -31,9 +37,6 @@ local function add_vcpkg_libtorrent()
         "boost_random-vc145-mt-x64-1_91",
         "boost_context-vc145-mt-x64-1_91")
     add_syslinks("ws2_32", "iphlpapi", "crypt32", "bcrypt", "advapi32", "user32", "shell32")
-    if is_plat("windows") then
-        set_runtimes("MT")
-    end
 end
 
 target("installer_core")
@@ -54,6 +57,7 @@ target("installer_core")
         "src/verifier/Verifier.cpp")
 
     if is_plat("windows") then
+        add_files("src/paths/FolderCleanup.cpp")
         add_cxxflags("/W4", "/permissive-", {tools = "cl"})
         add_syslinks("bcrypt", "ole32", "oleaut32", {public = true})
     else
@@ -67,9 +71,6 @@ target_end()
 
 target("modlist-installer")
     set_kind("binary")
-    if has_config("use_libtorrent") and is_plat("windows") then
-        set_runtimes("MT")
-    end
     set_rundir("$(projectdir)")
     add_files("src/app/main.cpp")
     add_deps("installer_core")
@@ -77,9 +78,6 @@ target_end()
 
 target("modlist-installer-gui")
     set_kind("binary")
-    if has_config("use_libtorrent") and is_plat("windows") then
-        set_runtimes("MT")
-    end
     set_rundir("$(projectdir)")
     add_includedirs("resources")
     add_files("src/ui/WinInstallerApp.cpp", "src/ui/NativeInstallerView.cpp", "src/ui/NativeStrings.cpp")
@@ -94,9 +92,6 @@ target_end()
 
 target("installer_core_tests")
     set_kind("binary")
-    if has_config("use_libtorrent") and is_plat("windows") then
-        set_runtimes("MT")
-    end
     set_rundir("$(projectdir)")
     add_files("tests/test_main.cpp", "src/ui/NativeStrings.cpp")
     if is_plat("windows") then
@@ -112,11 +107,21 @@ target("pipeline_scheduler_tests")
 target_end()
 
 if is_plat("windows") then
+    target("folder_cleanup_tests")
+        set_kind("binary")
+        add_files("tests/test_folder_cleanup.cpp")
+        add_deps("installer_core")
+        add_syslinks("advapi32")
+    target_end()
+
+    target("smoke_script_driver")
+        set_kind("binary")
+        add_files("tests/smoke_script_driver.cpp")
+        add_deps("installer_core")
+    target_end()
+
     target("pipeline_smoke")
         set_kind("binary")
-        if has_config("use_libtorrent") then
-            set_runtimes("MT")
-        end
         add_files("tests/pipeline_smoke.cpp", "resources/app.rc")
         add_includedirs("resources")
         add_deps("installer_core")
@@ -124,7 +129,6 @@ if is_plat("windows") then
 
     target("diagnostics_engine")
         set_kind("static")
-        set_runtimes("MT")
         add_includedirs("src", "resources", {public = true})
         add_files("src/diagnostics/Workload.cpp", "src/diagnostics/Benchmark.cpp",
                   "src/extractor/PipelinedSevenZipExtractor.cpp", "src/extractor/SevenZipExtractor.cpp",
@@ -136,7 +140,6 @@ if is_plat("windows") then
 
     target("modlist-diagnostics")
         set_kind("binary")
-        set_runtimes("MT")
         add_files("src/diagnostics/Main.cpp", "resources/app.rc")
         add_deps("diagnostics_engine")
         add_cxxflags("/utf-8", {tools = "cl"})
@@ -146,7 +149,6 @@ if is_plat("windows") then
 
     target("diagnostics_integration_tests")
         set_kind("binary")
-        set_runtimes("MT")
         add_files("tests/test_diagnostics_integration.cpp", "resources/app.rc")
         add_deps("diagnostics_engine")
         add_cxxflags("/utf-8", {tools = "cl"})
@@ -154,17 +156,23 @@ if is_plat("windows") then
 
     target("diagnostics_tests")
         set_kind("binary")
-        set_runtimes("MT")
         add_includedirs("src")
         add_files("tests/test_diagnostics.cpp", "src/diagnostics/Workload.cpp")
         add_cxxflags("/utf-8", {tools = "cl"})
     target_end()
 
+    target("installer_workflow_tests")
+        set_kind("binary")
+        set_rundir("$(projectdir)")
+        add_files("tests/test_install_workflow.cpp", "src/ui/NativeInstallerView.cpp", "src/ui/NativeStrings.cpp", "resources/app.rc")
+        add_includedirs("resources")
+        add_cxxflags("/utf-8", {tools = "cl"})
+        add_deps("installer_core")
+        add_syslinks("user32", "gdi32", "d2d1", "dwrite", "dwmapi", "uxtheme", "comdlg32", "shell32", "ole32", "oleaut32", "comctl32", "shlwapi", "advapi32")
+    target_end()
+
     target("installer_ui_tests")
         set_kind("binary")
-        if has_config("use_libtorrent") then
-            set_runtimes("MT")
-        end
         set_rundir("$(projectdir)")
         add_files("tests/test_ui.cpp", "src/ui/NativeInstallerView.cpp", "src/ui/NativeStrings.cpp", "resources/app.rc")
         add_includedirs("resources")

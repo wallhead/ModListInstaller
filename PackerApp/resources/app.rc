@@ -1,3 +1,5 @@
 #include "resource.h"
 
-IDR_7ZIP_EXE RCDATA "7z.exe"
+IDR_7ZIP_EXE RCDATA "7zip/7z.exe"
+IDR_7ZIP_DLL RCDATA "7zip/7z.dll"
+IDR_7ZIP_LICENSE RCDATA "7zip/7zip-License.txt"

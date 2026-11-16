@@ -2,8 +2,12 @@
 #include "manifest/Json.h"
 
 #include <windows.h>
+#include <chrono>
+#include <cmath>
 #include <fstream>
+#include <future>
 #include <iostream>
+#include <map>
 #include <stdexcept>
 
 using namespace modlist;
@@ -28,8 +32,25 @@ int wmain(int argc,wchar_t** argv) {
     Require(!cancelled.ok && cancelled.cancelled && cancelled.sourceRun.empty(),"Pre-cancelled benchmark created data or reported success");
     Require(!std::filesystem::exists(config.sourceParent) && !std::filesystem::exists(config.destinationParent),"Pre-cancelled benchmark created missing parent folders");
     cancel=false;config.reversePass=true;
-    const auto outcome=RunBenchmark(config,cancel);
+    std::promise<void> finalProgressEntered, releaseFinalProgress;
+    auto releaseFinal=releaseFinalProgress.get_future().share();
+    std::map<std::string, Progress> extractionFinals;
+    auto benchmark=std::async(std::launch::async,[&] {
+      return RunBenchmark(config,cancel,[&](const Progress& progress) {
+        if(!progress.stage.starts_with("extract_") || progress.message!="Finished")return;
+        extractionFinals[progress.stage]=progress;
+        if(progress.stage=="extract_pipeline-1") {
+          finalProgressEntered.set_value();
+          releaseFinal.wait();
+        }
+      });
+    });
+    const bool reachedFinal=finalProgressEntered.get_future().wait_for(std::chrono::seconds(60))==std::future_status::ready;
+    const bool drainBlocked=reachedFinal && benchmark.wait_for(std::chrono::milliseconds(150))==std::future_status::timeout;
+    releaseFinalProgress.set_value();
+    const auto outcome=benchmark.get();
     Require(outcome.ok,!outcome.error.empty()?outcome.error:"Benchmark did not succeed");
+    Require(drainBlocked,"Test did not block final progress delivery");
     Require(std::filesystem::is_directory(config.sourceParent) && std::filesystem::is_directory(config.destinationParent),"Missing parent folders were not created");
     std::ifstream file(outcome.logFolder/"results.json",std::ios::binary);
     std::string json((std::istreambuf_iterator<char>(file)),{});
@@ -40,7 +61,13 @@ int wmain(int argc,wchar_t** argv) {
       Require(stage.Find("status")->AsString()=="ok","A smoke stage failed");
       const auto name=stage.Find("name")->AsString();
       Require(name!="source_sha256_read","Benchmark still rereads and hashes every generated source file");
-      if(name.starts_with("extract_")) {++extracts;Require(stage.Find("logical_bytes")->AsNumber()==64*1024*1024,"Extraction byte total is false");}
+      if(name.starts_with("extract_")) {
+        ++extracts;Require(stage.Find("logical_bytes")->AsNumber()==64*1024*1024,"Extraction byte total is false");
+        const auto final=extractionFinals.find(name);
+        Require(final!=extractionFinals.end(),"Final extraction progress was lost");
+        Require(final->second.bytes==64*1024*1024 && final->second.files==515 && final->second.percent==100,"Final extraction progress counters are false");
+        Require(std::abs(stage.Find("seconds")->AsNumber()-final->second.elapsedSeconds)<1e-9,"Stage timing includes final progress/log draining after its final measurement");
+      }
       if(name=="archive_create") {
         Require(stage.Find("logical_bytes")->AsNumber()==64*1024*1024,"Archive creation must report logical input bytes");
         Require(stage.Find("sample_progress_basis")->AsString()=="child_process_read_proxy","Compression progress incorrectly follows compressed output instead of source reads");
@@ -58,6 +85,10 @@ int wmain(int argc,wchar_t** argv) {
     Require(!parsed.value().Find("per_file_sha256")->AsBool(),"Report falsely claims per-file hashing is enabled");
     for(const auto& record:parsed.value().Find("pipeline_diagnostics")->AsArray())
       Require(record.Find("counters")->Find("hashNanoseconds")->AsNumber()>0,"Real pipeline archive validation is disabled");
+    std::ifstream progressFile(outcome.logFolder/"diagnostics.log",std::ios::binary);
+    const std::string progressLog((std::istreambuf_iterator<char>(progressFile)),{});
+    const auto validationBytes=static_cast<uint64_t>(parsed.value().Find("archive_bytes")->AsNumber());
+    Require(progressLog.find("; validation_bytes="+std::to_string(validationBytes)+"; extraction_percent=100")!=std::string::npos,"Final pipeline validation progress was lost from the log");
     std::cout << "PASS: complete smoke benchmark, both extraction orders, metadata checks only\n";
     std::cout << "PASS: missing nested parent folders are created automatically\n";
     std::cout << "Report: " << outcome.logFolder << '\n';
@@ -91,6 +122,22 @@ int wmain(int argc,wchar_t** argv) {
     });
     Require(stopped.cancelled && !stopped.ok,"Cancelling native extraction did not stop the benchmark");
     std::cout << "PASS: native child cancellation returns a partial report\n";
+    cancel=false;
+
+    config.sevenZipFirst=false;
+    const auto pipelineStopped=RunBenchmark(config,cancel,[&](const Progress& progress){
+      if(progress.stage=="extract_pipeline-1" && progress.message=="Started")cancel=true;
+    });
+    Require(pipelineStopped.cancelled && !pipelineStopped.ok,"Cancelling pipeline extraction did not stop the benchmark");
+    std::ifstream stoppedFile(pipelineStopped.logFolder/"results.json",std::ios::binary);
+    const auto stoppedJson=ParseJson(std::string((std::istreambuf_iterator<char>(stoppedFile)),{}));
+    Require(stoppedJson.ok(),"Cancelled pipeline report is not valid JSON");
+    const auto& stoppedStages=stoppedJson.value().Find("stages")->AsArray();
+    Require(!stoppedStages.empty(),"Cancelled pipeline lost its stage report");
+    const auto& stoppedStage=stoppedStages.back();
+    Require(stoppedStage.Find("name")->AsString()=="extract_pipeline-1" && stoppedStage.Find("status")->AsString()=="failed","Cancelled pipeline stage incorrectly reported success");
+    Require(stoppedStage.Find("logical_bytes")->AsNumber()==0 && stoppedStage.Find("files")->AsNumber()==0,"Cancelled pipeline fabricated completed output counters");
+    std::cout << "PASS: pipeline cancellation retains a failed stage and partial counters\n";
     cancel=false;
 
     bool reportBlocked=false;

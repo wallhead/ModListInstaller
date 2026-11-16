@@ -24,6 +24,7 @@ else()
 endif()
 
 if(WIN32)
+  target_sources(installer_core PRIVATE paths/FolderCleanup.cpp)
   target_link_libraries(installer_core PUBLIC bcrypt ole32 oleaut32)
 endif()
 
@@ -47,6 +48,8 @@ if(WIN32)
   target_include_directories(modlist-installer-gui PRIVATE ../resources)
   if(MSVC)
     target_compile_options(modlist-installer-gui PRIVATE /utf-8)
+    # app.rc already embeds the DPI-aware application manifest.
+    target_link_options(modlist-installer-gui PRIVATE /MANIFEST:NO)
   endif()
   target_link_libraries(modlist-installer-gui PRIVATE installer_core
     user32 gdi32 d2d1 dwrite dwmapi uxtheme comctl32 shlwapi
