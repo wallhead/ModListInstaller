@@ -48,7 +48,7 @@
 namespace {
 
 constexpr const wchar_t* kUnpackFolderName = L"Unpacking";
-constexpr std::wstring_view kInstallerBuildLabel = L"Modlist Installer v0.3.9 by WallHead";
+constexpr std::wstring_view kInstallerBuildLabel = L"Modlist Installer v0.3.10 by WallHead";
 constexpr auto kPipelineLogInterval = std::chrono::seconds(60);
 
 constexpr int kDownloadEdit = 1003;

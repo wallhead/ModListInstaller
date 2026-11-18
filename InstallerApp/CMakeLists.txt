@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(ModlistInstaller VERSION 0.3.9 LANGUAGES CXX)
+project(ModlistInstaller VERSION 0.3.10 LANGUAGES CXX)
 
 if(MSVC)
   set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
