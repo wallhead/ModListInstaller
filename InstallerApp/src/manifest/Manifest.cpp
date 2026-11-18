@@ -2,12 +2,14 @@
 
 #include "manifest/Json.h"
 #include "common/PathText.h"
+#include "verifier/Sha256.h"
 
 #include <algorithm>
 #include <cctype>
 #include <cstring>
 #include <fstream>
 #include <sstream>
+#include <utility>
 
 namespace modlist {
 
@@ -254,14 +256,25 @@ Result<Manifest> ParsePackerManifest(const JsonValue& root) {
 
 }  // namespace
 
-Result<Manifest> ManifestLoader::LoadFromFile(const std::filesystem::path& path) const {
+Result<Manifest> ManifestLoader::LoadFromFile(const std::filesystem::path& path,
+                                              std::string* manifestSha256) const {
+  if (manifestSha256 != nullptr) manifestSha256->clear();
   std::ifstream input(path, std::ios::binary);
   if (!input) {
     return Result<Manifest>::Error("Unable to open manifest: " + PathToUtf8(path));
   }
   std::ostringstream buffer;
   buffer << input.rdbuf();
-  return LoadFromString(buffer.str());
+  const auto contents = std::move(buffer).str();
+  auto result = LoadFromString(contents);
+  if (result.ok() && manifestSha256 != nullptr) {
+    try {
+      *manifestSha256 = Sha256::HexDigest(contents);
+    } catch (...) {
+      // Identifying the package is optional and must not change loading.
+    }
+  }
+  return result;
 }
 
 Result<Manifest> ManifestLoader::LoadFromString(const std::string& jsonText) const {

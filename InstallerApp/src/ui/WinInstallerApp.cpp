@@ -2,6 +2,7 @@
 
 #include "app/PackageDiscovery.h"
 #include "app/RuntimePaths.h"
+#include "common/BuildIdentity.h"
 #include "common/PathText.h"
 #include "common/ProgressThrottle.h"
 #include "extractor/PipelinedSevenZipExtractor.h"
@@ -48,6 +49,7 @@ namespace {
 
 constexpr const wchar_t* kUnpackFolderName = L"Unpacking";
 constexpr std::wstring_view kInstallerBuildLabel = L"Modlist Installer v0.3.9 by WallHead";
+constexpr auto kPipelineLogInterval = std::chrono::seconds(60);
 
 constexpr int kDownloadEdit = 1003;
 constexpr int kDownloadBrowse = 1004;
@@ -87,6 +89,7 @@ public:
 
   void Phase(std::wstring_view phase) noexcept;
   void EndPhase(Clock::time_point ended = Clock::now()) noexcept;
+  int64_t ElapsedMs(Clock::time_point at = Clock::now()) const noexcept;
   void Record(std::wstring_view event, std::wstring_view fields = {}) const noexcept;
   void Finish(std::wstring_view result, bool stopRequested = false) noexcept;
 
@@ -366,14 +369,24 @@ InstallRunLog::InstallRunLog() {
   static std::atomic_uint sequence{0};
   id_ = std::to_wstring(GetCurrentProcessId()) + L"-" + std::to_wstring(GetTickCount64()) +
       L"-" + std::to_wstring(sequence.fetch_add(1, std::memory_order_relaxed) + 1);
-  Record(L"run_start", L"schema=1 build=\"" + UiText("app_version", kInstallerBuildLabel) + L"\"");
+  try {
+    auto fields = L"schema=1 build=\"" + UiText("app_version", kInstallerBuildLabel) + L"\" build_id=";
+    const auto buildId = modlist::BuildIdentity();
+    fields.append(buildId.begin(), buildId.end());
+    Record(L"run_start", fields);
+  } catch (...) {
+    Record(L"run_start", L"schema=1 build_id=unavailable");
+  }
+}
+
+int64_t InstallRunLog::ElapsedMs(Clock::time_point at) const noexcept {
+  return std::chrono::duration_cast<std::chrono::milliseconds>(at - started_).count();
 }
 
 void InstallRunLog::Record(std::wstring_view event, std::wstring_view fields) const noexcept {
   try {
-    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - started_);
     std::wostringstream line;
-    line << L"INSTALL_PERF run=" << id_ << L" elapsed_ms=" << elapsed.count()
+    line << L"INSTALL_PERF run=" << id_ << L" elapsed_ms=" << ElapsedMs()
          << L" event=" << event;
     if (!phase_.empty()) line << L" phase=" << phase_;
     if (!fields.empty()) line << L" " << fields;
@@ -1527,7 +1540,8 @@ std::wstring FormatEta(int seconds);
 std::string HexDigest(const std::array<uint8_t, 32>& digest);
 size_t SelectHashWorkerCount(const std::filesystem::path& folder, size_t fileCount);
 std::optional<std::filesystem::path> FindFirstArchivePart(const std::filesystem::path& folder);
-std::optional<modlist::Manifest> LoadPackageManifest(std::wstring& message);
+std::optional<modlist::Manifest> LoadPackageManifest(std::wstring& message,
+                                                    std::string* manifestSha256 = nullptr);
 std::optional<std::filesystem::path> ArchivePartFromManifest(const modlist::Manifest& manifest);
 
 modlist::Result<modlist::PackageDiscovery> ReadPackageFromUi() {
@@ -1545,7 +1559,8 @@ modlist::Result<modlist::PackageDiscovery> ReadPackageFromUi() {
   return package;
 }
 
-std::optional<modlist::Manifest> LoadPackageManifest(std::wstring& message) {
+std::optional<modlist::Manifest> LoadPackageManifest(std::wstring& message,
+                                                    std::string* manifestSha256) {
   std::error_code ec;
   const auto path = ManifestPath();
   if (!std::filesystem::exists(path, ec) || ec) {
@@ -1554,7 +1569,7 @@ std::optional<modlist::Manifest> LoadPackageManifest(std::wstring& message) {
   }
 
   modlist::ManifestLoader loader;
-  auto manifest = loader.LoadFromFile(path);
+  auto manifest = loader.LoadFromFile(path, manifestSha256);
   if (!manifest.ok()) {
     message = L"Файл проверки: " + Widen(manifest.error());
     return std::nullopt;
@@ -2180,8 +2195,11 @@ public:
         std::unique_lock lock(waitMutex_);
         while (!stop.stop_requested()) {
           // Sample even when 7-Zip is not issuing progress callbacks.
-          wake_.wait_for(lock, stop, std::chrono::minutes(1), [] { return false; });
-          if (!stop.stop_requested()) WriteSnapshot(L"sample");
+          wake_.wait_for(lock, stop, kPipelineLogInterval, [] { return false; });
+          if (!stop.stop_requested()) {
+            lastSampleElapsedMs_ = runLog_.ElapsedMs();
+            WriteSnapshot(L"sample", lastSampleElapsedMs_);
+          }
         }
       });
     } catch (const std::system_error&) {
@@ -2195,12 +2213,14 @@ public:
     UpdateMaximum(extractionPercent_, progress.extractionPercent);
   }
 
-  void Finish() {
+  void Finish(InstallRunLog::Clock::time_point extractedAt) {
     if (sampler_.joinable()) {
       sampler_.request_stop();
       sampler_.join();
     }
-    WriteSnapshot(L"counters");
+    // A tick may have observed the frozen counters between return and stop.
+    WriteSnapshot(L"counters", std::max(runLog_.ElapsedMs(extractedAt), lastSampleElapsedMs_));
+    WriteSdkTimings();
   }
 
   modlist::PipelineExtractionDiagnostics diagnostics;
@@ -2212,23 +2232,71 @@ private:
     while (previous < value && !counter.compare_exchange_weak(previous, value, std::memory_order_relaxed)) {}
   }
 
-  void WriteSnapshot(std::wstring_view event) const noexcept {
+  void WriteSnapshot(std::wstring_view event, int64_t sampleElapsedMs) const noexcept {
     try {
       const auto load = [](const auto& counter) { return counter.load(std::memory_order_relaxed); };
+      const auto validated = load(validatedBytes_);
+      const auto percent = load(extractionPercent_);
+      const auto inputBytes = load(diagnostics.inputDiskBytes);
+      const auto inputReads = load(diagnostics.inputReadOps);
+      const auto loads = load(diagnostics.blockLoads);
+      const auto reloads = load(diagnostics.blockReloads);
+      const auto hits = load(diagnostics.cacheHits);
+      const auto misses = load(diagnostics.cacheMisses);
+      const auto blockWaitNs = load(diagnostics.blockWaitNanoseconds);
+      const auto readWaitNs = load(diagnostics.diskWaitNanoseconds);
+      const auto hashNs = load(diagnostics.hashNanoseconds);
+      const auto outputBytes = load(diagnostics.outputBytesWritten);
+      const auto outputFiles = load(diagnostics.outputFilesCreated);
+      const auto writeCalls = load(diagnostics.outputWriteCalls);
+      const auto directoryChecks = load(diagnostics.outputDirectoriesChecked);
+      const auto createNs = load(diagnostics.outputCreateNanoseconds);
+      const auto directoryNs = load(diagnostics.outputDirectoryNanoseconds);
+      const auto closeNs = load(diagnostics.outputCloseNanoseconds);
+      const auto writeNs = load(diagnostics.outputWriteNanoseconds);
       std::wostringstream fields;
-      fields << L"basis=cumulative_nonadditive validated_bytes=" << load(validatedBytes_)
-             << L" extraction_percent=" << load(extractionPercent_)
-             << L" input_read_bytes=" << load(diagnostics.inputDiskBytes)
-             << L" output_bytes=" << load(diagnostics.outputBytesWritten)
-             << L" output_files=" << load(diagnostics.outputFilesCreated)
-             << L" block_reloads=" << load(diagnostics.blockReloads)
-             << L" block_wait_ms=" << load(diagnostics.blockWaitNanoseconds) / 1000000
-             << L" read_wait_ms=" << load(diagnostics.diskWaitNanoseconds) / 1000000
-             << L" hash_ms=" << load(diagnostics.hashNanoseconds) / 1000000
-             << L" output_metadata_ms=" << (load(diagnostics.outputCreateNanoseconds) +
-                  load(diagnostics.outputDirectoryNanoseconds) + load(diagnostics.outputCloseNanoseconds)) / 1000000
-             << L" write_ms=" << load(diagnostics.outputWriteNanoseconds) / 1000000;
+      fields << L"basis=cumulative_nonadditive sample_elapsed_ms=" << sampleElapsedMs
+             << L" validated_bytes=" << validated << L" extraction_percent=" << percent
+             << L" input_read_bytes=" << inputBytes << L" input_read_ops=" << inputReads
+             << L" output_bytes=" << outputBytes << L" output_files=" << outputFiles
+             << L" output_write_calls=" << writeCalls << L" output_directory_checks=" << directoryChecks
+             << L" block_loads=" << loads << L" block_reloads=" << reloads
+             << L" cache_hits=" << hits << L" cache_misses=" << misses
+             << L" block_wait_ms=" << blockWaitNs / 1000000 << L" read_wait_ms=" << readWaitNs / 1000000
+             << L" hash_ms=" << hashNs / 1000000 << L" write_ms=" << writeNs / 1000000
+             << L" output_create_ms=" << createNs / 1000000
+             << L" output_directory_ms=" << directoryNs / 1000000
+             << L" output_close_ms=" << closeNs / 1000000
+             << L" output_metadata_ms=" << (createNs + directoryNs + closeNs) / 1000000;
       runLog_.Record(event, fields.str());
+    } catch (...) {
+    }
+  }
+
+  void WriteSdkTimings() const noexcept {
+    try {
+      std::wostringstream fields;
+      const auto write = [&](std::wstring_view step, std::wstring_view durationField,
+                             const modlist::PipelineStepTiming& timing) {
+        using State = modlist::PipelineStepState;
+        const wchar_t* state = L"skipped";
+        switch (timing.state) {
+          case State::Completed: state = L"completed"; break;
+          case State::Failed: state = L"failed"; break;
+          case State::Aborted: state = L"aborted"; break;
+          case State::Cancelled: state = L"cancelled"; break;
+          case State::Skipped: break;
+        }
+        fields << step << L"_state=" << state << L" " << durationField << L"=";
+        if (timing.state == State::Skipped) fields << L"unavailable";
+        else fields << timing.nanoseconds / 1000000;
+      };
+      write(L"sdk_open", L"sdk_open_ms", diagnostics.timings.open);
+      fields << L" ";
+      write(L"sdk_extract", L"sdk_extract_ms", diagnostics.timings.extract);
+      fields << L" ";
+      write(L"final_verify", L"final_verify_wait_ms", diagnostics.timings.finalVerification);
+      runLog_.Record(L"sdk_timings", fields.str());
     } catch (...) {
     }
   }
@@ -2236,6 +2304,7 @@ private:
   const InstallRunLog& runLog_;
   std::atomic<uint64_t> validatedBytes_{0};
   std::atomic<int> extractionPercent_{0};
+  int64_t lastSampleElapsedMs_{0};  // Read by Finish only after joining the sampler.
   std::mutex waitMutex_;
   std::condition_variable_any wake_;
   std::jthread sampler_;
@@ -2363,7 +2432,7 @@ bool RunPipelinedExtractionStep(HWND hwnd,
       });
 
   const auto extractedAt = InstallRunLog::Clock::now();
-  sampler.Finish();
+  sampler.Finish(extractedAt);
   runLog.EndPhase(extractedAt);
   PostLog(hwnd, Widen(result.message));
   WriteLastSevenZipLog(result.output);
@@ -2868,12 +2937,14 @@ void RunInstallWorker(HWND hwnd,
   }
 
   std::optional<modlist::Manifest> manifest;
+  std::string manifestSha256;
   {
     std::wstring manifestMessage;
-    manifest = LoadPackageManifest(manifestMessage);
+    manifest = LoadPackageManifest(manifestMessage, &manifestSha256);
     PostLog(hwnd, manifestMessage);
   }
   if (!manifest.has_value()) {
+    runLog->Record(L"package", L"package_id=unavailable package_id_basis=unavailable");
     PostLog(hwnd, L"Необходим файл manifest.json рядом с установщиком.");
     PostValidationFailed(hwnd);
     finish();
@@ -2884,16 +2955,43 @@ void RunInstallWorker(HWND hwnd,
   const bool usePipeline =
       modlist::PipelinedSevenZipExtractor::CanUse(*manifest) && pipelineLibrary.ok();
   const bool direct = IsSameFolder(unpackFolder, installFolder);
-  std::wostringstream configLog;
-  configLog << L"mode=" << (direct ? L"direct" : L"staged")
-            << L" verification=" << (usePipeline ? L"inline" : L"separate")
-            << L" manifest_files=" << manifest->files.size()
-            << L" archive_bytes=" << ManifestRequiredBytes(*manifest)
-            << L" unpacked_bytes=" << manifest->unpackedSize
-            << L" source_root=\"" << ArchiveFolder().root_name().wstring()
-            << L"\" extraction_root=\"" << unpackFolder.root_name().wstring()
-            << L"\" final_root=\"" << installFolder.root_name().wstring() << L"\"";
-  runLog->Record(L"config", configLog.str());
+  try {
+    const auto manifestBytes = ManifestRequiredBytes(*manifest);
+    // The CLI resolves its own volume chain, which is not available to the log.
+    const auto archive = usePipeline ? modlist::PipelinedSevenZipExtractor::DescribeArchive(*manifest)
+                                     : std::nullopt;
+    std::wostringstream configLog;
+    configLog << L"mode=" << (direct ? L"direct" : L"staged")
+              << L" verification=" << (usePipeline ? L"inline" : L"separate")
+              << L" manifest_files=" << manifest->files.size()
+              << L" archive_bytes=" << manifestBytes << L" manifest_bytes=" << manifestBytes;
+    if (archive) {
+      configLog << L" selected_archive_bytes=" << archive->bytes
+                << L" selected_volumes=" << archive->volumeCount;
+    } else {
+      configLog << L" selected_archive_bytes=unavailable selected_volumes=unavailable";
+    }
+    if (archive && manifest->hashChunkSize > 0) {
+      configLog << L" selected_chunks=" << archive->chunkCount
+                << L" chunk_size_bytes=" << manifest->hashChunkSize;
+    } else {
+      configLog << L" selected_chunks=unavailable chunk_size_bytes=unavailable";
+    }
+    if (manifestSha256.empty()) {
+      configLog << L" package_id=unavailable package_id_basis=unavailable";
+    } else {
+      configLog << L" package_id=" << Widen(manifestSha256) << L" package_id_basis=manifest_sha256";
+    }
+    configLog << L" unpacked_bytes=" << manifest->unpackedSize
+              << L" source_root=\"" << ArchiveFolder().root_name().wstring()
+              << L"\" extraction_root=\"" << unpackFolder.root_name().wstring()
+              << L"\" final_root=\"" << installFolder.root_name().wstring() << L"\"";
+    if (usePipeline) configLog << L" sample_interval_s=" << kPipelineLogInterval.count();
+    runLog->Record(L"config", configLog.str());
+  } catch (...) {
+    // Diagnostics must not affect archive selection or installation.
+    runLog->Record(L"config", L"telemetry=unavailable");
+  }
   if (usePipeline) {
     PostLog(hwnd, L"Доступна асинхронная проверка SHA-256 во время распаковки.");
   } else {

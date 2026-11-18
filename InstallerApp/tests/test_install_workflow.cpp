@@ -40,12 +40,48 @@ void RequireWorkflow(bool condition, const char* message) {
   if (!condition) throw std::runtime_error(message);
 }
 
+std::string ReadAppLogFrom(uintmax_t offset) {
+  std::ifstream input(AppLogPath(), std::ios::binary);
+  input.seekg(static_cast<std::streamoff>(offset));
+  return std::string((std::istreambuf_iterator<char>(input)), {});
+}
+
+bool WaitForTimingSample(uintmax_t offset) {
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(70);
+  do {
+    if (ReadAppLogFrom(offset).find(" event=sample phase=verified_extract ") != std::string::npos) return true;
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  } while (std::chrono::steady_clock::now() < deadline);
+  return false;
+}
+
+void CheckFinalSnapshotOrder() {
+  const auto path = AppLogPath();
+  const auto offset = std::filesystem::exists(path) ? std::filesystem::file_size(path) : 0;
+  InstallRunLog run;
+  run.Phase(L"verified_extract");
+  PipelineLogSampler sampler(run);
+  const auto extractedAt = InstallRunLog::Clock::now();
+  RequireWorkflow(WaitForTimingSample(offset), "The sampler did not publish a late tick");
+  sampler.Finish(extractedAt);
+  const auto log = ReadAppLogFrom(offset);
+  std::smatch periodic, final;
+  RequireWorkflow(std::regex_search(log, periodic,
+      std::regex(R"(event=sample phase=verified_extract .*sample_elapsed_ms=([0-9]+))")) &&
+      std::regex_search(log, final,
+      std::regex(R"(event=counters phase=verified_extract .*sample_elapsed_ms=([0-9]+))")),
+      "Expected periodic and final snapshots");
+  RequireWorkflow(std::stoll(final[1]) >= std::stoll(periodic[1]),
+      "A late periodic tick made the final snapshot run backward");
+  run.EndPhase(extractedAt);
+  run.Finish(L"success");
+  std::cout << "PASS final snapshot order\n";
+}
+
 void CheckInstallTimingLog(uintmax_t offset, bool direct, bool pipeline, bool success,
                            uintmax_t payloadBytes) {
-  std::ifstream input(AppLogPath(), std::ios::binary);
-  RequireWorkflow(input.good(), "Installer did not save a timing log");
-  input.seekg(static_cast<std::streamoff>(offset));
-  const std::string log((std::istreambuf_iterator<char>(input)), {});
+  const auto log = ReadAppLogFrom(offset);
+  RequireWorkflow(!log.empty(), "Installer did not save a timing log");
   std::smatch start;
   RequireWorkflow(std::regex_search(log, start,
       std::regex(R"(INSTALL_PERF run=([0-9-]+) elapsed_ms=[0-9]+ event=run_start .*build=)")),
@@ -54,9 +90,12 @@ void CheckInstallTimingLog(uintmax_t offset, bool direct, bool pipeline, bool su
   const auto containsRecord = [&](const std::string& pattern) {
     return std::regex_search(log, std::regex(prefix + pattern));
   };
+  RequireWorkflow(containsRecord("run_start .*build_id=[^\\s]+"), "Timing log omitted the build ID");
   if (success || containsRecord("config ")) {
     RequireWorkflow(containsRecord(std::string("config .*mode=") + (direct ? "direct" : "staged") +
         " verification=" + (pipeline ? "inline" : "separate")), "Timing log chose the wrong route");
+    RequireWorkflow(containsRecord("config .*package_id=[0-9a-f]{64} package_id_basis=manifest_sha256"),
+        "Timing log did not identify the loaded manifest");
   }
   const std::string extraction = pipeline ? "verified_extract" : "extract";
   const bool reachedExtraction = success || containsRecord("phase_start phase=" + extraction + "\\r?\\n");
@@ -69,8 +108,22 @@ void CheckInstallTimingLog(uintmax_t offset, bool direct, bool pipeline, bool su
         "Timing log did not measure separate validation");
   }
   if (pipeline && reachedExtraction) {
-    RequireWorkflow(containsRecord("counters phase=verified_extract .*block_wait_ms=[0-9]+"),
-        "Timing log omitted verified extraction counters");
+    for (const auto* field : {"sample_elapsed_ms", "block_wait_ms", "input_read_ops", "block_loads",
+          "cache_hits", "cache_misses", "output_write_calls", "output_directory_checks",
+          "output_create_ms", "output_directory_ms", "output_close_ms", "output_metadata_ms"}) {
+      RequireWorkflow(containsRecord(std::string("counters phase=verified_extract .*") + field + "=[0-9]+"),
+          field);
+    }
+    RequireWorkflow(containsRecord("sdk_timings phase=verified_extract "
+        "sdk_open_state=[a-z]+ sdk_open_ms=(unavailable|[0-9]+) "
+        "sdk_extract_state=[a-z]+ sdk_extract_ms=(unavailable|[0-9]+) "
+        "final_verify_state=[a-z]+ final_verify_wait_ms=(unavailable|[0-9]+)"),
+        "Timing log omitted the SDK operation outcomes");
+    if (success || addLeftover) {
+      RequireWorkflow(containsRecord("sdk_timings phase=verified_extract "
+          "sdk_open_state=completed sdk_open_ms=[0-9]+ sdk_extract_state=completed sdk_extract_ms=[0-9]+ "
+          "final_verify_state=completed final_verify_wait_ms=[0-9]+"), "Successful SDK steps were not timed");
+    }
     if (success && payloadBytes > 0) {
       RequireWorkflow(containsRecord("counters phase=verified_extract .*output_bytes=" +
           std::to_string(payloadBytes) + " "), "Timing log did not count actual output bytes");
@@ -137,14 +190,7 @@ BOOL WINAPI workflow_barrier::Post(HWND window, UINT message, WPARAM wParam, LPA
     // Hold the first pipeline status callback until the independent log sampler writes.
     const auto offset = *timingSampleOffset;
     timingSampleOffset.reset();
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(70);
-    do {
-      std::ifstream input(AppLogPath(), std::ios::binary);
-      input.seekg(static_cast<std::streamoff>(offset));
-      const std::string log((std::istreambuf_iterator<char>(input)), {});
-      timingSampleSeen = log.find(" event=sample phase=verified_extract ") != std::string::npos;
-      if (!timingSampleSeen) std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    } while (!timingSampleSeen && std::chrono::steady_clock::now() < deadline);
+    timingSampleSeen = WaitForTimingSample(offset);
   }
   if (stagingToLock.empty() || message != kLogMessage || !lParam) {
     return ::PostMessageW(window, message, wParam, lParam);
@@ -175,6 +221,10 @@ BOOL WINAPI workflow_barrier::Post(HWND window, UINT message, WPARAM wParam, LPA
 int wmain(int argc, wchar_t** argv) {
   HWND capture = nullptr;
   try {
+    if (argc == 2 && std::wstring_view(argv[1]) == L"--test-final-snapshot-order") {
+      CheckFinalSnapshotOrder();
+      return 0;
+    }
     RequireWorkflow(argc == 4 || argc == 5, "Usage: installer_workflow_tests <new-output-parent> <direct|staged> <success|failure> [--root-level|--lock-staged-tree|--hold-for-timing-sample]");
     const std::filesystem::path output(argv[1]);
     const std::wstring route(argv[2]);

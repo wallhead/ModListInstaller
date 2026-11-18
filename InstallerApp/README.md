@@ -135,11 +135,51 @@ saved to disk only; the installer window still shows the usual archive messages.
 `stop_requested=1` records a request, not the cause of a failure. The ordinary
 log messages still give the stage's specific error or stop reason.
 
+The run header's `build_id` is embedded at build time; it does not require Git
+on the installer's machine. A Git build records its source revision, with
+`-dirty` for a modified checkout, not a hash of the local edits. Use the same
+executable for repeat runs. `package_id` identifies the exact loaded manifest
+bytes (`package_id_basis=manifest_sha256`), without reopening the manifest or
+reading the archives for diagnostics. Editing even manifest whitespace changes
+that ID. Unavailable IDs are explicitly marked.
+
+Use `selected_archive_bytes` and `selected_volumes` for the verified stream's
+archive chain. They exclude listed sidecars and are unavailable on the legacy
+CLI route, where 7-Zip resolves its own volumes. `selected_chunks` and
+`chunk_size_bytes` describe the selected chunked volumes.
+`manifest_bytes` includes all listed files;
+`archive_bytes` retains that same historical meaning for older log readers.
+The separate legacy validation pass still checks every listed file.
+
 Verified extraction logs a snapshot once per minute, even without a progress
-callback, and a final counter summary. Compare successive rows for input read,
-validated bytes, output bytes/files, block waits, hashing, and output writes.
-Counters and progress are cumulative; timings can overlap and should not be added together.
-Input bytes count reads from the archive, including rereads, not physical disk traffic.
+callback, and a final counter summary. Use differences in `sample_elapsed_ms`
+within one run and phase to compare valid samples. The final sample uses the
+extractor's return time (or a later periodic tick if one raced with completion).
+Extraction phase duration always ends at the extractor's return. Ignore
+nonpositive sample intervals.
+Counters are cumulative, independently read, and nonadditive:
+
+- `input_read_bytes` and `input_read_ops` count application reads that completed,
+  including rereads and cached reads, not physical disk traffic.
+- `block_loads` counts successful cache fills; `block_reloads` is the subset
+  already verified. `cache_hits` and `cache_misses` count decoder demand lookups.
+- `output_write_calls` counts attempted writes and `output_directory_checks`
+  counts directory operations, including existing directories and failures.
+  `output_create_ms`, `output_directory_ms`, and `output_close_ms` break out
+  the metadata time. `output_metadata_ms` sums their raw timings before rounding.
+- `block_wait_ms` counts decoder demand waits, not the final verification tail.
+  Input waits, hashing, and output timings can overlap. A duration may be
+  credited only when the operation completes, so a flat sample does not rule
+  out a long wait or write in progress.
+
+The final `sdk_timings` row measures the verified archive open (`sdk_open_ms`),
+the SDK extraction call (`sdk_extract_ms`), and the remaining wait for full
+validation (`final_verify_wait_ms`). A skipped step has an unavailable duration;
+a measured step can take zero whole milliseconds. SDK extraction time includes
+input and output waits, not just decoding. The verification wait is not total
+hashing time. An SDK `aborted` state reports its return code, not the cause of
+an installation failure. A completed SDK call does not by itself mean the
+installation succeeded.
 
 Build the separate portable diagnostic utility with `scripts\build-diagnostics.ps1`.
 It generates 10/20/30 GiB, measures cross-disk bulk/small-file copying, and compares

@@ -6,11 +6,19 @@
 #include "paths/PathValidator.h"
 
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <functional>
+#include <optional>
 
 namespace modlist {
+
+struct PipelineArchiveInfo {
+  uint64_t bytes;
+  size_t volumeCount;
+  uint64_t chunkCount;
+};
 
 struct PipelineExtractionProgress {
   int extractionPercent{0};
@@ -26,7 +34,14 @@ struct PipelineExtractionProgress {
   size_t extractionArchiveCount{0};
 };
 
-// Cumulative, independently readable counters; timings overlap and are not additive.
+enum class PipelineStepState { Skipped, Completed, Failed, Aborted, Cancelled };
+
+struct PipelineStepTiming {
+  PipelineStepState state{PipelineStepState::Skipped};
+  uint64_t nanoseconds{0};
+};
+
+// Cumulative, independently readable counters; durations can overlap and are not additive.
 struct PipelineExtractionDiagnostics {
   // Completed successful overlapped reads, including rereads; not physical device traffic.
   std::atomic<uint64_t> inputDiskBytes{0};
@@ -52,6 +67,12 @@ struct PipelineExtractionDiagnostics {
   // create_directories calls, including existing directories, root and failed checks.
   std::atomic<uint64_t> outputDirectoriesChecked{0};
   std::atomic<uint64_t> outputDirectoryNanoseconds{0};
+  // Per extraction, not cumulative. Read only after Extract returns.
+  struct {
+    PipelineStepTiming open;
+    PipelineStepTiming extract;
+    PipelineStepTiming finalVerification;
+  } timings;
 };
 
 struct PipelinedExtractionConfig {
@@ -70,6 +91,7 @@ class PipelinedSevenZipExtractor {
 public:
   using ProgressCallback = std::function<void(const PipelineExtractionProgress&)>;
 
+  static std::optional<PipelineArchiveInfo> DescribeArchive(const Manifest& manifest);
   static bool CanUse(const Manifest& manifest);
   Result<std::filesystem::path> LocateLibrary(const std::filesystem::path& appRoot) const;
   Result<ExtractionPathPlan> PlanExtraction(

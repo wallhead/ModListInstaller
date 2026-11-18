@@ -1,3 +1,7 @@
+add_executable(installer_build_identity_tests test_build_identity.cpp)
+target_link_libraries(installer_build_identity_tests PRIVATE installer_core)
+add_test(NAME installer_build_identity_tests COMMAND installer_build_identity_tests)
+
 add_executable(installer_core_tests test_main.cpp ../src/ui/NativeStrings.cpp)
 target_include_directories(installer_core_tests PRIVATE ../resources)
 if(WIN32)

@@ -958,6 +958,26 @@ void TestPipelinedExtractor() {
   }
   manifest.extract.firstArchivePart = manifest.files.front().path;
 
+  auto manifestWithExtraFile = manifest;
+  ManifestFile extraFile;
+  extraFile.path = "unrelated.bin";
+  extraFile.size = 123;
+  extraFile.chunkSha256 = {"unused"};
+  manifestWithExtraFile.files.push_back(std::move(extraFile));
+  uint64_t archiveBytes = 0;
+  uint64_t archiveChunks = 0;
+  for (const auto& file : manifest.files) {
+    archiveBytes += file.size;
+    archiveChunks += file.chunkSha256.size();
+  }
+  const auto archiveInfo = PipelinedSevenZipExtractor::DescribeArchive(manifestWithExtraFile);
+  Expect(archiveInfo && archiveInfo->bytes == archiveBytes &&
+             archiveInfo->volumeCount == parts.size() && archiveInfo->chunkCount == archiveChunks,
+         "Archive description must count only the selected split volumes");
+  manifestWithExtraFile.extract.firstArchivePart.clear();
+  Expect(!PipelinedSevenZipExtractor::DescribeArchive(manifestWithExtraFile),
+         "An undeclared first part must not have an archive description");
+
   PipelinedSevenZipExtractor extractor;
   const auto sdkCache = root / "sdk-cache";
   const auto library = extractor.LocateLibrary(sdkCache);
@@ -1002,6 +1022,10 @@ void TestPipelinedExtractor() {
   for (auto& file : legacyManifest.files) {
     file.chunkSha256.clear();
   }
+  const auto legacyInfo = PipelinedSevenZipExtractor::DescribeArchive(legacyManifest);
+  Expect(legacyInfo && legacyInfo->bytes == archiveBytes &&
+             legacyInfo->volumeCount == parts.size() && legacyInfo->chunkCount == 0,
+         "Archive description must work for legacy volumes without chunk hashes");
   auto legacyConfig = config;
   legacyConfig.manifest = &legacyManifest;
   const auto legacyPlan = extractor.PlanExtraction(legacyConfig, output, root / "Unpacking");
@@ -1039,6 +1063,10 @@ void TestPipelinedExtractor() {
     }
   });
   Expect(result.ok, result.message.c_str());
+  Expect(diagnostics.timings.open.state == PipelineStepState::Completed &&
+             diagnostics.timings.extract.state == PipelineStepState::Completed &&
+             diagnostics.timings.finalVerification.state == PipelineStepState::Completed,
+         "Successful extraction must complete all three verified steps");
   Expect(std::filesystem::is_directory(output / "small-files" / "empty" / "nested"),
          "Pipelined extraction must preserve explicit empty directories");
   uint64_t actualOutputBytes = 0;
@@ -1128,6 +1156,15 @@ void TestPipelinedExtractor() {
              diagnostics.outputFilesCreated.load() == actualOutputFiles,
          "A subsequent extraction without diagnostics must not update prior counters");
 
+  missingConfig.diagnostics = &diagnostics;
+  Expect(!extractor.Extract(missingConfig).ok,
+         "A missing archive volume must fail before opening the archive in the SDK");
+  for (const auto& timing : {diagnostics.timings.open, diagnostics.timings.extract,
+                             diagnostics.timings.finalVerification}) {
+    Expect(timing.state == PipelineStepState::Skipped && timing.nanoseconds == 0,
+           "Reused diagnostics must reset skipped steps to zero duration");
+  }
+
   auto stoppedConfig = config;
   stoppedConfig.installFolder = root / "stopped-output";
   stoppedConfig.cancelRequested = &cancelled;
@@ -1170,12 +1207,14 @@ void TestPipelinedExtractor() {
   auto trailingConfig = config;
   trailingConfig.manifest = &trailingManifest;
   trailingConfig.installFolder = root / "trailing-output";
-  trailingConfig.diagnostics = nullptr;
+  trailingConfig.diagnostics = &diagnostics;
   PipelineExtractionProgress trailingProgress;
   const auto trailingResult = extractor.Extract(trailingConfig, [&](const auto& progress) {
     trailingProgress = progress;
   });
   Expect(trailingResult.ok, trailingResult.message.c_str());
+  Expect(diagnostics.timings.finalVerification.state == PipelineStepState::Completed,
+         "Final verification must complete for a valid unused tail");
   Expect(trailingProgress.validatedBytes == trailingProgress.validationTotalBytes,
          "Final verification must cover trailing data not consumed by decoding");
   {
@@ -1184,6 +1223,7 @@ void TestPipelinedExtractor() {
     trailing.put('X');
   }
   trailingConfig.installFolder = root / "corrupted-tail-output";
+  trailingConfig.diagnostics = nullptr;
   const auto corruptedTail = extractor.Extract(trailingConfig);
   Expect(!corruptedTail.ok && corruptedTail.message.find("SHA256 mismatch") != std::string::npos,
          "A corrupt unused tail chunk must fail final verification");

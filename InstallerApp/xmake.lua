@@ -44,6 +44,7 @@ target("installer_core")
     add_includedirs("src", "resources", {public = true})
     add_files(
         "src/app/PackageDiscovery.cpp",
+        "src/common/BuildIdentity.cpp",
         "src/downloader/LibtorrentDownloader.cpp",
         "src/extractor/PipelinedSevenZipExtractor.cpp",
         "src/extractor/SevenZipExtractor.cpp",
@@ -55,6 +56,41 @@ target("installer_core")
         "src/tracker/TrackerProvider.cpp",
         "src/verifier/Sha256.cpp",
         "src/verifier/Verifier.cpp")
+
+    on_load(function (target)
+        target:add("includedirs", path.join(target:autogendir(), "build_identity"))
+    end)
+    before_build(function (target)
+        local function git(...)
+            local args = {"--no-optional-locks", "-C", os.projectdir(), ...}
+            return try {function ()
+                local out, err = os.iorunv("git", args)
+                if not err or err == "" then
+                    return (out or ""):trim()
+                end
+            end}
+        end
+
+        local id = "unavailable"
+        -- An exported source tree inside an unrelated checkout is not a Git build.
+        if git("cat-file", "-e", "HEAD:./xmake.lua") then
+            local revision = git("rev-parse", "--verify", "HEAD^{commit}")
+            if revision and (#revision == 40 or #revision == 64) and revision:match("^[0-9a-f]+$") then
+                local status = git("status", "--porcelain=v1", "--untracked-files=normal", "--ignore-submodules=none")
+                if status then
+                    id = revision .. (status == "" and "" or "-dirty")
+                end
+            end
+        end
+
+        local dir = path.join(target:autogendir(), "build_identity")
+        local header = path.join(dir, "ModlistBuildIdentity.generated.h")
+        local content = '#define MODLIST_BUILD_ID "' .. id .. '"\n'
+        if not os.isfile(header) or io.readfile(header) ~= content then
+            os.mkdir(dir)
+            io.writefile(header, content)
+        end
+    end)
 
     if is_plat("windows") then
         add_files("src/paths/FolderCleanup.cpp")
@@ -97,6 +133,13 @@ target("installer_core_tests")
     if is_plat("windows") then
         add_files("resources/app.rc")
     end
+    add_deps("installer_core")
+target_end()
+
+target("installer_build_identity_tests")
+    set_kind("binary")
+    set_default(false)
+    add_files("tests/test_build_identity.cpp")
     add_deps("installer_core")
 target_end()
 

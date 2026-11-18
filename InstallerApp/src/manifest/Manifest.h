@@ -68,7 +68,9 @@ struct Manifest {
 
 class ManifestLoader {
 public:
-  Result<Manifest> LoadFromFile(const std::filesystem::path& path) const;
+  // Optional diagnostics fingerprint of the same bytes that were parsed.
+  Result<Manifest> LoadFromFile(const std::filesystem::path& path,
+                                std::string* manifestSha256 = nullptr) const;
   Result<Manifest> LoadFromString(const std::string& json) const;
 };
 

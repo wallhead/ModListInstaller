@@ -41,6 +41,26 @@ using namespace sevenzip_sdk;
 
 constexpr uint64_t kMaxPipelineChunkSize = 256ull * 1024ull * 1024ull;
 
+PipelineStepState SdkStepState(HRESULT result) {
+  if (result == S_OK) {
+    return PipelineStepState::Completed;
+  }
+  return result == E_ABORT ? PipelineStepState::Aborted : PipelineStepState::Failed;
+}
+
+template <typename Call, typename Classify>
+auto MeasurePipelineCall(PipelineStepTiming* timing, Call call, Classify classify) {
+  if (timing == nullptr) {
+    return call();
+  }
+  const auto start = std::chrono::steady_clock::now();
+  const auto result = call();
+  const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
+      std::chrono::steady_clock::now() - start).count();
+  *timing = {classify(result), static_cast<uint64_t>(elapsed)};
+  return result;
+}
+
 class DiagnosticTimer {
 public:
   explicit DiagnosticTimer(std::atomic<uint64_t>* counter) : counter_(counter) {
@@ -669,7 +689,7 @@ public:
     return error_.empty() && !volumes_.empty() && !chunks_.empty();
   }
 
-  bool VerifyAll() {
+  bool VerifyAll(bool& cancelled) {
     std::unique_lock lock(mutex_);
     if (!error_.empty()) {
       return false;
@@ -679,7 +699,9 @@ public:
     condition_.wait(lock, [&]() {
       return !error_.empty() || IsCancelled() || verifiedCount_ == chunks_.size();
     });
-    return error_.empty() && !IsCancelled() && verifiedCount_ == chunks_.size();
+    const bool noError = error_.empty();
+    cancelled = noError && IsCancelled();
+    return noError && !cancelled && verifiedCount_ == chunks_.size();
   }
 
   std::string Error() const {
@@ -1317,6 +1339,23 @@ uint64_t ManifestBytes(const Manifest& manifest) {
 
 }  // namespace
 
+std::optional<PipelineArchiveInfo> PipelinedSevenZipExtractor::DescribeArchive(
+    const Manifest& manifest) {
+  if (manifest.extract.firstArchivePart.empty()) {
+    return std::nullopt;
+  }
+  const auto volumes = ArchiveVolumes(manifest);
+  if (volumes.empty()) {
+    return std::nullopt;
+  }
+  PipelineArchiveInfo info{0, volumes.size(), 0};
+  for (const auto* volume : volumes) {
+    info.bytes += volume->size;
+    info.chunkCount += volume->chunkSha256.size();
+  }
+  return info;
+}
+
 bool PipelinedSevenZipExtractor::CanUse(const Manifest& manifest) {
   if (ArchiveFormat(manifest) == nullptr || manifest.hashChunkSize == 0 || manifest.hashChunkSize > kMaxPipelineChunkSize) {
     return false;
@@ -1409,6 +1448,10 @@ Result<ExtractionPathPlan> PipelinedSevenZipExtractor::PlanExtraction(
 ExtractionResult PipelinedSevenZipExtractor::Extract(
     const PipelinedExtractionConfig& config,
     ProgressCallback progressCallback) const {
+  auto* timings = config.diagnostics == nullptr ? nullptr : &config.diagnostics->timings;
+  if (timings != nullptr) {
+    *timings = {};
+  }
   ExtractionResult result;
   result.command = "7z.dll verified asynchronous pipeline";
   result.exitCode = 2;
@@ -1458,7 +1501,9 @@ ExtractionResult PipelinedSevenZipExtractor::Extract(
 
   ComPtr<IArchiveOpenCallback> openCallback(new ArchiveOpenCallback());
   const UInt64 maxCheckStartPosition = 0;
-  HRESULT operation = archive->Open(stream.Get(), &maxCheckStartPosition, openCallback.Get());
+  HRESULT operation = MeasurePipelineCall(timings != nullptr ? &timings->open : nullptr, [&] {
+    return archive->Open(stream.Get(), &maxCheckStartPosition, openCallback.Get());
+  }, SdkStepState);
   if (operation != S_OK) {
     result.message = rawStream->Error().empty()
         ? "7-Zip could not open the verified virtual archive"
@@ -1513,9 +1558,20 @@ ExtractionResult PipelinedSevenZipExtractor::Extract(
     auto* rawExtractCallback = new ArchiveExtractCallback(
         archive.Get(), config.installFolder, config.cancelRequested, reporter, config.diagnostics);
     ComPtr<IArchiveExtractCallback> extractCallback(rawExtractCallback);
-    operation = archive->Extract(
-        nullptr, std::numeric_limits<UInt32>::max(), 0, extractCallback.Get());
-    const bool allValidated = operation == S_OK && rawStream->VerifyAll();
+    operation = MeasurePipelineCall(timings != nullptr ? &timings->extract : nullptr, [&] {
+      return archive->Extract(
+          nullptr, std::numeric_limits<UInt32>::max(), 0, extractCallback.Get());
+    }, SdkStepState);
+    bool verificationCancelled = false;
+    const bool allValidated = operation == S_OK && MeasurePipelineCall(
+        timings != nullptr ? &timings->finalVerification : nullptr,
+        [&] { return rawStream->VerifyAll(verificationCancelled); },
+        [&](bool verified) {
+          if (verified) {
+            return PipelineStepState::Completed;
+          }
+          return verificationCancelled ? PipelineStepState::Cancelled : PipelineStepState::Failed;
+        });
     if (operation == S_OK && allValidated && rawExtractCallback->Errors() == 0) {
       reporter->FinishExtraction();
       result.ok = true;

@@ -54,6 +54,15 @@ function Use-LegacyManifest($Fixture) {
     [IO.File]::WriteAllText($Fixture.Manifest,($legacy | ConvertTo-Json -Depth 6))
 }
 
+function Add-ListedSidecar($Fixture) {
+    $sidecar = Join-Path $Fixture.Package 'notes.txt'
+    [IO.File]::WriteAllText($sidecar,'Listed in the manifest, not part of the archive.')
+    $sha = (Get-FileHash -LiteralPath $sidecar -Algorithm SHA256).Hash.ToLowerInvariant()
+    $manifest = Get-Content -LiteralPath $Fixture.Manifest -Raw | ConvertFrom-Json
+    $manifest.files += [pscustomobject]@{path='notes.txt';size=(Get-Item -LiteralPath $sidecar).Length;sha256=$sha;chunks=@($sha)}
+    [IO.File]::WriteAllText($Fixture.Manifest,($manifest | ConvertTo-Json -Depth 8))
+}
+
 function Test-Install([string]$Name,$Fixture,[string]$Route,[string]$Option,[string]$Expectation='success') {
     try {
         $output = Join-Path $WorkRoot $Name
@@ -65,6 +74,21 @@ function Test-Install([string]$Name,$Fixture,[string]$Route,[string]$Option,[str
         $expectedSuccess = [int]($Expectation -eq 'success')
         if ($code -ne 0 -or $text -notmatch "worker_success=$expectedSuccess") { throw $text }
         if ($Option -and $text -notmatch 'staging_retained=1') { throw 'Expected retained staging outcome was not observed.' }
+        $archiveParts = @(Get-ChildItem -LiteralPath $Fixture.Package -File -Filter 'Fixture.7z.*')
+        $selectedBytes = ($archiveParts | Measure-Object -Property Length -Sum).Sum
+        $sidecar = Join-Path $Fixture.Package 'notes.txt'
+        $manifestBytes = $selectedBytes
+        if (Test-Path -LiteralPath $sidecar) { $manifestBytes += (Get-Item -LiteralPath $sidecar).Length }
+        $packageId = (Get-FileHash -LiteralPath $Fixture.Manifest -Algorithm SHA256).Hash.ToLowerInvariant()
+        $isChunked = (Get-Content -LiteralPath $Fixture.Manifest -Raw | ConvertFrom-Json).schema -eq 'modlist-manifest-chunks-v1'
+        $config = Select-String -LiteralPath (Join-Path $Fixture.Package 'logs\modlist-installer.log') -Pattern 'INSTALL_PERF .* event=config ' |
+            Select-Object -Last 1 -ExpandProperty Line
+        $expectedBytes = if ($isChunked) { $selectedBytes } else { 'unavailable' }
+        $expectedVolumes = if ($isChunked) { $archiveParts.Count } else { 'unavailable' }
+        foreach ($field in @("archive_bytes=$manifestBytes","manifest_bytes=$manifestBytes",
+                "selected_archive_bytes=$expectedBytes","selected_volumes=$expectedVolumes","package_id=$packageId")) {
+            if ($config -notmatch (' ' + $field + '( |$)')) { throw "Wrong or missing config field: $field" }
+        }
         $verification = @{
             Source=$Fixture.Source
             Destinations=@((Join-Path $output 'installed\Fixture'))
@@ -91,6 +115,7 @@ try {
             }
             [IO.File]::WriteAllText($entry,'An ordinary archive entry, not a work folder')
             Build-Package $fixture
+            if ($kind -eq 'file' -and $case -eq 'lower') { Add-ListedSidecar $fixture }
             foreach ($route in @('direct','staged')) { Test-Install "$kind-$case-sdk-$route" $fixture $route }
             Use-LegacyManifest $fixture
             foreach ($route in @('direct','staged')) { Test-Install "$kind-$case-cli-$route" $fixture $route }
