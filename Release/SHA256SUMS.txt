@@ -1,1 +1,1 @@
-809f7aa069907f23d7d420d73e35ddde33bace6be773b4cfff631808b723137f  ModlistInstaller-v0.3.9.zip
+b24899c609fca69ae79e4e62bdad0adda22ce122c69c4606ed8e26af85e02242  ModlistInstaller-v0.3.10.zip

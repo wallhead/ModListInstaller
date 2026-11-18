@@ -25,3 +25,13 @@ and archive volumes. No repacking is needed.
 
 This is a diagnostics update. The interface, package format, and verification
 policy are unchanged. For a slow installation, share `logs\modlist-installer.log`.
+
+## Verification
+
+The installer embeds clean source revision `868608cf68c0c3a2e954f02cdb6da412e2a91501`.
+Both release builds passed the runtime-import checks. All 60 packer tests,
+18 installer finalization cases, and 5 CMake tests passed. Pack-to-install smoke
+tests verified payload contents on direct and staged routes for split 7z, ZIP,
+and Cyrillic paths. A damaged volume was rejected, and the installer logged
+a minute sample while the progress callback was paused. No clean-VM test was
+performed.
