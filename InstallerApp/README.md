@@ -125,6 +125,22 @@ The script configures xmake for release, rebuilds embedded assets, runs tests, a
 
 ## Performance Diagnostics
 
+For a slow install, collect `logs\modlist-installer.log` beside the installer.
+The `INSTALL_PERF` rows group each attempt by run ID and record its build,
+direct/staged route, verification mode, monotonic phase timings and outcome.
+Use `duration_ms` for phase time; `elapsed_ms` is the run time when the row
+was recorded and can include time spent writing earlier log rows.
+Cleanup confirmation time is separated from actual cleanup. These rows are
+saved to disk only; the installer window still shows the usual archive messages.
+`stop_requested=1` records a request, not the cause of a failure. The ordinary
+log messages still give the stage's specific error or stop reason.
+
+Verified extraction logs a snapshot once per minute, even without a progress
+callback, and a final counter summary. Compare successive rows for input read,
+validated bytes, output bytes/files, block waits, hashing, and output writes.
+Counters and progress are cumulative; timings can overlap and should not be added together.
+Input bytes count reads from the archive, including rereads, not physical disk traffic.
+
 Build the separate portable diagnostic utility with `scripts\build-diagnostics.ps1`.
 It generates 10/20/30 GiB, measures cross-disk bulk/small-file copying, and compares
 the real verified extraction pipeline against ordinary 7-Zip using the same

@@ -18,10 +18,10 @@ PackerApp/dist/modlist-packer.exe
 Ready-to-use versioned release archives are written to:
 
 ```text
-Release/ModlistInstaller-v0.3.8.zip
+Release/ModlistInstaller-v0.3.9.zip
 ```
 
-Download [v0.3.8](https://github.com/wallhead/ModListInstaller/releases/tag/v0.3.8), extract the ZIP, and run `modlist-packer.exe` inside its folder. The archive includes the matching installer, README, and 7-Zip license. No separate VC++ Redistributable, browser runtime, or external UI files are needed. Published older ZIPs retain their original layout; current releases use the flat layout below.
+Download [v0.3.9](https://github.com/wallhead/ModListInstaller/releases/tag/v0.3.9), extract the ZIP, and run `modlist-packer.exe` inside its folder. The archive includes the matching installer, README, and 7-Zip license. No separate VC++ Redistributable, browser runtime, or external UI files are needed. Published older ZIPs retain their original layout; current releases use the flat layout below.
 
 ## Installer Runtime Layout
 

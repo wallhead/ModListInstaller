@@ -26,6 +26,7 @@
 #include <atomic>
 #include <array>
 #include <chrono>
+#include <condition_variable>
 #include <ctime>
 #include <cwctype>
 #include <deque>
@@ -46,6 +47,7 @@
 namespace {
 
 constexpr const wchar_t* kUnpackFolderName = L"Unpacking";
+constexpr std::wstring_view kInstallerBuildLabel = L"Modlist Installer v0.3.9 by WallHead";
 
 constexpr int kDownloadEdit = 1003;
 constexpr int kDownloadBrowse = 1004;
@@ -74,11 +76,34 @@ constexpr UINT kValidationFailedMessage = WM_APP + 5;
 constexpr UINT kInstallFilesFailedMessage = WM_APP + 6;
 constexpr UINT kExtractionPlanMessage = WM_APP + 7;
 
+class InstallRunLog {
+public:
+  using Clock = std::chrono::steady_clock;
+
+  InstallRunLog();
+  ~InstallRunLog() { Finish(L"aborted"); }
+  InstallRunLog(const InstallRunLog&) = delete;
+  InstallRunLog& operator=(const InstallRunLog&) = delete;
+
+  void Phase(std::wstring_view phase) noexcept;
+  void EndPhase(Clock::time_point ended = Clock::now()) noexcept;
+  void Record(std::wstring_view event, std::wstring_view fields = {}) const noexcept;
+  void Finish(std::wstring_view result, bool stopRequested = false) noexcept;
+
+private:
+  Clock::time_point started_ = Clock::now();
+  std::optional<Clock::time_point> phaseStarted_;
+  std::wstring id_;
+  std::wstring_view phase_;
+  bool finished_ = false;
+};
+
 struct PreparedExtraction {
   modlist::PackageDiscovery package;
   std::filesystem::path installFolder;
   modlist::ExtractionPathPlan plan;
   std::string inspectionError;
+  std::unique_ptr<InstallRunLog> runLog;
 };
 
 struct ManualInstallRequiredData {
@@ -113,11 +138,13 @@ HWND g_mainWindow = nullptr;
 modlist::NativeInstallerView g_nativeView;
 modlist::NativeStrings g_strings;
 std::wstring g_archiveFolderName;
+std::mutex g_appLogMutex;
 struct PendingFolderCleanup {
   std::filesystem::path unpackFolder;
   std::filesystem::path installFolder;
   std::optional<modlist::FolderCleanupTicket> unpackTicket;
   std::optional<modlist::FolderCleanupTicket> installTicket;
+  std::unique_ptr<InstallRunLog> runLog;
 
   bool empty() const {
     return unpackFolder.empty() && installFolder.empty();
@@ -328,9 +355,60 @@ std::filesystem::path AppLogPath() {
 }
 
 void AppendAppLog(const std::wstring& text) {
+  std::lock_guard lock(g_appLogMutex);
   std::ofstream log(AppLogPath(), std::ios::binary | std::ios::app);
   if (log) {
     log << Timestamp() << " " << Narrow(text) << "\r\n";
+  }
+}
+
+InstallRunLog::InstallRunLog() {
+  static std::atomic_uint sequence{0};
+  id_ = std::to_wstring(GetCurrentProcessId()) + L"-" + std::to_wstring(GetTickCount64()) +
+      L"-" + std::to_wstring(sequence.fetch_add(1, std::memory_order_relaxed) + 1);
+  Record(L"run_start", L"schema=1 build=\"" + UiText("app_version", kInstallerBuildLabel) + L"\"");
+}
+
+void InstallRunLog::Record(std::wstring_view event, std::wstring_view fields) const noexcept {
+  try {
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - started_);
+    std::wostringstream line;
+    line << L"INSTALL_PERF run=" << id_ << L" elapsed_ms=" << elapsed.count()
+         << L" event=" << event;
+    if (!phase_.empty()) line << L" phase=" << phase_;
+    if (!fields.empty()) line << L" " << fields;
+    AppendAppLog(line.str());
+  } catch (...) {
+    // A diagnostic write must not interrupt installation.
+  }
+}
+
+void InstallRunLog::EndPhase(Clock::time_point ended) noexcept {
+  if (!phaseStarted_) return;
+  const auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(ended - *phaseStarted_);
+  phaseStarted_.reset();
+  try {
+    Record(L"phase_end", L"duration_ms=" + std::to_wstring(duration.count()));
+  } catch (...) {
+  }
+}
+
+void InstallRunLog::Phase(std::wstring_view phase) noexcept {
+  if (finished_) return;
+  EndPhase();
+  phase_ = phase;
+  phaseStarted_ = Clock::now();
+  Record(L"phase_start");
+}
+
+void InstallRunLog::Finish(std::wstring_view result, bool stopRequested) noexcept {
+  if (finished_) return;
+  finished_ = true;
+  EndPhase();
+  try {
+    Record(L"run_end", L"result=" + std::wstring(result) +
+        (stopRequested ? L" stop_requested=1" : L" stop_requested=0"));
+  } catch (...) {
   }
 }
 
@@ -2094,8 +2172,78 @@ bool RunExtractionStep(HWND hwnd,
   return result.ok;
 }
 
+class PipelineLogSampler {
+public:
+  explicit PipelineLogSampler(const InstallRunLog& runLog) : runLog_(runLog) {
+    try {
+      sampler_ = std::jthread([this](std::stop_token stop) {
+        std::unique_lock lock(waitMutex_);
+        while (!stop.stop_requested()) {
+          // Sample even when 7-Zip is not issuing progress callbacks.
+          wake_.wait_for(lock, stop, std::chrono::minutes(1), [] { return false; });
+          if (!stop.stop_requested()) WriteSnapshot(L"sample");
+        }
+      });
+    } catch (const std::system_error&) {
+      // A failed sampler start still permits the final counter summary.
+    }
+  }
+
+  void Publish(const modlist::PipelineExtractionProgress& progress) noexcept {
+    // Callbacks can arrive out of order. Keep high-water progress, not a part index.
+    UpdateMaximum(validatedBytes_, progress.validatedBytes);
+    UpdateMaximum(extractionPercent_, progress.extractionPercent);
+  }
+
+  void Finish() {
+    if (sampler_.joinable()) {
+      sampler_.request_stop();
+      sampler_.join();
+    }
+    WriteSnapshot(L"counters");
+  }
+
+  modlist::PipelineExtractionDiagnostics diagnostics;
+
+private:
+  template <typename T>
+  static void UpdateMaximum(std::atomic<T>& counter, T value) noexcept {
+    auto previous = counter.load(std::memory_order_relaxed);
+    while (previous < value && !counter.compare_exchange_weak(previous, value, std::memory_order_relaxed)) {}
+  }
+
+  void WriteSnapshot(std::wstring_view event) const noexcept {
+    try {
+      const auto load = [](const auto& counter) { return counter.load(std::memory_order_relaxed); };
+      std::wostringstream fields;
+      fields << L"basis=cumulative_nonadditive validated_bytes=" << load(validatedBytes_)
+             << L" extraction_percent=" << load(extractionPercent_)
+             << L" input_read_bytes=" << load(diagnostics.inputDiskBytes)
+             << L" output_bytes=" << load(diagnostics.outputBytesWritten)
+             << L" output_files=" << load(diagnostics.outputFilesCreated)
+             << L" block_reloads=" << load(diagnostics.blockReloads)
+             << L" block_wait_ms=" << load(diagnostics.blockWaitNanoseconds) / 1000000
+             << L" read_wait_ms=" << load(diagnostics.diskWaitNanoseconds) / 1000000
+             << L" hash_ms=" << load(diagnostics.hashNanoseconds) / 1000000
+             << L" output_metadata_ms=" << (load(diagnostics.outputCreateNanoseconds) +
+                  load(diagnostics.outputDirectoryNanoseconds) + load(diagnostics.outputCloseNanoseconds)) / 1000000
+             << L" write_ms=" << load(diagnostics.outputWriteNanoseconds) / 1000000;
+      runLog_.Record(event, fields.str());
+    } catch (...) {
+    }
+  }
+
+  const InstallRunLog& runLog_;
+  std::atomic<uint64_t> validatedBytes_{0};
+  std::atomic<int> extractionPercent_{0};
+  std::mutex waitMutex_;
+  std::condition_variable_any wake_;
+  std::jthread sampler_;
+};
+
 bool RunPipelinedExtractionStep(HWND hwnd,
                                 const modlist::PipelinedExtractionConfig& extraction,
+                                InstallRunLog& runLog,
                                 int progressBase,
                                 int progressSpan) {
   PostLog(hwnd, L"Асинхронная проверка и распаковка: " +
@@ -2118,10 +2266,14 @@ bool RunPipelinedExtractionStep(HWND hwnd,
     size_t nextExtractedArchive{0};
   };
   const auto activityLog = std::make_shared<PipelineActivityLogState>();
+  PipelineLogSampler sampler(runLog);
+  auto measuredExtraction = extraction;
+  measuredExtraction.diagnostics = &sampler.diagnostics;
   modlist::PipelinedSevenZipExtractor extractor;
   const auto result = extractor.Extract(
-      extraction,
-      [hwnd, progressBase, progressSpan, startedAt, activityLog](const auto& progress) {
+      measuredExtraction,
+      [hwnd, progressBase, progressSpan, startedAt, activityLog, &sampler](const auto& progress) {
+        sampler.Publish(progress);
         const int validationPercent = progress.validationTotalBytes > 0
             ? static_cast<int>(std::min<uint64_t>(
                   100, progress.validatedBytes * 100 / progress.validationTotalBytes))
@@ -2210,6 +2362,9 @@ bool RunPipelinedExtractionStep(HWND hwnd,
         PostStatus(hwnd, status.str());
       });
 
+  const auto extractedAt = InstallRunLog::Clock::now();
+  sampler.Finish();
+  runLog.EndPhase(extractedAt);
   PostLog(hwnd, Widen(result.message));
   WriteLastSevenZipLog(result.output);
   if (!result.ok) {
@@ -2693,14 +2848,21 @@ bool InstallExtractedFiles(HWND hwnd, const std::filesystem::path& unpackFolder,
 void RunInstallWorker(HWND hwnd,
                       modlist::PackageDiscovery package,
                       std::filesystem::path unpackFolder,
-                      std::filesystem::path installFolder) {
+                      std::filesystem::path installFolder,
+                      std::unique_ptr<InstallRunLog> runLog = {}) {
+  if (!runLog) runLog = std::make_unique<InstallRunLog>();
+  const auto finish = [&](bool installed = false) {
+    runLog->Finish(installed ? L"success" : L"failed", g_stopRequested.load());
+    FinishWorker(hwnd, installed);
+  };
+  runLog->Phase(L"worker_preflight");
   g_workerRunning = true;
   PostProgress(hwnd, 0);
   PostLog(hwnd, L"Начало проверки...");
   for (const auto& folder : {unpackFolder, installFolder}) {
     if (const auto error = RuntimeOverlapError(folder); error.has_value()) {
       PostLog(hwnd, *error);
-      FinishWorker(hwnd);
+      finish();
       return;
     }
   }
@@ -2714,13 +2876,24 @@ void RunInstallWorker(HWND hwnd,
   if (!manifest.has_value()) {
     PostLog(hwnd, L"Необходим файл manifest.json рядом с установщиком.");
     PostValidationFailed(hwnd);
-    FinishWorker(hwnd);
+    finish();
     return;
   }
   modlist::PipelinedSevenZipExtractor pipelineExtractor;
   const auto pipelineLibrary = pipelineExtractor.LocateLibrary(ExeFolder());
   const bool usePipeline =
       modlist::PipelinedSevenZipExtractor::CanUse(*manifest) && pipelineLibrary.ok();
+  const bool direct = IsSameFolder(unpackFolder, installFolder);
+  std::wostringstream configLog;
+  configLog << L"mode=" << (direct ? L"direct" : L"staged")
+            << L" verification=" << (usePipeline ? L"inline" : L"separate")
+            << L" manifest_files=" << manifest->files.size()
+            << L" archive_bytes=" << ManifestRequiredBytes(*manifest)
+            << L" unpacked_bytes=" << manifest->unpackedSize
+            << L" source_root=\"" << ArchiveFolder().root_name().wstring()
+            << L"\" extraction_root=\"" << unpackFolder.root_name().wstring()
+            << L"\" final_root=\"" << installFolder.root_name().wstring() << L"\"";
+  runLog->Record(L"config", configLog.str());
   if (usePipeline) {
     PostLog(hwnd, L"Доступна асинхронная проверка SHA-256 во время распаковки.");
   } else {
@@ -2729,12 +2902,14 @@ void RunInstallWorker(HWND hwnd,
     } else {
       PostLog(hwnd, L"Manifest не содержит совместимые блоки SHA-256; используется обычная проверка.");
     }
+    runLog->Phase(L"manifest_validation");
     if (!VerifyPackageManifest(hwnd, *manifest)) {
-      FinishWorker(hwnd);
+      finish();
       return;
     }
   }
 
+  runLog->Phase(L"prepare_output");
   PostLog(hwnd, L"Поиск архива для распаковки...");
   auto firstArchivePart = package.firstArchivePart;
   firstArchivePart = ArchivePartFromManifest(*manifest);
@@ -2743,7 +2918,7 @@ void RunInstallWorker(HWND hwnd,
   }
   if (!firstArchivePart.has_value()) {
     PostLog(hwnd, L"Архив не найден/не скачан. Ошибка распаковки.");
-    FinishWorker(hwnd);
+    finish();
     return;
   }
 
@@ -2752,14 +2927,14 @@ void RunInstallWorker(HWND hwnd,
   if (const auto emptyError = FolderMustBeEmptyError(unpackFolder, L"Папка распаковки");
       emptyError.has_value()) {
     PostLog(hwnd, *emptyError);
-    FinishWorker(hwnd);
+    finish();
     return;
   }
-  if (!IsSameFolder(unpackFolder, installFolder)) {
+  if (!direct) {
     if (const auto emptyError = FolderMustBeEmptyError(installFolder, L"Папка установки");
         emptyError.has_value()) {
       PostLog(hwnd, *emptyError);
-      FinishWorker(hwnd);
+      finish();
       return;
     }
   }
@@ -2774,7 +2949,7 @@ void RunInstallWorker(HWND hwnd,
                       L"; требуется с запасом: " + FormatBytes(plan.unpackRequiredBytes));
     if (unpackFree < plan.unpackRequiredBytes) {
       PostLog(hwnd, L"Не хватает места для распаковки архива");
-      FinishWorker(hwnd);
+      finish();
       return;
     }
   }
@@ -2784,7 +2959,7 @@ void RunInstallWorker(HWND hwnd,
                       L"; требуется: " + FormatBytes(plan.installRequiredBytes));
     if (installFree < plan.installRequiredBytes) {
       PostLog(hwnd, L"Не хватает места для установки распакованных файлов");
-      FinishWorker(hwnd);
+      finish();
       return;
     }
   } else if (requirements.unpackedBytes > 0) {
@@ -2792,11 +2967,11 @@ void RunInstallWorker(HWND hwnd,
   }
 
   std::unique_ptr<modlist::StagingSession> stagingSession;
-  if (!IsSameFolder(unpackFolder, installFolder)) {
+  if (!direct) {
     const auto packageId = modlist::Sha256::FileHexDigest(ManifestPath());
     if (!packageId.ok()) {
       PostLog(hwnd, L"Не удалось определить владельца рабочей папки: " + Widen(packageId.error()));
-      FinishWorker(hwnd);
+      finish();
       return;
     }
     std::error_code createError;
@@ -2805,7 +2980,7 @@ void RunInstallWorker(HWND hwnd,
     if (createError || !session.ok()) {
       PostLog(hwnd, L"Невозможно безопасно занять рабочую папку распаковки: " +
           Widen(createError ? createError.message() : session.error()));
-      FinishWorker(hwnd);
+      finish();
       return;
     }
     stagingSession = std::move(session.value());
@@ -2817,31 +2992,35 @@ void RunInstallWorker(HWND hwnd,
     extraction.sevenZipLibrary = pipelineLibrary.value();
     extraction.archiveFolder = ArchiveFolder();
     extraction.installFolder = unpackFolder;
-    extraction.maxOutputPathLength = IsSameFolder(unpackFolder, installFolder)
-        ? modlist::kDirectExtractionPathBudget : 0;
+    extraction.maxOutputPathLength = direct ? modlist::kDirectExtractionPathBudget : 0;
     extraction.manifest = &*manifest;
     extraction.cancelRequested = &g_stopRequested;
-    extracted = RunPipelinedExtractionStep(hwnd, extraction, 0, 95);
+    runLog->Phase(L"verified_extract");
+    runLog->Record(L"decoder", L"threads=" + std::to_wstring(extraction.decoderThreads));
+    extracted = RunPipelinedExtractionStep(hwnd, extraction, *runLog, 0, 95);
   } else {
     modlist::SevenZipExtractor extractor;
     auto sevenZip = extractor.LocateExecutable(ExeFolder());
     if (!sevenZip.ok()) {
       PostLog(hwnd, L"Ошибка 7-Zip: " + Widen(sevenZip.error()));
-      FinishWorker(hwnd);
+      finish();
       return;
     }
+    runLog->Phase(L"extract");
     extracted = ExtractArchiveChain(
         hwnd, extractor, sevenZip.value(), *firstArchivePart, unpackFolder,
         35, 60, requirements.unpackedBytes);
   }
   if (!extracted) {
     PostProgress(hwnd, 0);
-    FinishWorker(hwnd);
+    finish();
     return;
   }
 
+  runLog->Phase(L"finalize");
   bool installed = InstallExtractedFiles(hwnd, unpackFolder, installFolder);
   if (installed && stagingSession) {
+    runLog->Phase(L"staging_cleanup");
     const auto completed = stagingSession->Complete();
     if (!completed.ok()) {
       PostLog(hwnd, L"Не удалось завершить рабочую сессию: " + Widen(completed.error()));
@@ -2855,18 +3034,22 @@ void RunInstallWorker(HWND hwnd,
     PostStatus(hwnd, L"Установка 100%");
   }
   PostProgress(hwnd, installed ? 100 : 0);
-  FinishWorker(hwnd, installed);
+  finish(installed);
 }
 
 bool ValidateFolders(const SpaceRequirements& requirements = {},
                      bool allowCleanupPrompt = false,
-                     const std::filesystem::path& extractionFolder = {}) {
+                     const std::filesystem::path& extractionFolder = {},
+                     std::unique_ptr<InstallRunLog>* runLog = nullptr) {
   modlist::PathValidator validator;
   bool ok = true;
   std::vector<std::wstring> errors;
   std::vector<std::wstring> cleanupErrors;
   PendingFolderCleanup pendingCleanup;
   g_pendingFolderCleanup.reset();
+  const auto failRun = [&] {
+    if (runLog && *runLog) (*runLog)->Finish(L"failed");
+  };
 
   auto addError = [&](const std::wstring& message) {
     AppendLog(message);
@@ -2909,12 +3092,14 @@ bool ValidateFolders(const SpaceRequirements& requirements = {},
   const auto unpackFolder = extractionFolder.empty() ? SelectedUnpackFolder() : extractionFolder;
   for (const auto& folder : {unpackFolder, installFolder}) {
     if (const auto error = RuntimeOverlapError(folder); error.has_value()) {
+      failRun();
       SendUiError(UiText("path_error_title", L"Ошибка пути"), *error);
       return false;
     }
   }
   if ((!installFolder.empty() && modlist::InstallationOverlapsPackage(installFolder, ExeFolder())) ||
       (!unpackFolder.empty() && modlist::InstallationOverlapsPackage(unpackFolder, ExeFolder()))) {
+    failRun();
     SendUiError(UiText("path_error_title", L"Ошибка пути"),
                 PackageOverlapMessage(installFolder));
     return false;
@@ -2998,14 +3183,19 @@ bool ValidateFolders(const SpaceRequirements& requirements = {},
 
   if (!pendingCleanup.empty()) {
     if (errors.empty()) {
-      g_pendingFolderCleanup = pendingCleanup;
-      SendUiCleanupConfirm(pendingCleanup);
+      if (runLog && *runLog) {
+        (*runLog)->Phase(L"await_cleanup_confirmation");
+        pendingCleanup.runLog = std::move(*runLog);
+      }
+      g_pendingFolderCleanup = std::move(pendingCleanup);
+      SendUiCleanupConfirm(*g_pendingFolderCleanup);
     } else {
       errors.insert(errors.end(), cleanupErrors.begin(), cleanupErrors.end());
     }
   }
 
   if (!ok && !errors.empty()) {
+    failRun();
     std::wostringstream message;
     for (size_t i = 0; i < errors.size(); ++i) {
       if (i > 0) {
@@ -3085,7 +3275,7 @@ void StopInstall() {
   AppendLog(L"Остановка. Существующие файлы сборки останутся без изменений.");
 }
 
-void StartInstall(HWND hwnd) {
+void StartInstall(HWND hwnd, std::unique_ptr<InstallRunLog> runLog = {}) {
   if (g_installCompleted) {
     SendMessageW(hwnd, WM_CLOSE, 0, 0);
     return;
@@ -3094,9 +3284,12 @@ void StartInstall(HWND hwnd) {
     AppendLog(L"Установщик уже запущен.");
     return;
   }
+  if (!runLog) runLog = std::make_unique<InstallRunLog>();
+  runLog->Phase(L"preflight");
   if (const auto documentsError = EnsureGameDocumentsFolders();
       documentsError.has_value()) {
     AppendLog(*documentsError);
+    runLog->Finish(L"failed");
     SendUiError(UiText("documents_error_title", L"Ошибка папки документов"), *documentsError);
     return;
   }
@@ -3104,6 +3297,7 @@ void StartInstall(HWND hwnd) {
   auto package = ReadPackageFromUi();
   if (!package.ok()) {
     AppendLog(L"Ошибка сборки: " + Widen(package.error()));
+    runLog->Finish(L"failed");
     return;
   }
   std::wstring manifestMessage;
@@ -3111,6 +3305,7 @@ void StartInstall(HWND hwnd) {
   if (!manifest.has_value()) {
     AppendLog(manifestMessage);
     AppendLog(L"Необходим файл manifest.json рядом с установщиком.");
+    runLog->Finish(L"failed");
     return;
   }
   g_archiveFolderName = Widen(manifest->archiveName);
@@ -3119,15 +3314,18 @@ void StartInstall(HWND hwnd) {
       FinalInstallFolder(std::filesystem::path(GetText(g_installEdit)));
   const auto unpackFolder = modlist::AutomaticUnpackFolder(installFolder);
   if (installFolder.empty() || unpackFolder.empty()) {
+    runLog->Finish(L"failed");
     SendUiError(UiText("path_error_title", L"Ошибка пути"),
                 L"Выберите полную папку установки на диске.");
     return;
   }
   if (const auto error = RuntimeOverlapError(installFolder); error.has_value()) {
+    runLog->Finish(L"failed");
     SendUiError(UiText("path_error_title", L"Ошибка пути"), *error);
     return;
   }
   if (modlist::InstallationOverlapsPackage(installFolder, ExeFolder())) {
+    runLog->Finish(L"failed");
     SendUiError(UiText("path_error_title", L"Ошибка пути"),
                 PackageOverlapMessage(installFolder));
     return;
@@ -3138,12 +3336,14 @@ void StartInstall(HWND hwnd) {
   g_closeAfterWorker = false;
   PostStatus(hwnd, L"Проверка путей в архиве...");
   AppendLog(L"Проверка путей всех файлов и папок в архиве перед распаковкой...");
+  runLog->Phase(L"archive_path_check");
   std::thread([hwnd, package = std::move(package.value()), manifest = std::move(*manifest),
-               installFolder, unpackFolder]() mutable {
+               installFolder, unpackFolder, runLog = std::move(runLog)]() mutable {
     auto prepared = std::make_unique<PreparedExtraction>();
     prepared->package = std::move(package);
     prepared->installFolder = installFolder;
     prepared->plan.folder = unpackFolder;
+    prepared->runLog = std::move(runLog);
     modlist::PipelinedSevenZipExtractor inspector;
     const auto library = inspector.LocateLibrary(ExeFolder());
     if (library.ok()) {
@@ -3161,6 +3361,7 @@ void StartInstall(HWND hwnd) {
     } else {
       prepared->inspectionError = library.error();
     }
+    prepared->runLog->EndPhase();
     if (PostMessageW(hwnd, kExtractionPlanMessage, 0,
                      reinterpret_cast<LPARAM>(prepared.get()))) {
       prepared.release();
@@ -3181,8 +3382,9 @@ void ConfirmPendingFolderCleanup(HWND hwnd) {
     return;
   }
 
-  const auto pending = *g_pendingFolderCleanup;
+  auto pending = std::move(*g_pendingFolderCleanup);
   g_pendingFolderCleanup.reset();
+  if (pending.runLog) pending.runLog->Phase(L"cleanup_existing");
   const auto currentUnpackFolder = SelectedUnpackFolder();
   const auto selectedRoot = std::filesystem::path(GetText(g_installEdit));
   const auto currentInstallFolder = FinalInstallFolder(selectedRoot);
@@ -3206,6 +3408,7 @@ void ConfirmPendingFolderCleanup(HWND hwnd) {
        !IsSameFolder(currentInstallFolder, currentInstallFolder.root_path()));
   if (!safeUnpack || !safeInstall) {
     AppendLog(L"Очистка отменена: выбранные папки изменились.");
+    if (pending.runLog) pending.runLog->Finish(L"failed");
     SendUiError(UiText("cleanup_cancelled_title", L"Очистка отменена"),
                 L"Выбранные папки изменились. Нажмите «Установить» и проверьте пути ещё раз.");
     return;
@@ -3220,6 +3423,7 @@ void ConfirmPendingFolderCleanup(HWND hwnd) {
       const auto error = L"Рабочая папка распаковки не очищена:\n" +
           PathToDisplay(currentUnpackFolder) + L"\n\n" + Widen(cleared.error());
       AppendLog(error);
+      if (pending.runLog) pending.runLog->Finish(L"failed");
       SendUiError(UiText("cleanup_error_title", L"Ошибка очистки"), error);
       return;
     }
@@ -3235,17 +3439,19 @@ void ConfirmPendingFolderCleanup(HWND hwnd) {
       const auto error = L"Перезапись итоговой папки отменена:\n" +
           PathToDisplay(currentInstallFolder) + L"\n\n" + Widen(cleared.error());
       AppendLog(error);
+      if (pending.runLog) pending.runLog->Finish(L"failed");
       SendUiError(UiText("cleanup_error_title", L"Ошибка очистки"), error);
       return;
     }
     AppendLog(L"Папка установки очищена.");
   }
 
-  StartInstall(hwnd);
+  StartInstall(hwnd, std::move(pending.runLog));
 }
 
 void CancelPendingFolderCleanup() {
   if (g_pendingFolderCleanup.has_value()) {
+    if (g_pendingFolderCleanup->runLog) g_pendingFolderCleanup->runLog->Finish(L"declined");
     AppendLog(L"Очистка отменена пользователем. Файлы не изменены.");
     g_pendingFolderCleanup.reset();
     SendUiState();
@@ -3483,7 +3689,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
       const auto finalFolder = FinalInstallFolder(std::filesystem::path(GetText(g_installEdit)));
       modlist::NativeInstallerViewState state;
       state.title = UiText("app_title", L"Modlist Installer Beta");
-      state.version = UiText("app_version", L"Modlist Installer v0.3.8 by WallHead");
+      state.version = UiText("app_version", kInstallerBuildLabel);
       state.unpackNote = UiText(
           "unpack_note",
           L"Установщик проверит пути в архиве и распакует файлы прямо в папку установки, если пути достаточно короткие. Иначе он использует временную папку, затем перенесет файлы.");
@@ -3662,15 +3868,18 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
       g_workerRunning = false;
       SetControlsRunning(hwnd, false);
       if (g_closeAfterWorker) {
+        prepared->runLog->Finish(L"cancelled", true);
         DestroyWindow(hwnd);
         return 0;
       }
       if (g_stopRequested) {
+        prepared->runLog->Finish(L"cancelled", true);
         SendUiStatus(L"Установка остановлена пользователем");
         return 0;
       }
       const auto currentInstallFolder = FinalInstallFolder(std::filesystem::path(GetText(g_installEdit)));
       if (!IsSameFolder(currentInstallFolder, prepared->installFolder)) {
+        prepared->runLog->Finish(L"failed");
         SendUiError(UiText("path_error_title", L"Ошибка пути"),
                     L"Папка установки изменилась. Нажмите «Установить» ещё раз.");
         return 0;
@@ -3678,6 +3887,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
       if (!prepared->inspectionError.empty()) {
         AppendLog(L"Проверка путей: " + Widen(prepared->inspectionError));
         if (prepared->inspectionError.find("unsafe output path") != std::string::npos) {
+          prepared->runLog->Finish(L"failed");
           SendUiError(UiText("path_error_title", L"Ошибка пути"), L"Архив содержит небезопасный путь.");
           return 0;
         }
@@ -3690,9 +3900,11 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
       AppendLog(prepared->plan.direct
           ? L"Распаковка прямо в папку установки: " + PathToDisplay(prepared->plan.folder)
           : L"Распаковка через короткую папку: " + PathToDisplay(prepared->plan.folder));
+      prepared->runLog->Phase(L"folder_check");
       SendUiStatus(L"Проверка папок установки...");
       const auto requirements = EstimateSpaceRequirements(prepared->package);
-      if (!ValidateFolders(requirements, true, prepared->plan.folder)) {
+      if (!ValidateFolders(requirements, true, prepared->plan.folder, &prepared->runLog)) {
+        if (prepared->runLog) prepared->runLog->Finish(L"failed");
         if (!g_workerRunning && !g_pendingFolderCleanup.has_value()) {
           SendUiStatus(UiText("status_idle", L"Ожидание | Ожидание проверки"));
         }
@@ -3701,7 +3913,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
       g_workerRunning = true;
       SetControlsRunning(hwnd, true);
       std::thread(RunInstallWorker, hwnd, std::move(prepared->package),
-                  prepared->plan.folder, prepared->installFolder).detach();
+                  prepared->plan.folder, prepared->installFolder, std::move(prepared->runLog)).detach();
       return 0;
     }
     case kWorkerFinishedMessage: {

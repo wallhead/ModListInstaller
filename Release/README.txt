@@ -1,4 +1,4 @@
-ModListInstaller v0.3.8
+ModListInstaller v0.3.9
 
 Keep modlist-packer.exe and modlist-installer.exe together. Run the packer to
 create <selected release parent>\<archive name>.
@@ -19,6 +19,10 @@ Archive names and manifest file paths are UTF-8, including non-English names.
 Cached extraction tools are verified against their embedded originals before use.
 Successful installation shows 100% and a themed completion message. Popup text
 and backgrounds do not require a GPU render target.
+
+For a slow install, send logs\modlist-installer.log. The INSTALL_PERF rows group
+attempts by run ID and record the route, phase times, and extraction counters.
+An existing package can use this installer without repacking.
 
 The final folder is <selected install root>\<archive_name>. Before extraction,
 the installer checks all archive entry paths. If every full destination path
