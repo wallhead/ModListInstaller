@@ -36,7 +36,7 @@ else()
 endif()
 
 if(WIN32)
-  target_sources(installer_core PRIVATE paths/FolderCleanup.cpp)
+  target_sources(installer_core PRIVATE paths/FolderCleanup.cpp patch/PatchInstaller.cpp patch/PatchDeletePaths.cpp)
   target_link_libraries(installer_core PUBLIC bcrypt ole32 oleaut32)
 endif()
 
@@ -52,18 +52,22 @@ target_link_libraries(modlist-installer PRIVATE installer_core)
 if(WIN32)
   set_property(SOURCE ../resources/app.rc APPEND PROPERTY OBJECT_DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/../ui/style.css;${CMAKE_CURRENT_SOURCE_DIR}/../ui/strings.json")
-  add_executable(modlist-installer-gui WIN32
-    ui/WinInstallerApp.cpp
-    ui/NativeInstallerView.cpp
-    ui/NativeStrings.cpp
-    ../resources/app.rc)
-  target_include_directories(modlist-installer-gui PRIVATE ../resources)
-  if(MSVC)
-    target_compile_options(modlist-installer-gui PRIVATE /utf-8)
-    # app.rc already embeds the DPI-aware application manifest.
-    target_link_options(modlist-installer-gui PRIVATE /MANIFEST:NO)
-  endif()
-  target_link_libraries(modlist-installer-gui PRIVATE installer_core
-    user32 gdi32 d2d1 dwrite dwmapi uxtheme comctl32 shlwapi
-    ole32 oleaut32 shell32 advapi32)
+  foreach(gui_target modlist-installer-gui modlist-patch-installer)
+    add_executable(${gui_target} WIN32
+      ui/WinInstallerApp.cpp
+      ui/NativeInstallerView.cpp
+      ui/NativeStrings.cpp
+      ../resources/app.rc)
+    target_include_directories(${gui_target} PRIVATE ../resources)
+    if(MSVC)
+      target_compile_options(${gui_target} PRIVATE /utf-8)
+      # app.rc already embeds the DPI-aware application manifest.
+      target_link_options(${gui_target} PRIVATE /MANIFEST:NO)
+    endif()
+    target_link_libraries(${gui_target} PRIVATE installer_core
+      user32 gdi32 d2d1 dwrite dwmapi uxtheme comctl32 shlwapi
+      ole32 oleaut32 shell32 advapi32)
+  endforeach()
+  target_sources(modlist-patch-installer PRIVATE ../resources/PatchManifestResource.rc)
+  target_compile_definitions(modlist-patch-installer PRIVATE MODLIST_PATCH_INSTALLER)
 endif()

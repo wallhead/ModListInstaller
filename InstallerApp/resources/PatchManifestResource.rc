@@ -1,0 +1,4 @@
+#include <windows.h>
+#include "PatchManifestResource.h"
+
+IDR_INLINE_PATCH_MANIFEST RCDATA BEGIN 1 END

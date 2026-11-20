@@ -215,6 +215,15 @@ Result<Manifest> ParsePackerManifest(const JsonValue& root) {
   }
   manifest.hashChunkSize = chunkSize.value();
 
+  if (const auto* paths = root.Find("delete_paths")) {
+    if (!paths->IsArray()) return Result<Manifest>::Error("Manifest field 'delete_paths' must be an array");
+    manifest.deletePaths.emplace();
+    for (const auto& path : paths->AsArray()) {
+      if (!path.IsString()) return Result<Manifest>::Error("Manifest 'delete_paths' entries must be strings");
+      manifest.deletePaths->push_back(path.AsString());
+    }
+  }
+
   const JsonValue* files = root.Find("files");
   if (files == nullptr || !files->IsArray() || files->AsArray().empty()) {
     return Result<Manifest>::Error("Manifest field 'files' must be a non-empty array");

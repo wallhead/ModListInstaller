@@ -15,6 +15,9 @@
 #include "ui/NativeInstallerView.h"
 #include "ui/NativeStrings.h"
 #include "verifier/Sha256.h"
+#ifdef MODLIST_PATCH_INSTALLER
+#include "patch/PatchInstaller.h"
+#endif
 
 #include <windows.h>
 #include <commctrl.h>
@@ -31,6 +34,9 @@
 #include <ctime>
 #include <cwctype>
 #include <deque>
+#ifdef MODLIST_PATCH_INSTALLER
+#include <exception>
+#endif
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -77,6 +83,13 @@ constexpr UINT kStatusMessage = WM_APP + 4;
 constexpr UINT kValidationFailedMessage = WM_APP + 5;
 constexpr UINT kInstallFilesFailedMessage = WM_APP + 6;
 constexpr UINT kExtractionPlanMessage = WM_APP + 7;
+
+#ifdef MODLIST_PATCH_INSTALLER
+constexpr wchar_t kPatchTitle[] = L"Modlist Patch Installer";
+constexpr wchar_t kPatchIdle[] = L"Выберите папку сборки";
+constexpr UINT_PTR kPatchPollTimer = 1;
+constexpr DWORD kPatchPathCapacity = 32768;
+#endif
 
 class InstallRunLog {
 public:
@@ -142,6 +155,11 @@ modlist::NativeInstallerView g_nativeView;
 modlist::NativeStrings g_strings;
 std::wstring g_archiveFolderName;
 std::mutex g_appLogMutex;
+#ifdef MODLIST_PATCH_INSTALLER
+std::unique_ptr<modlist::patch::PatchLogFile> g_patchLogFile;
+std::filesystem::path g_patchLogPath;
+std::atomic_bool g_patchLogWriteFailed{false};
+#endif
 struct PendingFolderCleanup {
   std::filesystem::path unpackFolder;
   std::filesystem::path installFolder;
@@ -335,9 +353,17 @@ void FillVerticalGradient(HDC dc, RECT rect, COLORREF top, COLORREF bottom) {
 }
 
 std::filesystem::path ModuleFolder() {
+#ifdef MODLIST_PATCH_INSTALLER
+  std::wstring buffer(kPatchPathCapacity, L'\0');
+  const DWORD size = GetModuleFileNameW(nullptr, buffer.data(), kPatchPathCapacity);
+  if (size == 0 || size >= kPatchPathCapacity) return {};
+  buffer.resize(size);
+  return std::filesystem::path(buffer).parent_path();
+#else
   wchar_t buffer[MAX_PATH]{};
   GetModuleFileNameW(nullptr, buffer, MAX_PATH);
   return std::filesystem::path(buffer).parent_path();
+#endif
 }
 
 std::string Timestamp() {
@@ -357,12 +383,22 @@ std::filesystem::path AppLogPath() {
   return logFolder / "modlist-installer.log";
 }
 
+#ifdef MODLIST_PATCH_INSTALLER
+void SavePatchLog(std::string_view line) noexcept {
+  if (g_patchLogFile && !g_patchLogFile->Append(line)) g_patchLogWriteFailed = true;
+}
+#endif
+
 void AppendAppLog(const std::wstring& text) {
+#ifdef MODLIST_PATCH_INSTALLER
+  if (g_patchLogFile) SavePatchLog(Narrow(text));
+#else
   std::lock_guard lock(g_appLogMutex);
   std::ofstream log(AppLogPath(), std::ios::binary | std::ios::app);
   if (log) {
     log << Timestamp() << " " << Narrow(text) << "\r\n";
   }
+#endif
 }
 
 InstallRunLog::InstallRunLog() {
@@ -447,13 +483,17 @@ void SetText(HWND hwnd, const std::wstring& text) {
   SetWindowTextW(hwnd, text.c_str());
 }
 
-void AppendLog(const std::wstring& text) {
-  AppendAppLog(text);
+void AppendLogToView(const std::wstring& text) {
   const int length = GetWindowTextLengthW(g_logEdit);
   SendMessageW(g_logEdit, EM_SETSEL, length, length);
   std::wstring line = text + L"\r\n";
   SendMessageW(g_logEdit, EM_REPLACESEL, FALSE, reinterpret_cast<LPARAM>(line.c_str()));
   SendUiLog(text);
+}
+
+void AppendLog(const std::wstring& text) {
+  AppendAppLog(text);
+  AppendLogToView(text);
 }
 
 void PostLog(HWND hwnd, std::wstring text) {
@@ -541,18 +581,31 @@ std::optional<std::filesystem::path> PickFolder(HWND owner) {
   BROWSEINFOW browse{};
   browse.hwndOwner = owner;
   browse.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE;
+#ifdef MODLIST_PATCH_INSTALLER
+  browse.lpszTitle = L"Выберите папку сборки или её папку Stock Game.";
+  browse.ulFlags |= BIF_NONEWFOLDERBUTTON;
+#endif
   PIDLIST_ABSOLUTE idList = SHBrowseForFolderW(&browse);
   if (idList == nullptr) {
     return std::nullopt;
   }
 
+#ifdef MODLIST_PATCH_INSTALLER
+  std::wstring path(kPatchPathCapacity, L'\0');
+  const bool ok = SHGetPathFromIDListEx(idList, path.data(), kPatchPathCapacity, GPFIDL_DEFAULT) != FALSE;
+#else
   wchar_t path[MAX_PATH]{};
   const bool ok = SHGetPathFromIDListW(idList, path) != FALSE;
+#endif
   CoTaskMemFree(idList);
   if (!ok) {
     return std::nullopt;
   }
+#ifdef MODLIST_PATCH_INSTALLER
+  return std::filesystem::path(path.c_str());
+#else
   return std::filesystem::path(path);
+#endif
 }
 
 HWND CreateLabel(HWND parent, const wchar_t* text, int x, int y, int width, int height) {
@@ -1174,8 +1227,12 @@ LRESULT CALLBACK ThemedDialogProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM
     case WM_COMMAND: {
       const int id = LOWORD(wParam);
       if (id == IDOK || id == IDYES || id == IDNO || id == IDCANCEL) {
+#ifdef MODLIST_PATCH_INSTALLER
+        EndThemedDialog(hwnd, id);
+#else
         EndThemedDialog(hwnd, id == IDCANCEL
             ? (data != nullptr && data->confirmation ? IDNO : IDOK) : id);
+#endif
         return 0;
       }
       break;
@@ -1229,7 +1286,11 @@ int ShowThemedMessage(HWND owner,
     if (RegisterClassW(&windowClass) == 0 && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
       AppendAppLog(L"UI: themed message class registration failed; Windows error=" +
                    std::to_wstring(GetLastError()));
+#ifdef MODLIST_PATCH_INSTALLER
+      return IDCANCEL;
+#else
       return confirmation ? IDNO : IDOK;
+#endif
     }
     registered = true;
   }
@@ -1238,7 +1299,9 @@ int ShowThemedMessage(HWND owner,
   data.title = title;
   data.message = message;
   data.confirmation = confirmation;
+#ifndef MODLIST_PATCH_INSTALLER
   data.result = confirmation ? IDNO : IDOK;
+#endif
 
   const UINT dpi = owner != nullptr ? GetDpiForWindow(owner) : GetDpiForSystem();
   RECT windowRect{0, 0, MulDiv(480, static_cast<int>(dpi), 96),
@@ -1572,6 +1635,10 @@ std::optional<modlist::Manifest> LoadPackageManifest(std::wstring& message,
   auto manifest = loader.LoadFromFile(path, manifestSha256);
   if (!manifest.ok()) {
     message = L"Файл проверки: " + Widen(manifest.error());
+    return std::nullopt;
+  }
+  if (manifest.value().deletePaths) {
+    message = L"Это пакет обновления. Запустите modlist-patch-installer.exe.";
     return std::nullopt;
   }
 
@@ -3672,19 +3739,242 @@ void UnpackOnly(HWND hwnd) {
 }
 
 void OpenLogFile() {
+#ifdef MODLIST_PATCH_INSTALLER
+  if (g_patchLogPath.empty()) return;
+  const auto opened = ShellExecuteW(g_mainWindow, L"open", g_patchLogPath.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+  if (reinterpret_cast<INT_PTR>(opened) <= 32) {
+    ShowThemedMessage(g_mainWindow, kPatchTitle,
+        L"Не удалось открыть журнал:\n" + PathToDisplay(g_patchLogPath));
+  }
+#else
   const auto path = AppLogPath();
   ShellExecuteW(nullptr, L"open", path.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+#endif
 }
+
+#ifdef MODLIST_PATCH_INSTALLER
+using PatchTicket = std::unique_ptr<modlist::patch::PatchFolder>;
+
+bool g_patchSelecting = false;
+std::filesystem::path g_patchRoot;
+std::thread g_patchWorker;
+std::mutex g_patchUpdateMutex;
+int g_patchPercent = 0;
+std::wstring g_patchStatus;
+std::vector<std::wstring> g_patchLogLines;
+std::optional<modlist::patch::PatchOutcome> g_patchOutcome;
+
+PatchTicket FindRegisteredPatchFolder(const std::filesystem::path& package) {
+  constexpr wchar_t key[] = L"SOFTWARE\\Bethesda Softworks\\Skyrim Special Edition";
+  constexpr DWORD views[] = {RRF_SUBKEY_WOW6432KEY, RRF_SUBKEY_WOW6464KEY};
+  for (const DWORD view : views) {
+    std::wstring value(kPatchPathCapacity, L'\0');
+    DWORD bytes = static_cast<DWORD>(value.size() * sizeof(wchar_t));
+    if (RegGetValueW(HKEY_LOCAL_MACHINE, key, L"Installed Path", view | RRF_RT_REG_SZ,
+                     nullptr, value.data(), &bytes) != ERROR_SUCCESS ||
+        bytes < sizeof(wchar_t) || bytes % sizeof(wchar_t) != 0) {
+      continue;
+    }
+    value.resize(bytes / sizeof(wchar_t) - 1);
+    if (value.find(L'\0') != std::wstring::npos) continue;
+    auto leaf = std::filesystem::path(value);
+    if (!leaf.is_absolute()) continue;
+    if (!leaf.has_filename() && leaf.has_relative_path()) leaf = leaf.parent_path();
+    if (CompareStringOrdinal(leaf.filename().c_str(), -1, L"Stock Game", -1, TRUE) != CSTR_EQUAL) {
+      continue;
+    }
+    auto opened = modlist::patch::OpenPatchFolder(
+        leaf, package, modlist::patch::PatchSelection::RegisteredStock);
+    if (opened.ok()) return std::move(opened.value());
+  }
+  return {};
+}
+
+int ConfirmPatchFolder(HWND hwnd, const modlist::patch::PatchFolder& folder) {
+  return ShowThemedMessage(hwnd, kPatchTitle,
+      L"Найдена копия сборки по пути «" + PathToDisplay(folder.Root()) + L"». Это верный путь?",
+      true);
+}
+
+PatchTicket ChoosePatchFolder(HWND hwnd, bool tryRegistry) {
+  const auto package = ExeFolder();
+  if (package.empty()) {
+    ShowThemedMessage(hwnd, kPatchTitle, L"Не удалось определить папку пакета обновления.");
+    return {};
+  }
+  if (tryRegistry) {
+    if (auto ticket = FindRegisteredPatchFolder(package)) {
+      const int choice = ConfirmPatchFolder(hwnd, *ticket);
+      if (choice == IDYES) return ticket;
+      if (choice != IDNO) return {};
+    }
+  }
+  if (!IsWindow(hwnd)) return {};
+  const auto selected = PickFolder(hwnd);
+  if (!selected || !IsWindow(hwnd)) return {};
+
+  auto opened = modlist::patch::OpenPatchFolder(*selected, package);
+  if (!opened.ok()) {
+    ShowThemedMessage(hwnd, kPatchTitle, L"Не удалось открыть папку сборки:\n«" +
+        PathToDisplay(*selected) + L"»\n\n" + Widen(opened.error()));
+    return {};
+  }
+  if (ConfirmPatchFolder(hwnd, *opened.value()) == IDYES) return std::move(opened.value());
+  return {};
+}
+
+void UpdatePatchControls(HWND hwnd) {
+  const bool running = g_workerRunning.load();
+  EnableWindow(GetDlgItem(hwnd, kInstallBrowse), !running && !g_installCompleted);
+  EnableWindow(GetDlgItem(hwnd, kStartButton), !running);
+  EnableWindow(GetDlgItem(hwnd, kStopButton), running && !g_stopRequested);
+  EnableWindow(GetDlgItem(hwnd, kOpenLogButton), !g_patchLogPath.empty());
+}
+
+void StartPatchLog(const modlist::patch::PatchFolder& folder) {
+  // Do not write beside the executable before the user confirms a separate modlist.
+  g_patchLogFile.reset();
+  g_patchLogPath.clear();
+  g_patchLogWriteFailed = false;
+  try {
+    auto opened = modlist::patch::PatchLogFile::Open(folder);
+    if (opened.ok()) {
+      g_patchLogPath = opened.value()->Path();
+      g_patchLogFile = std::move(opened.value());
+      AppendLogToView(L"Файл журнала: " + PathToDisplay(g_patchLogPath));
+    } else {
+      AppendLogToView(L"Не удалось сохранить журнал: " + Widen(opened.error()));
+    }
+  } catch (...) {
+    AppendLogToView(L"Не удалось открыть файл журнала.");
+  }
+}
+
+void SelectAndStartPatch(HWND hwnd, bool tryRegistry) {
+  if (g_workerRunning || g_patchSelecting || g_installCompleted) return;
+  g_patchSelecting = true;
+  auto ticket = ChoosePatchFolder(hwnd, tryRegistry);
+  g_patchSelecting = false;
+  if (!ticket || !IsWindow(hwnd)) return;
+
+  StartPatchLog(*ticket);
+  g_patchRoot = ticket->Root();
+  SetText(g_installEdit, PathToDisplay(g_patchRoot));
+  SendUiPath(L"installFolder", PathToDisplay(g_patchRoot));
+  AppendLog(L"Папка сборки: «" + PathToDisplay(g_patchRoot) + L"»");
+  g_stopRequested = false;
+  g_patchPercent = 0;
+  g_patchStatus = L"Подготовка обновления…";
+  g_patchLogLines.clear();
+  SendUiProgress(0, g_patchStatus);
+
+  if (SetTimer(hwnd, kPatchPollTimer, 100, nullptr) != 0) {
+    try {
+      g_patchWorker = std::thread([folder = std::move(ticket)]() mutable {
+        modlist::patch::PatchOutcome outcome;
+        try {
+          modlist::patch::PatchOptions options;
+          options.cancelRequested = &g_stopRequested;
+          options.progress = [](int percent, const std::string& status) {
+            auto text = Widen(status);
+            std::lock_guard lock(g_patchUpdateMutex);
+            g_patchPercent = percent;
+            if (!text.empty()) g_patchStatus = std::move(text);
+          };
+          options.log = [](std::string_view line) {
+            SavePatchLog(line);
+            auto text = Widen(std::string(line));
+            std::lock_guard lock(g_patchUpdateMutex);
+            g_patchLogLines.push_back(std::move(text));
+          };
+          if (g_patchLogFile) options.diagnostics = SavePatchLog;
+          outcome = modlist::patch::ApplyPatch(*folder, options);
+        } catch (const std::exception& error) {
+          outcome.detail = error.what();
+        } catch (...) {
+          outcome.detail = "Unexpected patch worker error.";
+        }
+        folder.reset();
+        std::lock_guard lock(g_patchUpdateMutex);
+        g_patchOutcome.emplace(std::move(outcome));
+      });
+      g_workerRunning = true;
+      UpdatePatchControls(hwnd);
+      return;
+    } catch (const std::exception&) {
+      KillTimer(hwnd, kPatchPollTimer);
+    }
+  }
+  SendUiStatus(L"Не удалось запустить обновление");
+  AppendLog(g_statusText);
+  g_patchLogFile.reset();
+  UpdatePatchControls(hwnd);
+  ShowThemedMessage(hwnd, kPatchTitle, g_statusText);
+}
+
+void RequestPatchStop(HWND hwnd) {
+  if (!g_workerRunning || g_stopRequested.exchange(true)) return;
+  UpdatePatchControls(hwnd);
+  SendUiStatus(L"Остановка… Ожидайте завершения операции.");
+  AppendLog(g_statusText);
+}
+
+void PollPatchWorker(HWND hwnd) {
+  int percent;
+  std::wstring status;
+  std::vector<std::wstring> lines;
+  std::optional<modlist::patch::PatchOutcome> outcome;
+  {
+    std::lock_guard lock(g_patchUpdateMutex);
+    percent = g_patchPercent;
+    status = g_patchStatus;
+    lines.swap(g_patchLogLines);
+    outcome.swap(g_patchOutcome);
+  }
+  for (const auto& line : lines) AppendLogToView(line);
+  if (!outcome) {
+    SendUiProgress(percent, g_stopRequested ? g_statusText : status);
+    return;
+  }
+
+  KillTimer(hwnd, kPatchPollTimer);
+  g_patchWorker.join();
+  g_workerRunning = false;
+  g_installCompleted = outcome->succeeded;
+  UpdatePatchControls(hwnd);
+
+  const bool recovery = !outcome->recoveryFolder.empty();
+  const std::wstring summary = outcome->succeeded
+      ? (recovery ? L"Обновление применено, но остались рабочие данные." : L"Обновление завершено!")
+      : (outcome->cancelled ? L"Обновление остановлено." : L"Не удалось применить обновление.");
+  SendUiProgress(outcome->succeeded ? 100 : percent, summary);
+  std::wstring detail = summary;
+  if (!outcome->detail.empty()) detail += L"\n\n" + Widen(outcome->detail);
+  if (recovery) {
+    detail += L"\n\nРабочие данные сохранены в папке:\n«" +
+        PathToDisplay(outcome->recoveryFolder) + L"»";
+  }
+  AppendLog(detail);
+  if (g_patchLogWriteFailed) AppendLogToView(L"Часть журнала не удалось сохранить на диск.");
+  g_patchLogFile.reset();
+  if (!g_closeAfterWorker || recovery || (!outcome->succeeded && !outcome->cancelled)) {
+    ShowThemedMessage(hwnd, kPatchTitle, detail);
+  }
+  if (g_closeAfterWorker && IsWindow(hwnd)) DestroyWindow(hwnd);
+}
+#endif
 
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
   switch (message) {
     case WM_CREATE: {
       g_mainWindow = hwnd;
+#ifndef MODLIST_PATCH_INSTALLER
       INITCOMMONCONTROLSEX controls{};
       controls.dwSize = sizeof(controls);
       controls.dwICC = ICC_PROGRESS_CLASS;
       InitCommonControlsEx(&controls);
       AppLogPath();
+#endif
       ApplyWindowFrameTheme(hwnd);
       std::wstring themeWarning;
       if (!g_nativeView.Initialize(hwnd, &themeWarning)) {
@@ -3692,13 +3982,24 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
       }
       std::wstring stringsWarning;
       g_strings.LoadEmbedded(&stringsWarning);
+#ifdef MODLIST_PATCH_INSTALLER
+      g_statusText = kPatchIdle;
+#else
       g_statusText = UiText("status_idle", L"Ожидание | Ожидание проверки");
       SetWindowTextW(hwnd, UiText("window_title", L"Modlist Installer Beta").c_str());
+#endif
       g_contentBrush = CreateSolidBrush(kContentColor);
       g_headerBrush = CreateSolidBrush(kHeaderColor);
       g_panelBrush = CreateSolidBrush(kPanelColor);
       g_footerBrush = CreateSolidBrush(kFooterColor);
       g_editBrush = CreateSolidBrush(g_nativeView.InputColor());
+#ifdef MODLIST_PATCH_INSTALLER
+      g_installEdit = CreateEdit(hwnd, kInstallEdit, 0, 0, 1, 1);
+      const HWND browse = CreateButton(hwnd, kInstallBrowse, UiText("button_browse", L"Обзор").c_str(), 0, 0, 1, 1);
+      const HWND close = CreateButton(hwnd, kStartButton, UiText("button_close", L"Закрыть").c_str(), 0, 0, 1, 1);
+      const HWND stop = CreateButton(hwnd, kStopButton, UiText("button_stop", L"Остановить").c_str(), 0, 0, 1, 1);
+      const HWND openLog = CreateButton(hwnd, kOpenLogButton, UiText("button_open_log", L"Открыть лог").c_str(), 0, 0, 1, 1);
+#else
       g_stepLabel = CreateLabel(hwnd, L"", 16, 18, 720, 24);
       g_welcomeTitle = CreateLabel(hwnd, UiText("app_title", L"Modlist Installer Beta").c_str(), 16, 92, 720, 38);
       g_welcomeBody = CreateLabel(hwnd, L"", 16, 146, 720, 90);
@@ -3727,15 +4028,25 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
                                       WS_CHILD | WS_VISIBLE,
                                       16, 170, 622, 22, hwnd,
                                       reinterpret_cast<HMENU>(static_cast<INT_PTR>(kStatusLabel)), g_instance, nullptr);
+#endif
       g_logEdit = CreateWindowExW(0, L"EDIT", L"",
                                   WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL,
                                   16, 177, 622, 258, hwnd,
                                   reinterpret_cast<HMENU>(static_cast<INT_PTR>(kLogEdit)), g_instance, nullptr);
+#ifdef MODLIST_PATCH_INSTALLER
+      if (!g_installEdit || !g_logEdit || !browse || !close || !stop || !openLog) return -1;
+      SendMessageW(g_installEdit, EM_SETREADONLY, TRUE, 0);
+#endif
       RecreateUiFonts(hwnd);
       SendMessageW(g_logEdit, EM_SETLIMITTEXT, 4 * 1024 * 1024, 0);
+#ifndef MODLIST_PATCH_INSTALLER
       SetWindowTheme(g_unpackDriveCombo, L"DarkMode_CFD", nullptr);
+#endif
       SetWindowTheme(g_installEdit, L"DarkMode_Explorer", nullptr);
       SetWindowTheme(g_logEdit, L"DarkMode_Explorer", nullptr);
+#ifdef MODLIST_PATCH_INSTALLER
+      UpdatePatchControls(hwnd);
+#else
       const int comboItemHeight = MulDiv(
           static_cast<int>(g_nativeView.Theme().controlHeight) - 2,
           static_cast<int>(GetDpiForWindow(hwnd)), 96);
@@ -3775,8 +4086,11 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
         }
       }
       AppendLog(L"Пути в архиве будут проверены перед распаковкой. Короткие пути: прямо в папку установки; длинные: через <drive>:\\Unpacking.");
+#endif
       Layout(hwnd);
+#ifndef MODLIST_PATCH_INSTALLER
       ShowWizardPage(hwnd, WizardPage::Activity);
+#endif
       return 0;
     }
     case WM_ERASEBKGND:
@@ -3784,8 +4098,17 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
     case WM_PAINT: {
       PAINTSTRUCT paint{};
       BeginPaint(hwnd, &paint);
+#ifndef MODLIST_PATCH_INSTALLER
       const auto finalFolder = FinalInstallFolder(std::filesystem::path(GetText(g_installEdit)));
+#endif
       modlist::NativeInstallerViewState state;
+#ifdef MODLIST_PATCH_INSTALLER
+      state.title = kPatchTitle;
+      state.version = kInstallerBuildLabel;
+      state.installFolderLabel = L"Папка сборки";
+      state.finalPathLabel = L"Подтверждённый путь";
+      state.finalInstallFolder = g_patchRoot.empty() ? kPatchIdle : PathToDisplay(g_patchRoot);
+#else
       state.title = UiText("app_title", L"Modlist Installer Beta");
       state.version = UiText("app_version", kInstallerBuildLabel);
       state.unpackNote = UiText(
@@ -3796,6 +4119,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
       state.finalInstallFolder = finalFolder.empty()
                                      ? UiText("final_path_empty", L"Выберите папку установки")
                                      : finalFolder.wstring();
+#endif
       state.status = g_statusText;
       state.progress = g_progressPercent;
       g_nativeView.Paint(hwnd, state, &paint.rcPaint);
@@ -3806,6 +4130,14 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
       HDC dc = reinterpret_cast<HDC>(wParam);
       HWND control = reinterpret_cast<HWND>(lParam);
       SetBkMode(dc, TRANSPARENT);
+#ifdef MODLIST_PATCH_INSTALLER
+      if (control == g_installEdit) {
+        SetBkMode(dc, OPAQUE);
+        SetTextColor(dc, g_nativeView.TextColor());
+        SetBkColor(dc, g_nativeView.InputColor());
+        return reinterpret_cast<LRESULT>(g_editBrush);
+      }
+#endif
       if (control == g_logEdit) {
         SetBkMode(dc, OPAQUE);
         SetTextColor(dc, g_nativeView.MutedColor());
@@ -3872,12 +4204,14 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
                      SWP_NOACTIVATE | SWP_NOZORDER);
       }
       RecreateUiFonts(hwnd);
+#ifndef MODLIST_PATCH_INSTALLER
       const int comboItemHeight = MulDiv(
           static_cast<int>(g_nativeView.Theme().controlHeight) - 2,
           static_cast<int>(GetDpiForWindow(hwnd)), 96);
       SendMessageW(g_unpackDriveCombo, CB_SETITEMHEIGHT,
                    static_cast<WPARAM>(-1), comboItemHeight);
       SendMessageW(g_unpackDriveCombo, CB_SETITEMHEIGHT, 0, comboItemHeight);
+#endif
       Layout(hwnd);
       InvalidateRect(hwnd, nullptr, FALSE);
       return 0;
@@ -3891,6 +4225,17 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
     }
     case WM_COMMAND: {
       const int id = LOWORD(wParam);
+#ifdef MODLIST_PATCH_INSTALLER
+      if (id == kInstallBrowse) {
+        SelectAndStartPatch(hwnd, false);
+      } else if (id == kStartButton && !g_workerRunning && !g_patchSelecting) {
+        SendMessageW(hwnd, WM_CLOSE, 0, 0);
+      } else if (id == kStopButton) {
+        RequestPatchStop(hwnd);
+      } else if (id == kOpenLogButton && !g_patchSelecting) {
+        OpenLogFile();
+      }
+#else
       if (id == kDownloadBrowse) {
         AppendLog(L"Package folder selection is disabled; manifest is loaded beside the executable.");
       } else if (id == kInstallBrowse) {
@@ -3923,8 +4268,14 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
         GoToNextPage(hwnd);
       }
       SendUiState();
+#endif
       return 0;
     }
+#ifdef MODLIST_PATCH_INSTALLER
+    case WM_TIMER:
+      if (wParam == kPatchPollTimer && g_workerRunning) PollPatchWorker(hwnd);
+      return 0;
+#else
     case kLogMessage: {
       std::unique_ptr<std::wstring> text(reinterpret_cast<std::wstring*>(lParam));
       AppendLog(*text);
@@ -4035,12 +4386,18 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
       }
       return 0;
     }
+#endif
     case WM_CLOSE:
       if (g_workerRunning) {
         g_closeAfterWorker = true;
+#ifdef MODLIST_PATCH_INSTALLER
+        RequestPatchStop(hwnd);
+        SetWindowTextW(hwnd, L"Modlist Patch Installer - остановка…");
+#else
         StopInstall();
         SetWindowTextW(hwnd, UiText("window_title_stopping", L"Modlist Installer Beta - остановка...").c_str());
         AppendLog(L"Ожидание остановки проверки перед закрытием.");
+#endif
         return 0;
       }
       DestroyWindow(hwnd);
@@ -4087,7 +4444,11 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
   RECT windowRect{0, 0, MulDiv(920, static_cast<int>(dpi), 96),
                   MulDiv(660, static_cast<int>(dpi), 96)};
   AdjustWindowRectExForDpi(&windowRect, windowStyle, FALSE, 0, dpi);
+#ifdef MODLIST_PATCH_INSTALLER
+  HWND hwnd = CreateWindowExW(0, className, kPatchTitle,
+#else
   HWND hwnd = CreateWindowExW(0, className, L"Modlist Installer Beta",
+#endif
                               windowStyle,
                               CW_USEDEFAULT, CW_USEDEFAULT,
                               windowRect.right - windowRect.left,
@@ -4111,6 +4472,9 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
 
   ShowWindow(hwnd, showCommand);
   UpdateWindow(hwnd);
+#ifdef MODLIST_PATCH_INSTALLER
+  SelectAndStartPatch(hwnd, true);
+#endif
 
   MSG message{};
   while (GetMessageW(&message, nullptr, 0, 0) > 0) {
@@ -4118,6 +4482,12 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
     DispatchMessageW(&message);
   }
 
+#ifdef MODLIST_PATCH_INSTALLER
+  if (g_patchWorker.joinable()) {
+    g_stopRequested = true;
+    g_patchWorker.join();
+  }
+#endif
   OleUninitialize();
   return static_cast<int>(message.wParam);
 }

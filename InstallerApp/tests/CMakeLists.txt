@@ -5,6 +5,21 @@ add_test(NAME installer_build_identity_tests COMMAND installer_build_identity_te
 add_executable(installer_core_tests test_main.cpp ../src/ui/NativeStrings.cpp)
 target_include_directories(installer_core_tests PRIVATE ../resources)
 if(WIN32)
+  add_executable(patch_installer_tests test_patch_installer.cpp ../resources/app.rc)
+  target_include_directories(patch_installer_tests PRIVATE ../resources)
+  target_link_libraries(patch_installer_tests PRIVATE installer_core)
+  add_test(NAME patch_installer_tests COMMAND patch_installer_tests)
+
+  add_executable(patch_registry_tests test_patch_registry.cpp ../src/ui/NativeInstallerView.cpp
+    ../src/ui/NativeStrings.cpp ../resources/app.rc)
+  target_include_directories(patch_registry_tests PRIVATE ../resources)
+  if(MSVC)
+    target_compile_options(patch_registry_tests PRIVATE /utf-8)
+  endif()
+  target_link_libraries(patch_registry_tests PRIVATE installer_core
+    user32 gdi32 d2d1 dwrite dwmapi uxtheme comdlg32 shell32 ole32 oleaut32 comctl32 shlwapi advapi32)
+  add_test(NAME patch_registry_tests COMMAND patch_registry_tests)
+
   add_executable(folder_cleanup_tests test_folder_cleanup.cpp)
   target_link_libraries(folder_cleanup_tests PRIVATE installer_core advapi32)
   add_test(NAME folder_cleanup_tests COMMAND folder_cleanup_tests)
@@ -49,7 +64,8 @@ if(WIN32)
 
   if(MSVC)
     # These executables embed the application manifest through app.rc.
-    foreach(target installer_core_tests pipeline_smoke installer_ui_tests installer_workflow_tests)
+    foreach(target installer_core_tests pipeline_smoke installer_ui_tests installer_workflow_tests patch_installer_tests
+        patch_registry_tests)
       target_link_options(${target} PRIVATE /MANIFEST:NO)
     endforeach()
   endif()

@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -61,6 +62,7 @@ struct Manifest {
   TorrentFeatures torrentFeatures;
   InstallSettings install;
   std::vector<ManifestFile> files;
+  std::optional<std::vector<std::string>> deletePaths;
   uint64_t hashChunkSize{0};
   uint64_t unpackedSize{0};
   ExtractSettings extract;

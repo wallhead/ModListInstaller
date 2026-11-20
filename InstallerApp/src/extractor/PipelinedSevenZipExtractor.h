@@ -75,6 +75,13 @@ struct PipelineExtractionDiagnostics {
   } timings;
 };
 
+struct PipelineOutput {
+  // Relative paths resolved by the caller. A new file returns an owned Win32
+  // handle; the extraction stream closes it.
+  std::function<Result<void>(const std::filesystem::path&)> ensureDirectory;
+  std::function<Result<void*>(const std::filesystem::path&)> openNewFile;
+};
+
 struct PipelinedExtractionConfig {
   std::filesystem::path sevenZipLibrary;
   std::filesystem::path archiveFolder;
@@ -85,6 +92,7 @@ struct PipelinedExtractionConfig {
   size_t maxOutputPathLength{0};
   // Caller-owned; keep alive through Extract, which joins its stream worker before returning.
   PipelineExtractionDiagnostics* diagnostics{nullptr};
+  const PipelineOutput* output{nullptr};
 };
 
 class PipelinedSevenZipExtractor {

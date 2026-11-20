@@ -1,14 +1,19 @@
 #include "paths/FolderCleanup.h"
+#include "paths/PatchFolder.h"
 #include "app/PackageDiscovery.h"
 #include "app/RuntimePaths.h"
+#include "common/PathText.h"
+#include "paths/PathValidator.h"
 
 #define NOMINMAX
 #include <windows.h>
 #include <winternl.h>
 
 #include <algorithm>
+#include <ctime>
 #include <cwctype>
 #include <cstddef>
+#include <mutex>
 #include <sstream>
 #include <string_view>
 #include <vector>
@@ -88,9 +93,10 @@ struct PinnedFolder {
 
 enum class RelativeOpenMode { Synchronous, AsynchronousWatch };
 
-Result<Handle> OpenRelative(HANDLE parent, const std::wstring& name, ACCESS_MASK access,
-    bool directory, ULONG disposition = FILE_OPEN, ULONG attributes = 0,
-    RelativeOpenMode mode = RelativeOpenMode::Synchronous) {
+Result<Handle> OpenNativeChild(HANDLE parent, const std::wstring& name, ACCESS_MASK access,
+    ULONG type, ULONG disposition, ULONG attributes, ULONG share,
+    RelativeOpenMode mode, NTSTATUS* failure = nullptr) {
+  if (failure) *failure = 0;
   if (name.empty() || name == L"." || name == L".." || name.size() > 32767 ||
       name.find_first_of(L"\\/:") != std::wstring::npos || name.find(L'\0') != std::wstring::npos) {
     return Result<Handle>::Error("Native cleanup opens require exactly one child name");
@@ -110,11 +116,22 @@ Result<Handle> OpenRelative(HANDLE parent, const std::wstring& name, ACCESS_MASK
   // RootDirectory is the pinned object, never a path that can resolve through a changed ancestor.
   // Attribute-only writes bypass sharing: reparse checks alone cannot anchor traversal.
   const NTSTATUS status = create(&raw, access | SYNCHRONIZE, &object, &statusBlock, nullptr, attributes,
-      FILE_SHARE_READ | (watch ? FILE_SHARE_DELETE : 0), disposition,
+      share, disposition,
       FILE_OPEN_REPARSE_POINT | (watch ? 0 : FILE_SYNCHRONOUS_IO_NONALERT) |
-      (directory ? FILE_DIRECTORY_FILE : FILE_NON_DIRECTORY_FILE), nullptr, 0);
-  if (status < 0) return Result<Handle>::Error("Open pinned child without following reparses (NTSTATUS " + std::to_string(status) + ")");
+      type, nullptr, 0);
+  if (status < 0) {
+    if (failure) *failure = status;
+    return Result<Handle>::Error("Open pinned child without following reparses (NTSTATUS " + std::to_string(status) + ")");
+  }
   return Result<Handle>::Ok(Handle(raw));
+}
+
+Result<Handle> OpenRelative(HANDLE parent, const std::wstring& name, ACCESS_MASK access,
+    bool directory, ULONG disposition = FILE_OPEN, ULONG attributes = 0,
+    RelativeOpenMode mode = RelativeOpenMode::Synchronous) {
+  return OpenNativeChild(parent, name, access, directory ? FILE_DIRECTORY_FILE : FILE_NON_DIRECTORY_FILE,
+      disposition, attributes, FILE_SHARE_READ |
+      (mode == RelativeOpenMode::AsynchronousWatch ? FILE_SHARE_DELETE : 0), mode);
 }
 
 Result<void> CheckPlainDirectory(HANDLE handle) {
@@ -242,7 +259,7 @@ class StagingChangeWatch {
 };
 
 Result<PinnedFolder> PinFolder(const fs::path& folder, bool deleteRoot = false,
-    bool createMissing = false, bool* createdLeaf = nullptr) {
+    bool createMissing = false, bool* createdLeaf = nullptr, ULONG directoryShare = FILE_SHARE_READ) {
   const auto normalized = Normalize(folder);
   if (!normalized.ok()) return Result<PinnedFolder>::Error(normalized.error());
   const auto path = normalized.value();
@@ -267,7 +284,8 @@ Result<PinnedFolder> PinFolder(const fs::path& folder, bool deleteRoot = false,
   for (size_t i = 0; i < components.size(); ++i) {
     const auto access = FILE_READ_ATTRIBUTES | FILE_LIST_DIRECTORY |
         ((deleteRoot && i + 1 == components.size()) ? DELETE : 0);
-    auto opened = OpenRelative(pinned.chain.back().value, components[i].native(), access, true);
+    auto opened = OpenNativeChild(pinned.chain.back().value, components[i].native(), access,
+        FILE_DIRECTORY_FILE, FILE_OPEN, 0, directoryShare, RelativeOpenMode::Synchronous);
     if (!opened.ok() && createMissing) {
       opened = OpenRelative(pinned.chain.back().value, components[i].native(), access, true, FILE_CREATE);
       if (opened.ok()) {
@@ -386,9 +404,11 @@ Result<void> DeleteOpened(Handle& handle) {
 enum class TreeInspection { ForDeletion, EmptyDirectoriesOnly };
 
 Result<void> CollectTree(HANDLE folder, std::vector<Handle>& entries,
-    const FolderCleanupLimits& limits, TreeInspection inspection, size_t depth = 0) {
+    const FolderCleanupLimits& limits, TreeInspection inspection, size_t depth = 0,
+    const wchar_t* keepAtRoot = nullptr) {
   if (depth > limits.maxDepth) return Result<void>::Error("Cleanup tree exceeds safe depth limit");
   return VisitDirectory(folder, [&](const DirectoryEntry& entry) {
+    if (depth == 0 && keepAtRoot && PathTextEqual(entry.name, keepAtRoot)) return Result<bool>::Ok(true);
     if (entries.size() >= limits.maxEntries) return Result<bool>::Error("Cleanup tree exceeds safe entry limit");
     if (entry.attributes & FILE_ATTRIBUTE_REPARSE_POINT) return Result<bool>::Error("Nested reparse point/junction found; cleanup refused");
     const bool directory = (entry.attributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
@@ -667,4 +687,434 @@ Result<std::unique_ptr<StagingSession>> BeginOwnedStaging(const fs::path& folder
   impl->ownership = std::move(ownership);
   return Result<std::unique_ptr<StagingSession>>::Ok(std::make_unique<StagingSession>(std::move(impl)));
 }
+
+namespace patch {
+namespace {
+
+constexpr ULONG kSharePatchDirectory = FILE_SHARE_READ | FILE_SHARE_WRITE;
+constexpr ACCESS_MASK kReadPatchDirectory = FILE_LIST_DIRECTORY | FILE_TRAVERSE | FILE_READ_ATTRIBUTES;
+
+std::string PatchNtError(const std::string& error, NTSTATUS status) {
+  if (status >= 0) return error;
+  using Convert = ULONG(NTAPI*)(NTSTATUS);
+  static const auto convert = reinterpret_cast<Convert>(
+      GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "RtlNtStatusToDosError"));
+  return convert ? error + " (Windows error " + std::to_string(convert(status)) + ")" : error;
+}
+
+bool PatchEntryMissing(NTSTATUS status) {
+  const auto error = static_cast<uint32_t>(status);
+  return error == 0xc0000034u || error == 0xc000003au || error == 0xc000000fu;
+}
+
+Result<PatchEntry> ReadPatchEntry(HANDLE handle, const fs::path& name) {
+  BY_HANDLE_FILE_INFORMATION info{};
+  if (!GetFileInformationByHandle(handle, &info)) {
+    return Result<PatchEntry>::Error(WinError("Read patch entry identity"));
+  }
+  if (info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) {
+    return Result<PatchEntry>::Error("Reparse point/junction is not allowed in a patch path");
+  }
+  const auto identity = Identify(handle);
+  if (!identity.ok()) return Result<PatchEntry>::Error(identity.error());
+  if (!PathTextEqual(fs::path(identity.value().resolved).filename().native(), name.native())) {
+    return Result<PatchEntry>::Error("Short-name aliases are not allowed in a patch path");
+  }
+  return Result<PatchEntry>::Ok({
+      info.dwVolumeSerialNumber,
+      (static_cast<uint64_t>(info.nFileIndexHigh) << 32) | info.nFileIndexLow,
+      (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0});
+}
+
+struct PatchChain {
+  HANDLE base = INVALID_HANDLE_VALUE;
+  std::vector<Handle> directories;
+  bool missing = false;
+  HANDLE Last() const { return directories.empty() ? base : directories.back().value; }
+};
+
+Result<PatchChain> PinPatchChildDirectories(const PinnedFolder& root, const fs::path& relative,
+    bool allowMissing) {
+  const auto checked = CheckChain(root);
+  if (!checked.ok()) return Result<PatchChain>::Error(checked.error());
+  if (!relative.empty() && !IsSafeArchiveOutputPath(relative)) {
+    return Result<PatchChain>::Error("Unsafe patch ancestor path");
+  }
+  PatchChain result;
+  result.base = root.chain.back().value;
+  for (const auto& part : relative) {
+    NTSTATUS status{};
+    auto handle = OpenNativeChild(result.Last(), part.native(), kReadPatchDirectory, FILE_DIRECTORY_FILE,
+        FILE_OPEN, 0, kSharePatchDirectory, RelativeOpenMode::Synchronous, &status);
+    if (!handle.ok()) {
+      if (allowMissing && PatchEntryMissing(status)) {
+        result.missing = true;
+        return Result<PatchChain>::Ok(std::move(result));
+      }
+      return Result<PatchChain>::Error(PatchNtError(handle.error(), status));
+    }
+    const auto identity = ReadPatchEntry(handle.value().value, part);
+    if (!identity.ok()) return Result<PatchChain>::Error(identity.error());
+    result.directories.push_back(std::move(handle.value()));
+  }
+  return Result<PatchChain>::Ok(std::move(result));
+}
+
+Result<void> CheckPatchChain(const PatchChain& chain) {
+  if (auto checked = CheckPlainDirectory(chain.base); !checked.ok()) return checked;
+  for (const auto& directory : chain.directories) {
+    if (auto checked = CheckPlainDirectory(directory.value); !checked.ok()) return checked;
+  }
+  return Result<void>::Ok();
+}
+
+}  // namespace
+
+struct PatchFolder::Impl {
+  PinnedFolder root;
+  fs::path package;
+  Handle workspace;
+  Handle recovery;
+  PatchEntry workspaceIdentity;
+  bool recoveryOnly = false;
+};
+
+PatchFolder::PatchFolder(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
+PatchFolder::~PatchFolder() = default;
+const fs::path& PatchFolder::Root() const { return impl_->root.folder; }
+const fs::path& PatchFolder::Package() const { return impl_->package; }
+bool PatchFolder::RecoveryOnly() const { return impl_->recoveryOnly; }
+
+struct PatchLogFile::Impl {
+  fs::path path;
+  PinnedFolder base;
+  Handle directory;
+  Handle file;
+  std::mutex mutex;
+};
+
+PatchLogFile::PatchLogFile(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
+PatchLogFile::~PatchLogFile() = default;
+const fs::path& PatchLogFile::Path() const { return impl_->path; }
+
+Result<std::unique_ptr<PatchLogFile>> PatchLogFile::Open(const PatchFolder& folder) {
+  using Outcome = Result<std::unique_ptr<PatchLogFile>>;
+  const auto openIn = [&](const fs::path& base, bool createBase) -> Outcome {
+    if (!base.is_absolute() || InstallationOverlapsPackage(folder.Root(), base)) {
+      return Outcome::Error("Log folder overlaps the modlist or is not absolute");
+    }
+    auto pinned = PinFolder(base, false, createBase, nullptr, kSharePatchDirectory);
+    if (!pinned.ok()) return Outcome::Error(pinned.error());
+    if (InstallationOverlapsPackage(folder.Root(), fs::path(pinned.value().identity.resolved))) {
+      return Outcome::Error("Resolved log folder overlaps the modlist");
+    }
+    NTSTATUS status{};
+    auto directory = OpenNativeChild(pinned.value().chain.back().value, L"logs", kReadPatchDirectory,
+        FILE_DIRECTORY_FILE, FILE_OPEN_IF, 0, kSharePatchDirectory, RelativeOpenMode::Synchronous, &status);
+    if (!directory.ok()) return Outcome::Error(PatchNtError(directory.error(), status));
+    const auto ordinary = ReadPatchEntry(directory.value().value, L"logs");
+    if (!ordinary.ok()) return Outcome::Error(ordinary.error());
+
+    constexpr wchar_t name[] = L"modlist-patch-installer.log";
+    auto file = OpenNativeChild(directory.value().value, name, FILE_APPEND_DATA | FILE_READ_ATTRIBUTES,
+        FILE_NON_DIRECTORY_FILE, FILE_OPEN_IF, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ,
+        RelativeOpenMode::Synchronous, &status);
+    if (!file.ok()) return Outcome::Error(PatchNtError(file.error(), status));
+    BY_HANDLE_FILE_INFORMATION info{};
+    if (!GetFileInformationByHandle(file.value().value, &info)) {
+      return Outcome::Error(WinError("Inspect patch log file"));
+    }
+    if (info.nNumberOfLinks != 1 || (info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)) {
+      return Outcome::Error("Patch log is a hard link or reparse point");
+    }
+    const auto identity = ReadPatchEntry(file.value().value, name);
+    if (!identity.ok()) return Outcome::Error(identity.error());
+
+    auto impl = std::make_unique<Impl>();
+    impl->path = pinned.value().folder / L"logs" / name;
+    impl->base = std::move(pinned.value());
+    impl->directory = std::move(directory.value());
+    impl->file = std::move(file.value());
+    return Outcome::Ok(std::unique_ptr<PatchLogFile>(new PatchLogFile(std::move(impl))));
+  };
+
+  auto nextToPackage = openIn(folder.Package(), false);
+  if (nextToPackage.ok()) return nextToPackage;
+  auto cached = openIn(UserRuntimeFolder(folder.Package()), true);
+  if (cached.ok()) return cached;
+  return Outcome::Error("Package log: " + nextToPackage.error() + "; local log: " + cached.error());
+}
+
+bool PatchLogFile::Append(std::string_view text) noexcept {
+  try {
+    const auto now = std::time(nullptr);
+    std::tm local{};
+    char prefix[32]{};
+    if (localtime_s(&local, &now) != 0 ||
+        std::strftime(prefix, sizeof(prefix), "%Y-%m-%d %H:%M:%S ", &local) == 0) return false;
+    std::string record;
+    do {
+      const auto end = text.find('\n');
+      auto line = text.substr(0, end);
+      if (line.ends_with('\r')) line.remove_suffix(1);
+      record.append(prefix).append(line).append("\r\n");
+      if (end == std::string_view::npos) break;
+      text.remove_prefix(end + 1);
+    } while (!text.empty());
+    if (record.size() > MAXDWORD) return false;
+    DWORD written = 0;
+    const std::lock_guard lock(impl_->mutex);
+    return WriteFile(impl_->file.value, record.data(), static_cast<DWORD>(record.size()), &written, nullptr) &&
+        written == record.size();
+  } catch (...) {
+    return false;
+  }
+}
+
+Result<std::optional<PatchEntry>> PatchFolder::Inspect(const fs::path& relative) const {
+  using Outcome = Result<std::optional<PatchEntry>>;
+  if (!IsSafeArchiveOutputPath(relative)) return Outcome::Error("Unsafe patch inspection path");
+  auto parent = PinPatchChildDirectories(impl_->root, relative.parent_path(), true);
+  if (!parent.ok()) return Outcome::Error(parent.error());
+  if (parent.value().missing) return Outcome::Ok(std::nullopt);
+  NTSTATUS status{};
+  auto child = OpenNativeChild(parent.value().Last(), relative.filename().native(), FILE_READ_ATTRIBUTES,
+      0, FILE_OPEN, 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+      RelativeOpenMode::Synchronous, &status);
+  if (!child.ok()) return PatchEntryMissing(status) ? Outcome::Ok(std::nullopt)
+      : Outcome::Error(PatchNtError(child.error(), status));
+  const auto id = ReadPatchEntry(child.value().value, relative.filename());
+  return id.ok() ? Outcome::Ok(id.value()) : Outcome::Error(id.error());
+}
+
+Result<std::vector<PatchChild>> PatchFolder::List(const fs::path& relative) const {
+  using Outcome = Result<std::vector<PatchChild>>;
+  auto directory = PinPatchChildDirectories(impl_->root, relative, false);
+  if (!directory.ok()) return Outcome::Error(directory.error());
+  std::vector<PatchChild> children;
+  const auto checked = VisitDirectory(directory.value().Last(), [&](const DirectoryEntry& entry) {
+    if ((entry.attributes & FILE_ATTRIBUTE_REPARSE_POINT) || !IsSafeArchiveOutputPath(fs::path(entry.name))) {
+      return Result<bool>::Error("Unexpected path or reparse point in a patch directory");
+    }
+    children.push_back({entry.name, {impl_->root.identity.volume, entry.id,
+        (entry.attributes & FILE_ATTRIBUTE_DIRECTORY) != 0}});
+    return Result<bool>::Ok(true);
+  });
+  return checked.ok() ? Outcome::Ok(std::move(children)) : Outcome::Error(checked.error());
+}
+
+Result<PatchEntry> PatchFolder::MakeDirectory(const fs::path& relative) {
+  if (!IsSafeArchiveOutputPath(relative)) return Result<PatchEntry>::Error("Unsafe patch directory path");
+  auto parent = PinPatchChildDirectories(impl_->root, relative.parent_path(), false);
+  if (!parent.ok()) return Result<PatchEntry>::Error(parent.error());
+  NTSTATUS status{};
+  auto child = OpenNativeChild(parent.value().Last(), relative.filename().native(), kReadPatchDirectory,
+      FILE_DIRECTORY_FILE, FILE_CREATE, 0, kSharePatchDirectory, RelativeOpenMode::Synchronous, &status);
+  if (!child.ok()) return Result<PatchEntry>::Error(PatchNtError(child.error(), status));
+  return ReadPatchEntry(child.value().value, relative.filename());
+}
+
+Result<void*> PatchFolder::CreateNewOutputFile(const fs::path& relative) {
+  using Outcome = Result<void*>;
+  if (!impl_->workspace || !IsSafeArchiveOutputPath(relative)) {
+    return Outcome::Error("Unsafe archive output path or no owned workspace");
+  }
+  auto part = relative.begin();
+  if (!PathTextEqual(part->native(), kWorkFolder) || ++part == relative.end() ||
+      !PathTextEqual(part->native(), L"new") || ++part == relative.end()) {
+    return Outcome::Error("Archive output is not in the private staging folder");
+  }
+  auto parent = PinPatchChildDirectories(impl_->root, relative.parent_path(), false);
+  if (!parent.ok()) return Outcome::Error(parent.error());
+  NTSTATUS status{};
+  auto child = OpenNativeChild(parent.value().Last(), relative.filename().native(), GENERIC_WRITE,
+      FILE_NON_DIRECTORY_FILE, FILE_CREATE, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ,
+      RelativeOpenMode::Synchronous, &status);
+  if (!child.ok()) return Outcome::Error(PatchNtError(child.error(), status));
+  return Outcome::Ok(std::exchange(child.value().value, INVALID_HANDLE_VALUE));
+}
+
+Result<void> PatchFolder::Rename(const fs::path& source, const PatchEntry& expected,
+    const fs::path& destination) {
+  if (!IsSafeArchiveOutputPath(source) || !IsSafeArchiveOutputPath(destination)) {
+    return Result<void>::Error("Unsafe patch move path");
+  }
+  auto from = PinPatchChildDirectories(impl_->root, source.parent_path(), false);
+  if (!from.ok()) return Result<void>::Error(from.error());
+  auto to = PinPatchChildDirectories(impl_->root, destination.parent_path(), false);
+  if (!to.ok()) return Result<void>::Error(to.error());
+  NTSTATUS status{};
+  auto file = OpenNativeChild(from.value().Last(), source.filename().native(), DELETE | FILE_READ_ATTRIBUTES,
+      expected.directory ? FILE_DIRECTORY_FILE : FILE_NON_DIRECTORY_FILE, FILE_OPEN, 0, FILE_SHARE_READ,
+      RelativeOpenMode::Synchronous, &status);
+  if (!file.ok()) return Result<void>::Error(PatchNtError(file.error(), status));
+  const auto id = ReadPatchEntry(file.value().value, source.filename());
+  if (!id.ok() || id.value() != expected) return Result<void>::Error("Patch move source identity changed");
+  if (auto checked = CheckPatchChain(from.value()); !checked.ok()) return checked;
+  if (auto checked = CheckPatchChain(to.value()); !checked.ok()) return checked;
+
+  // The native rename takes a pinned destination parent and a single child name.
+  // ReplaceIfExists stays false, including during rollback.
+  using NativeRename = NTSTATUS(NTAPI*)(HANDLE, PIO_STATUS_BLOCK, PVOID, ULONG, FILE_INFORMATION_CLASS);
+  static const auto rename = reinterpret_cast<NativeRename>(
+      GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtSetInformationFile"));
+  if (!rename) return Result<void>::Error("Native no-follow rename is unavailable");
+  const auto name = destination.filename().native();
+  const size_t size = sizeof(FILE_RENAME_INFO) + name.size() * sizeof(wchar_t);
+  std::vector<ULONGLONG> storage((size + sizeof(ULONGLONG) - 1) / sizeof(ULONGLONG));
+  auto* move = reinterpret_cast<FILE_RENAME_INFO*>(storage.data());
+  move->RootDirectory = to.value().Last();
+  move->FileNameLength = static_cast<DWORD>(name.size() * sizeof(wchar_t));
+  std::copy(name.begin(), name.end(), move->FileName);
+  IO_STATUS_BLOCK completed{};
+  constexpr auto fileRenameInformation = static_cast<FILE_INFORMATION_CLASS>(10);
+  status = rename(file.value().value, &completed, move, static_cast<ULONG>(size), fileRenameInformation);
+  return status < 0 ? Result<void>::Error(PatchNtError("Rename pinned patch entry", status))
+                    : Result<void>::Ok();
+}
+
+Result<void> PatchFolder::RemoveEmptyDirectory(const fs::path& relative, const PatchEntry& expected) {
+  if (!IsSafeArchiveOutputPath(relative)) return Result<void>::Error("Unsafe empty directory path");
+  auto parent = PinPatchChildDirectories(impl_->root, relative.parent_path(), false);
+  if (!parent.ok()) return Result<void>::Error(parent.error());
+  auto child = OpenRelative(parent.value().Last(), relative.filename().native(),
+      DELETE | kReadPatchDirectory, true);
+  if (!child.ok()) return Result<void>::Error(child.error());
+  const auto id = ReadPatchEntry(child.value().value, relative.filename());
+  if (!id.ok() || id.value() != expected) return Result<void>::Error("Rollback directory identity changed");
+  const auto empty = DirectoryIsEmpty(child.value().value);
+  if (!empty.ok() || !empty.value()) return Result<void>::Error("Rollback directory is not empty");
+  return DeleteOpened(child.value());
+}
+
+Result<void> PatchFolder::BeginWorkspace() {
+  if (impl_->workspace) return Result<void>::Error("A patch workspace is already in use");
+  if (auto checked = CheckChain(impl_->root); !checked.ok()) return checked;
+  auto work = OpenNativeChild(impl_->root.chain.back().value, kWorkFolder, kReadPatchDirectory,
+      FILE_DIRECTORY_FILE, FILE_CREATE, FILE_ATTRIBUTE_HIDDEN, kSharePatchDirectory,
+      RelativeOpenMode::Synchronous);
+  if (!work.ok()) {
+    return Result<void>::Error("Cannot create the private patch workspace; an existing workspace is not reused");
+  }
+  const auto identity = ReadPatchEntry(work.value().value, kWorkFolder);
+  if (!identity.ok()) return Result<void>::Error(identity.error());
+  impl_->workspaceIdentity = identity.value();
+  impl_->workspace = std::move(work.value());
+  return Result<void>::Ok();
+}
+
+Result<void> PatchFolder::WriteRecovery(std::string_view bytes) {
+  if (!impl_->workspace) return Result<void>::Error("No owned patch workspace");
+  if (!impl_->recovery) {
+    auto record = OpenRelative(impl_->workspace.value, L"recovery.txt", GENERIC_WRITE,
+        false, FILE_CREATE);
+    if (!record.ok()) return Result<void>::Error(record.error());
+    impl_->recovery = std::move(record.value());
+  }
+  DWORD written = 0;
+  if (bytes.size() > MAXDWORD || !WriteFile(impl_->recovery.value, bytes.data(),
+      static_cast<DWORD>(bytes.size()), &written, nullptr) || written != bytes.size() ||
+      !FlushFileBuffers(impl_->recovery.value)) {
+    return Result<void>::Error(WinError("Persist patch recovery record"));
+  }
+  return Result<void>::Ok();
+}
+
+Result<void> PatchFolder::DiscardWorkspace() {
+  if (!impl_->workspace) return Result<void>::Error("No owned workspace to clean up");
+  impl_->recovery.Close();
+  impl_->workspace.Close();
+  if (auto checked = CheckChain(impl_->root); !checked.ok()) return checked;
+  auto work = OpenRelative(impl_->root.chain.back().value, kWorkFolder, DELETE | kReadPatchDirectory, true);
+  if (!work.ok()) return Result<void>::Error(work.error());
+  const auto identity = ReadPatchEntry(work.value().value, kWorkFolder);
+  if (!identity.ok() || identity.value() != impl_->workspaceIdentity) {
+    return Result<void>::Error("Patch workspace identity changed; not cleaned up");
+  }
+  NTSTATUS status{};
+  auto record = OpenNativeChild(work.value().value, L"recovery.txt", DELETE | FILE_READ_ATTRIBUTES,
+      FILE_NON_DIRECTORY_FILE, FILE_OPEN, 0, FILE_SHARE_READ,
+      RelativeOpenMode::Synchronous, &status);
+  if (!record.ok() && !PatchEntryMissing(status)) return Result<void>::Error(PatchNtError(record.error(), status));
+  if (record.ok()) {
+    const auto confirmed = ReadPatchEntry(record.value().value, L"recovery.txt");
+    if (!confirmed.ok()) return Result<void>::Error(confirmed.error());
+  }
+  std::vector<Handle> entries;
+  const auto scanned = CollectTree(work.value().value, entries, {}, TreeInspection::ForDeletion,
+      0, L"recovery.txt");
+  if (!scanned.ok()) return scanned;
+  if (auto checked = CheckChain(impl_->root); !checked.ok()) return checked;
+  for (auto it = entries.rbegin(); it != entries.rend(); ++it) {
+    BY_HANDLE_FILE_INFORMATION info{};
+    if (!GetFileInformationByHandle(it->value, &info) || (info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)) {
+      return Result<void>::Error("Workspace entry changed; not cleaned up");
+    }
+    const auto removed = DeleteOpened(*it);
+    if (!removed.ok()) return removed;
+  }
+  // Keep the state record until nothing remains to recover or clean up.
+  if (record.ok()) {
+    const auto deleted = DeleteOpened(record.value());
+    if (!deleted.ok()) return deleted;
+  }
+  return DeleteOpened(work.value());
+}
+
+Result<std::unique_ptr<PatchFolder>> OpenPatchFolder(const fs::path& selection, const fs::path& package,
+    PatchSelection origin) {
+  using Outcome = Result<std::unique_ptr<PatchFolder>>;
+  const auto normalized = Normalize(selection);
+  if (!normalized.ok()) return Outcome::Error(normalized.error());
+  auto openRoot = [&](const fs::path& root) -> Outcome {
+    if (root.root_name().native().size() != 2 || root.root_name().native().back() != L':' ||
+        root == root.root_path() || GetDriveTypeW(root.root_path().c_str()) == DRIVE_REMOTE) {
+      return Outcome::Error("Choose a modlist directory on a local drive, not a drive root or share");
+    }
+    if (!package.is_absolute() || InstallationOverlapsPackage(root, package) ||
+        InstallationOverlapsRuntime(root)) {
+      return Outcome::Error("Modlist overlaps the package or the installer runtime");
+    }
+    // The kernel must open the destination parent for write access during a
+    // relative rename. Still exclude share-delete so the confirmed root is pinned.
+    auto pinned = PinFolder(root, false, false, nullptr, kSharePatchDirectory);
+    if (!pinned.ok()) return Outcome::Error(pinned.error());
+    if (InstallationOverlapsPackage(pinned.value().identity.resolved, package)) {
+      return Outcome::Error("Resolved modlist overlaps the patch package");
+    }
+    auto impl = std::make_unique<PatchFolder::Impl>();
+    impl->root = std::move(pinned.value());
+    impl->package = package;
+    auto* state = impl.get();
+    auto folder = std::make_unique<PatchFolder>(std::move(impl));
+    const auto work = folder->Inspect(kWorkFolder);
+    if (!work.ok() || work.value()) {
+      // A previous patch may have moved the layout markers into its backup.
+      // This ticket can report recovery but must never authorize a new patch.
+      state->recoveryOnly = true;
+      return Outcome::Ok(std::move(folder));
+    }
+    for (const auto& [name, directory] : {std::pair{L"Stock Game", true},
+        std::pair{L"mods", true}, std::pair{L"ModOrganizer.exe", false}}) {
+      const auto marker = folder->Inspect(name);
+      if (!marker.ok()) return Outcome::Error(marker.error());
+      if (!marker.value() || marker.value()->directory != directory) {
+        return Outcome::Error("Choose the modlist root containing Stock Game, mods and ModOrganizer.exe");
+      }
+    }
+    return Outcome::Ok(std::move(folder));
+  };
+  const bool stockName = PathTextEqual(normalized.value().filename().native(), L"Stock Game");
+  if (origin == PatchSelection::RegisteredStock) {
+    if (!stockName) return Outcome::Error("Registry path is not a Stock Game folder");
+    return openRoot(normalized.value().parent_path());
+  }
+  auto selected = openRoot(normalized.value());
+  if (!selected.ok() && stockName) {
+    return openRoot(normalized.value().parent_path());
+  }
+  return selected;
+}
+
+}  // namespace patch
 } // namespace modlist

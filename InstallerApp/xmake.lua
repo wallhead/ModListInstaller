@@ -93,7 +93,7 @@ target("installer_core")
     end)
 
     if is_plat("windows") then
-        add_files("src/paths/FolderCleanup.cpp")
+        add_files("src/paths/FolderCleanup.cpp", "src/patch/PatchInstaller.cpp", "src/patch/PatchDeletePaths.cpp")
         add_cxxflags("/W4", "/permissive-", {tools = "cl"})
         add_syslinks("bcrypt", "ole32", "oleaut32", {public = true})
     else
@@ -150,6 +150,37 @@ target("pipeline_scheduler_tests")
 target_end()
 
 if is_plat("windows") then
+    target("modlist-patch-installer")
+        set_kind("binary")
+        set_rundir("$(projectdir)")
+        add_defines("MODLIST_PATCH_INSTALLER")
+        add_files("src/ui/WinInstallerApp.cpp", "src/ui/NativeInstallerView.cpp",
+                  "src/ui/NativeStrings.cpp", "resources/app.rc", "resources/PatchManifestResource.rc")
+        add_cxxflags("/utf-8", {tools = "cl"})
+        add_deps("installer_core")
+        add_syslinks("user32", "gdi32", "d2d1", "dwrite", "dwmapi", "uxtheme",
+                     "comdlg32", "shell32", "ole32", "oleaut32", "comctl32", "shlwapi", "advapi32")
+        add_ldflags("/SUBSYSTEM:WINDOWS", {tools = "link"})
+    target_end()
+
+    target("patch_installer_tests")
+        set_kind("binary")
+        set_rundir("$(projectdir)")
+        add_files("tests/test_patch_installer.cpp", "resources/app.rc")
+        add_cxxflags("/utf-8", {tools = "cl"})
+        add_deps("installer_core")
+    target_end()
+
+    target("patch_registry_tests")
+        set_kind("binary")
+        add_files("tests/test_patch_registry.cpp", "src/ui/NativeInstallerView.cpp",
+                  "src/ui/NativeStrings.cpp", "resources/app.rc")
+        add_cxxflags("/utf-8", {tools = "cl"})
+        add_deps("installer_core")
+        add_syslinks("user32", "gdi32", "d2d1", "dwrite", "dwmapi", "uxtheme",
+                     "comdlg32", "shell32", "ole32", "oleaut32", "comctl32", "shlwapi", "advapi32")
+    target_end()
+
     target("folder_cleanup_tests")
         set_kind("binary")
         add_files("tests/test_folder_cleanup.cpp")

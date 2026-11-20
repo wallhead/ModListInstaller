@@ -1099,19 +1099,31 @@ class FileOutStream final : public ISequentialOutStream, private ComRefCount {
 public:
   explicit FileOutStream(const std::filesystem::path& path,
                          const std::atomic_bool* cancelRequested,
-                         PipelineExtractionDiagnostics* diagnostics)
+                         PipelineExtractionDiagnostics* diagnostics,
+                         const PipelineOutput* output,
+                         const std::filesystem::path& relative)
       : cancelRequested_(cancelRequested), diagnostics_(diagnostics) {
     DiagnosticTimer timer(diagnostics_ != nullptr ? &diagnostics_->outputCreateNanoseconds : nullptr);
-    handle_ = CreateFileW(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr,
-                          CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
-    openError_ = handle_ == INVALID_HANDLE_VALUE ? GetLastError() : ERROR_SUCCESS;
+    if (output != nullptr) {
+      try {
+        const auto opened = output->openNewFile(relative);
+        if (opened.ok() && opened.value() && opened.value() != INVALID_HANDLE_VALUE) handle_ = opened.value();
+        else error_ = opened.ok() ? "No archive output handle was returned" : opened.error();
+      } catch (const std::exception& e) {
+        error_ = e.what();
+      }
+    } else {
+      handle_ = CreateFileW(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr,
+                            CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+      openError_ = handle_ == INVALID_HANDLE_VALUE ? GetLastError() : ERROR_SUCCESS;
+    }
     if (handle_ != INVALID_HANDLE_VALUE && diagnostics_ != nullptr) {
       diagnostics_->outputFilesCreated.fetch_add(1, std::memory_order_relaxed);
     }
   }
 
   bool Ready() const { return handle_ != INVALID_HANDLE_VALUE; }
-  DWORD OpenError() const { return openError_; }
+  std::string OpenError() const { return error_.empty() ? WindowsErrorMessage(openError_) : error_; }
 
   HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void** object) override {
     if (object == nullptr) {
@@ -1168,6 +1180,7 @@ private:
 
   HANDLE handle_{INVALID_HANDLE_VALUE};
   DWORD openError_{ERROR_SUCCESS};
+  std::string error_;
   const std::atomic_bool* cancelRequested_{nullptr};
   PipelineExtractionDiagnostics* diagnostics_{nullptr};
 };
@@ -1178,9 +1191,11 @@ public:
                          std::filesystem::path outputFolder,
                          const std::atomic_bool* cancelRequested,
                          std::shared_ptr<ProgressReporter> reporter,
-                         PipelineExtractionDiagnostics* diagnostics)
+                         PipelineExtractionDiagnostics* diagnostics,
+                         const PipelineOutput* output)
       : archive_(archive), outputFolder_(std::move(outputFolder)),
-        cancelRequested_(cancelRequested), diagnostics_(diagnostics), reporter_(std::move(reporter)) {
+        cancelRequested_(cancelRequested), diagnostics_(diagnostics), reporter_(std::move(reporter)),
+        output_(output) {
     archive_->AddRef();
   }
 
@@ -1246,27 +1261,37 @@ public:
     PropVariantClear(&directoryProperty);
 
     currentPath_ = outputFolder_ / relative;
-    std::error_code ec;
-    if (isDirectory) {
-      CreateOutputDirectories(currentPath_, ec, diagnostics_);
-      if (ec) {
-        error_ = "Unable to create extracted directory: " + ec.message();
-        return E_FAIL;
+    const auto makeDirectories = [&](const std::filesystem::path& dir,
+                                     const std::filesystem::path& absolute, const char* kind) {
+      std::string detail;
+      if (output_ != nullptr) {
+        try {
+          const auto result = output_->ensureDirectory(dir);
+          if (!result.ok()) detail = result.error();
+        } catch (const std::exception& e) {
+          detail = e.what();
+        }
+      } else {
+        std::error_code ec;
+        CreateOutputDirectories(absolute, ec, diagnostics_);
+        if (ec) detail = ec.message();
       }
-      return S_OK;
+      if (detail.empty()) return S_OK;
+      error_ = std::string("Unable to create extracted ") + kind + ": " + detail;
+      return E_FAIL;
+    };
+    if (isDirectory) {
+      return makeDirectories(relative, currentPath_, "directory");
     }
     if (askExtractMode != kAskExtract) {
       return S_OK;
     }
-    CreateOutputDirectories(currentPath_.parent_path(), ec, diagnostics_);
-    if (ec) {
-      error_ = "Unable to create extracted file directory: " + ec.message();
-      return E_FAIL;
-    }
-    auto* stream = new FileOutStream(currentPath_, cancelRequested_, diagnostics_);
+    if (const auto made = makeDirectories(relative.parent_path(), currentPath_.parent_path(), "file directory");
+        FAILED(made)) return made;
+    auto* stream = new FileOutStream(currentPath_, cancelRequested_, diagnostics_, output_, relative);
     if (!stream->Ready()) {
-      error_ = "Unable to create extracted file " + PathToUtf8(currentPath_) + ": " +
-               WindowsErrorMessage(stream->OpenError());
+      error_ = std::string(output_ ? "Unable to create archive output " : "Unable to create extracted file ") +
+               PathToUtf8(currentPath_) + ": " + stream->OpenError();
       stream->Release();
       return E_FAIL;
     }
@@ -1322,6 +1347,7 @@ private:
   const std::atomic_bool* cancelRequested_{nullptr};
   PipelineExtractionDiagnostics* diagnostics_{nullptr};
   std::shared_ptr<ProgressReporter> reporter_;
+  const PipelineOutput* output_{nullptr};
   ISequentialOutStream* current_{nullptr};
   FileOutStream* currentFile_{nullptr};
   std::filesystem::path currentPath_;
@@ -1459,6 +1485,10 @@ ExtractionResult PipelinedSevenZipExtractor::Extract(
     result.message = "Manifest does not support pipelined chunk validation";
     return result;
   }
+  if (config.output && (!config.output->ensureDirectory || !config.output->openNewFile)) {
+    result.message = "Incomplete guarded archive output";
+    return result;
+  }
   HMODULE library = LoadLibraryExW(
       config.sevenZipLibrary.c_str(), nullptr,
       LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
@@ -1523,7 +1553,18 @@ ExtractionResult PipelinedSevenZipExtractor::Extract(
       }
     }
     std::error_code ec;
-    if (SUCCEEDED(operation)) {
+    if (SUCCEEDED(operation) && config.output != nullptr) {
+      try {
+        const auto ready = config.output->ensureDirectory({});
+        if (!ready.ok()) {
+          result.message = ready.error();
+          operation = E_FAIL;
+        }
+      } catch (const std::exception& e) {
+        result.message = e.what();
+        operation = E_FAIL;
+      }
+    } else if (SUCCEEDED(operation)) {
       CreateOutputDirectories(config.installFolder, ec, config.diagnostics);
       if (ec) {
         result.message = "Unable to create extraction folder: " + ec.message();
@@ -1556,7 +1597,8 @@ ExtractionResult PipelinedSevenZipExtractor::Extract(
 
     if (SUCCEEDED(operation)) {
     auto* rawExtractCallback = new ArchiveExtractCallback(
-        archive.Get(), config.installFolder, config.cancelRequested, reporter, config.diagnostics);
+        archive.Get(), config.installFolder, config.cancelRequested, reporter, config.diagnostics,
+        config.output);
     ComPtr<IArchiveExtractCallback> extractCallback(rawExtractCallback);
     operation = MeasurePipelineCall(timings != nullptr ? &timings->extract : nullptr, [&] {
       return archive->Extract(
