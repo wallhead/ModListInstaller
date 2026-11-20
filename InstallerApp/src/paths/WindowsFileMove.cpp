@@ -1,4 +1,5 @@
 #include "paths/WindowsFileMove.h"
+#include "paths/WindowsPath.h"
 
 #include <algorithm>
 #include <system_error>
@@ -26,13 +27,14 @@ MoveTreeResult FailedTreeMove(const std::filesystem::path& source,
 
 bool IsTraversableDirectory(const std::filesystem::path& path,
                             std::error_code& ec) {
-  const auto status = std::filesystem::symlink_status(path, ec);
+  const auto ioPath = WindowsIoPath(path);
+  const auto status = std::filesystem::symlink_status(ioPath, ec);
   if (ec || !std::filesystem::is_directory(status) ||
       std::filesystem::is_symlink(status)) {
     return false;
   }
 #ifdef _WIN32
-  const DWORD attributes = GetFileAttributesW(path.c_str());
+  const DWORD attributes = GetFileAttributesW(ioPath.c_str());
   if (attributes == INVALID_FILE_ATTRIBUTES) {
     ec = std::error_code(static_cast<int>(GetLastError()), std::system_category());
     return false;
@@ -45,10 +47,10 @@ bool IsTraversableDirectory(const std::filesystem::path& path,
 
 bool ContainsPayload(const std::filesystem::path& directory,
                      std::error_code& ec) {
-  auto iterator = std::filesystem::directory_iterator(directory, ec);
+  auto iterator = std::filesystem::directory_iterator(WindowsIoPath(directory), ec);
   const auto end = std::filesystem::directory_iterator();
   while (!ec && iterator != end) {
-    const auto entry = iterator->path();
+    const auto entry = directory / iterator->path().filename();
     const bool traversableDirectory = IsTraversableDirectory(entry, ec);
     if (ec) {
       return true;
@@ -87,7 +89,8 @@ MoveTreeResult MoveTree(const std::filesystem::path& source,
     return {moved.ok, moved.error, source, target, usedDirectoryFallback};
   }
 
-  const bool targetExists = std::filesystem::exists(target, ec);
+  const auto ioTarget = WindowsIoPath(target);
+  const bool targetExists = std::filesystem::exists(ioTarget, ec);
   if (ec) {
     return FailedTreeMove(source, target, static_cast<unsigned long>(ec.value()),
                           usedDirectoryFallback);
@@ -106,17 +109,18 @@ MoveTreeResult MoveTree(const std::filesystem::path& source,
     usedDirectoryFallback = true;
   }
 
-  std::filesystem::create_directories(target, ec);
+  std::filesystem::create_directories(ioTarget, ec);
   if (ec) {
     return FailedTreeMove(source, target, static_cast<unsigned long>(ec.value()),
                           usedDirectoryFallback);
   }
 
   std::vector<std::filesystem::path> entries;
-  auto iterator = std::filesystem::directory_iterator(source, ec);
+  const auto ioSource = WindowsIoPath(source);
+  auto iterator = std::filesystem::directory_iterator(ioSource, ec);
   const auto end = std::filesystem::directory_iterator();
   while (!ec && iterator != end) {
-    entries.push_back(iterator->path());
+    entries.push_back(source / iterator->path().filename());
     iterator.increment(ec);
   }
   if (ec) {
@@ -134,7 +138,7 @@ MoveTreeResult MoveTree(const std::filesystem::path& source,
     }
   }
 
-  std::filesystem::remove(source, ec);
+  std::filesystem::remove(ioSource, ec);
   if (ec) {
     const auto cleanupError = static_cast<unsigned long>(ec.value());
     ec.clear();
@@ -171,6 +175,10 @@ MovePathResult MovePathWithRetry(
     MoveRetryCallback retryCallback) {
   MovePathResult result;
   const uint32_t attempts = std::max<uint32_t>(1, maxAttempts);
+#ifdef _WIN32
+  const auto ioSource = WindowsIoPath(source);
+  const auto ioTarget = WindowsIoPath(target);
+#endif
   for (uint32_t attempt = 1; attempt <= attempts; ++attempt) {
     result.attempts = attempt;
 #ifdef _WIN32
@@ -178,7 +186,7 @@ MovePathResult MovePathWithRetry(
     if (replaceExisting) {
       flags |= MOVEFILE_REPLACE_EXISTING;
     }
-    if (MoveFileExW(source.c_str(), target.c_str(), flags)) {
+    if (MoveFileExW(ioSource.c_str(), ioTarget.c_str(), flags)) {
       result.ok = true;
       result.error = ERROR_SUCCESS;
       return result;

@@ -27,7 +27,9 @@ Release/ModlistInstaller-v*.zip
 
 *.exe
 !InstallerApp/dist/modlist-installer.exe
+!InstallerApp/dist/modlist-patch-installer.exe
 !InstallerApp/resources/7z.exe
 !InstallerApp/resources/7z.dll
 !PackerApp/dist/modlist-installer.exe
+!PackerApp/dist/modlist-patch-installer.exe
 !PackerApp/dist/modlist-packer.exe

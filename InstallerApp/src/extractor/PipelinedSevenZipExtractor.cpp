@@ -238,57 +238,12 @@ Result<std::filesystem::path> ExtractEmbeddedLibrary(const std::filesystem::path
   return Result<std::filesystem::path>::Ok(output);
 }
 
-bool EndsWithDigits(const std::string& value) {
-  return value.size() >= 3 &&
-         std::all_of(value.end() - 3, value.end(), [](unsigned char c) {
-           return c >= '0' && c <= '9';
-         });
-}
-
-const GUID* ArchiveFormat(const Manifest& manifest) {
-  auto path = manifest.extract.firstArchivePart;
-  const auto extension = GenericPathToUtf8(path.extension());
-  if (extension.size() == 4 && extension.front() == '.' && EndsWithDigits(extension)) {
-    path = path.stem();
-  }
+const GUID* ArchiveFormat(const std::filesystem::path& path) {
   auto format = path.extension().wstring();
   std::transform(format.begin(), format.end(), format.begin(), [](wchar_t ch) { return std::towlower(ch); });
   if (format == L".7z") return &kClsid7zFormat;
   if (format == L".zip") return &kClsidZipFormat;
   return nullptr;
-}
-
-std::vector<const ManifestFile*> ArchiveVolumes(const Manifest& manifest) {
-  std::vector<const ManifestFile*> volumes;
-  const std::string first = GenericPathToUtf8(manifest.extract.firstArchivePart);
-  if (first.size() >= 4 && first[first.size() - 4] == '.' && EndsWithDigits(first)) {
-    const std::string prefix = first.substr(0, first.size() - 3);
-    for (const auto& file : manifest.files) {
-      const std::string path = GenericPathToUtf8(file.path);
-      if (path.size() == prefix.size() + 3 && path.starts_with(prefix) && EndsWithDigits(path)) {
-        volumes.push_back(&file);
-      }
-    }
-    std::sort(volumes.begin(), volumes.end(), [](const auto* left, const auto* right) {
-      return GenericPathToUtf8(left->path) < GenericPathToUtf8(right->path);
-    });
-    for (size_t index = 0; index < volumes.size(); ++index) {
-      const std::string path = GenericPathToUtf8(volumes[index]->path);
-      const unsigned int number = static_cast<unsigned int>(std::stoul(path.substr(path.size() - 3)));
-      if (number != index + 1) {
-        return {};
-      }
-    }
-    return volumes;
-  }
-
-  for (const auto& file : manifest.files) {
-    if (file.path == manifest.extract.firstArchivePart) {
-      volumes.push_back(&file);
-      break;
-    }
-  }
-  return volumes;
 }
 
 class ProgressReporter {
@@ -388,26 +343,24 @@ struct VolumeHandle {
 // Metadata inspection needs seekable access to split volumes, without reading the payload.
 class ArchiveHeaderStream final : public IInStream, private ComRefCount {
 public:
-  explicit ArchiveHeaderStream(const PipelinedExtractionConfig& config)
+  ArchiveHeaderStream(const PipelinedExtractionConfig& config,
+                      const std::vector<const ManifestFile*>& volumes)
       : cancelRequested_(config.cancelRequested) {
-    for (const auto* volume : ArchiveVolumes(*config.manifest)) {
+    for (const auto* volume : volumes) {
       if (!IsSafeManifestRelativePath(volume->path) ||
           volume->size > static_cast<uint64_t>(std::numeric_limits<Int64>::max()) - totalSize_) {
         return;
       }
-      const auto path = config.archiveFolder / volume->path;
+      auto path = config.archiveFolder / volume->path;
       std::error_code ec;
       if (std::filesystem::file_size(path, ec) != volume->size || ec) {
         return;
       }
-      files_.emplace_back(path, std::ios::binary);
-      if (!files_.back()) {
-        return;
-      }
+      volumePaths_.push_back(std::move(path));
       ends_.push_back(totalSize_ + volume->size);
       totalSize_ += volume->size;
     }
-    ready_ = !files_.empty();
+    ready_ = !volumePaths_.empty();
   }
 
   bool Ready() const { return ready_; }
@@ -440,11 +393,20 @@ public:
           std::upper_bound(ends_.begin(), ends_.end(), position_) - ends_.begin());
       const uint64_t start = index == 0 ? 0 : ends_[index - 1];
       const auto count = static_cast<UInt32>(std::min<uint64_t>(size - processed, ends_[index] - position_));
-      auto& file = files_[index];
-      file.clear();
-      file.seekg(static_cast<std::streamoff>(position_ - start));
-      file.read(static_cast<char*>(data) + processed, count);
-      if (file.gcount() != count) {
+      // The C runtime has a much lower open-stream limit than the number of volumes.
+      if (openVolume_ != index) {
+        if (file_.is_open()) file_.close();
+        file_.open(volumePaths_[index], std::ios::binary);
+        if (!file_) {
+          openVolume_.reset();
+          return E_FAIL;
+        }
+        openVolume_ = index;
+      }
+      file_.clear();
+      file_.seekg(static_cast<std::streamoff>(position_ - start));
+      file_.read(static_cast<char*>(data) + processed, count);
+      if (file_.gcount() != count) {
         return E_FAIL;
       }
       position_ += count;
@@ -474,8 +436,10 @@ public:
   }
 
 private:
-  std::vector<std::ifstream> files_;
+  std::vector<std::filesystem::path> volumePaths_;
   std::vector<uint64_t> ends_;
+  std::ifstream file_;
+  std::optional<size_t> openVolume_;
   const std::atomic_bool* cancelRequested_;
   uint64_t totalSize_{0};
   uint64_t position_{0};
@@ -525,10 +489,10 @@ using CachedBlock = detail::VerifiedBlock;
 class VerifiedArchiveStream final : public IInStream, private ComRefCount {
 public:
   VerifiedArchiveStream(const PipelinedExtractionConfig& config,
+                        const std::vector<const ManifestFile*>& manifestVolumes,
                         std::shared_ptr<ProgressReporter> reporter)
       : cancelRequested_(config.cancelRequested), diagnostics_(config.diagnostics),
         reporter_(std::move(reporter)) {
-    const auto manifestVolumes = ArchiveVolumes(*config.manifest);
     uint64_t virtualOffset = 0;
     for (const ManifestFile* file : manifestVolumes) {
       VolumeHandle volume;
@@ -1355,25 +1319,7 @@ private:
   std::string error_;
 };
 
-uint64_t ManifestBytes(const Manifest& manifest) {
-  uint64_t total = 0;
-  for (const ManifestFile* file : ArchiveVolumes(manifest)) {
-    total += file->size;
-  }
-  return total;
-}
-
-}  // namespace
-
-std::optional<PipelineArchiveInfo> PipelinedSevenZipExtractor::DescribeArchive(
-    const Manifest& manifest) {
-  if (manifest.extract.firstArchivePart.empty()) {
-    return std::nullopt;
-  }
-  const auto volumes = ArchiveVolumes(manifest);
-  if (volumes.empty()) {
-    return std::nullopt;
-  }
+PipelineArchiveInfo DescribeVolumes(const std::vector<const ManifestFile*>& volumes) {
   PipelineArchiveInfo info{0, volumes.size(), 0};
   for (const auto* volume : volumes) {
     info.bytes += volume->size;
@@ -1382,19 +1328,27 @@ std::optional<PipelineArchiveInfo> PipelinedSevenZipExtractor::DescribeArchive(
   return info;
 }
 
-bool PipelinedSevenZipExtractor::CanUse(const Manifest& manifest) {
-  if (ArchiveFormat(manifest) == nullptr || manifest.hashChunkSize == 0 || manifest.hashChunkSize > kMaxPipelineChunkSize) {
-    return false;
-  }
-  const auto volumes = ArchiveVolumes(manifest);
-  if (volumes.empty()) {
-    return false;
-  }
+bool HasVerifiableChunks(uint64_t chunkSize, const std::vector<const ManifestFile*>& volumes) {
+  if (chunkSize == 0 || chunkSize > kMaxPipelineChunkSize) return false;
   return std::all_of(volumes.begin(), volumes.end(), [&](const ManifestFile* file) {
-    const uint64_t expected = file->size / manifest.hashChunkSize +
-        (file->size % manifest.hashChunkSize == 0 ? 0 : 1);
+    const uint64_t expected = file->size / chunkSize + (file->size % chunkSize != 0 ? 1 : 0);
     return file->chunkSha256.size() == expected;
   });
+}
+
+}  // namespace
+
+std::optional<PipelineArchiveInfo> PipelinedSevenZipExtractor::DescribeArchive(
+    const Manifest& manifest) {
+  const auto selection = SelectManifestArchive(manifest);
+  if (!selection.ok()) return std::nullopt;
+  return DescribeVolumes(selection.value().volumes);
+}
+
+bool PipelinedSevenZipExtractor::CanUse(const Manifest& manifest) {
+  const auto selection = SelectManifestArchive(manifest);
+  return selection.ok() && ArchiveFormat(selection.value().archivePath) != nullptr &&
+         HasVerifiableChunks(manifest.hashChunkSize, selection.value().volumes);
 }
 
 Result<std::filesystem::path> PipelinedSevenZipExtractor::LocateLibrary(
@@ -1424,10 +1378,12 @@ Result<ExtractionPathPlan> PipelinedSevenZipExtractor::PlanExtraction(
     const std::filesystem::path& finalFolder,
     const std::filesystem::path& stagingFolder) const {
   using PlanResult = Result<ExtractionPathPlan>;
-  if (config.manifest == nullptr || ArchiveVolumes(*config.manifest).empty()) {
+  if (config.manifest == nullptr) {
     return PlanResult::Error("No archive volumes are available for path inspection");
   }
-  const auto format = ArchiveFormat(*config.manifest);
+  const auto selection = SelectManifestArchive(*config.manifest);
+  if (!selection.ok()) return PlanResult::Error(selection.error());
+  const auto format = ArchiveFormat(selection.value().archivePath);
   if (format == nullptr) {
     return PlanResult::Error("Native archive inspection supports only 7z and ZIP packages");
   }
@@ -1452,7 +1408,7 @@ Result<ExtractionPathPlan> PipelinedSevenZipExtractor::PlanExtraction(
   if (FAILED(created) || !archive) {
     return PlanResult::Error("Unable to create the archive path inspector");
   }
-  auto* headerStream = new ArchiveHeaderStream(config);
+  auto* headerStream = new ArchiveHeaderStream(config, selection.value().volumes);
   ComPtr<IInStream> stream(headerStream);
   if (!headerStream->Ready()) {
     return PlanResult::Error("Unable to open archive volumes for path inspection");
@@ -1481,7 +1437,18 @@ ExtractionResult PipelinedSevenZipExtractor::Extract(
   ExtractionResult result;
   result.command = "7z.dll verified asynchronous pipeline";
   result.exitCode = 2;
-  if (config.manifest == nullptr || !CanUse(*config.manifest)) {
+  if (config.manifest == nullptr) {
+    result.message = "Manifest does not support pipelined chunk validation";
+    return result;
+  }
+  const auto selection = SelectManifestArchive(*config.manifest);
+  if (!selection.ok()) {
+    result.message = selection.error();
+    return result;
+  }
+  const auto format = ArchiveFormat(selection.value().archivePath);
+  const auto& volumes = selection.value().volumes;
+  if (format == nullptr || !HasVerifiableChunks(config.manifest->hashChunkSize, volumes)) {
     result.message = "Manifest does not support pipelined chunk validation";
     return result;
   }
@@ -1509,7 +1476,7 @@ ExtractionResult PipelinedSevenZipExtractor::Extract(
 
   IInArchive* rawArchive = nullptr;
   const HRESULT createResult = createObject(
-      ArchiveFormat(*config.manifest), &kIidInArchive, reinterpret_cast<void**>(&rawArchive));
+      format, &kIidInArchive, reinterpret_cast<void**>(&rawArchive));
   ComPtr<IInArchive> archive(rawArchive);
   if (FAILED(createResult) || !archive) {
     result.message = "Unable to create the 7-Zip archive handler";
@@ -1518,8 +1485,8 @@ ExtractionResult PipelinedSevenZipExtractor::Extract(
   }
 
   const auto reporter = std::make_shared<ProgressReporter>(
-      ManifestBytes(*config.manifest), std::move(progressCallback));
-  auto* rawStream = new VerifiedArchiveStream(config, reporter);
+      DescribeVolumes(volumes).bytes, std::move(progressCallback));
+  auto* rawStream = new VerifiedArchiveStream(config, volumes, reporter);
   ComPtr<IInStream> stream(rawStream);
   if (!rawStream->Ready()) {
     result.message = rawStream->Error();

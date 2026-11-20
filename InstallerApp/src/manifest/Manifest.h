@@ -68,6 +68,14 @@ struct Manifest {
   ExtractSettings extract;
 };
 
+struct ManifestArchive {
+  std::filesystem::path archivePath;
+  // Points into the manifest, in physical stream order.
+  std::vector<const ManifestFile*> volumes;
+};
+
+Result<ManifestArchive> SelectManifestArchive(const Manifest& manifest);
+
 class ManifestLoader {
 public:
   // Optional diagnostics fingerprint of the same bytes that were parsed.

@@ -3,6 +3,7 @@
 #include "app/RuntimePaths.h"
 #include "common/EmbeddedFile.h"
 #include "common/PathText.h"
+#include "extractor/SevenZipProgressParser.h"
 #include "resource.h"
 
 #ifndef NOMINMAX
@@ -14,7 +15,6 @@
 #include <array>
 #include <atomic>
 #include <chrono>
-#include <cctype>
 #include <fstream>
 #include <optional>
 #include <sstream>
@@ -215,27 +215,6 @@ std::string SevenZipExitMessage(int code) {
   }
 }
 
-std::optional<int> LastPercentIn(const std::string& text) {
-  std::optional<int> percent;
-  for (size_t i = 0; i < text.size(); ++i) {
-    if (text[i] != '%') {
-      continue;
-    }
-    size_t begin = i;
-    while (begin > 0 && std::isdigit(static_cast<unsigned char>(text[begin - 1]))) {
-      --begin;
-    }
-    if (begin == i) {
-      continue;
-    }
-    const int value = std::stoi(text.substr(begin, i - begin));
-    if (value >= 0 && value <= 100) {
-      percent = value;
-    }
-  }
-  return percent;
-}
-
 std::wstring BuildCommandWide(const ExtractionConfig& config) {
   return QuoteWide(config.sevenZipExe) + L" x " + QuoteWide(config.archiveFirstPart) +
          L" -o" + QuoteWide(config.installFolder) + L" -y -bsp1";
@@ -310,10 +289,26 @@ int RunProcessAndCapture(const std::wstring& command,
     TerminateProcess(process.hProcess, resumeError);
   }
 
-  std::string parseTail;
+  detail::SevenZipProgressParser progressParser;
   char buffer[4096];
   int lastPercent = 0;
   auto lastProgressAt = std::chrono::steady_clock::now();
+  const auto reportProgress = [&](std::optional<int> percent) {
+    if (progressCallback && percent && *percent != lastPercent) {
+      lastPercent = *percent;
+      progressCallback(lastPercent);
+      lastProgressAt = std::chrono::steady_clock::now();
+    }
+  };
+  const auto captureOutput = [&](DWORD bytesRead) {
+    if (log) {
+      log.write(buffer, bytesRead);
+    }
+    AppendBoundedTail(outputTail, buffer, bytesRead, kOutputTailLimit);
+    if (progressCallback) {
+      reportProgress(progressParser.Consume(std::string_view(buffer, bytesRead)));
+    }
+  };
   if (progressCallback) {
     progressCallback(lastPercent);
   }
@@ -331,22 +326,7 @@ int RunProcessAndCapture(const std::wstring& command,
       if (!ReadFile(readPipe, buffer, toRead, &bytesRead, nullptr) || bytesRead == 0) {
         break;
       }
-      if (log) {
-        log.write(buffer, bytesRead);
-      }
-      AppendBoundedTail(outputTail, buffer, bytesRead, kOutputTailLimit);
-      parseTail.append(buffer, bytesRead);
-      if (parseTail.size() > 256) {
-        parseTail.erase(0, parseTail.size() - 256);
-      }
-      if (progressCallback) {
-        const auto percent = LastPercentIn(parseTail);
-        if (percent.has_value() && *percent != lastPercent) {
-          lastPercent = *percent;
-          progressCallback(*percent);
-          lastProgressAt = std::chrono::steady_clock::now();
-        }
-      }
+      captureOutput(bytesRead);
       available = 0;
     }
 
@@ -365,11 +345,9 @@ int RunProcessAndCapture(const std::wstring& command,
         if (!ReadFile(readPipe, buffer, toRead, &bytesRead, nullptr) || bytesRead == 0) {
           break;
         }
-        if (log) {
-          log.write(buffer, bytesRead);
-        }
-        AppendBoundedTail(outputTail, buffer, bytesRead, kOutputTailLimit);
+        captureOutput(bytesRead);
       }
+      reportProgress(progressParser.Finish());
       break;
     }
   }

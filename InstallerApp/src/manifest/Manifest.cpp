@@ -5,10 +5,12 @@
 #include "verifier/Sha256.h"
 
 #include <algorithm>
+#include <charconv>
 #include <cctype>
 #include <cstring>
 #include <fstream>
 #include <sstream>
+#include <string_view>
 #include <utility>
 
 namespace modlist {
@@ -203,6 +205,12 @@ std::filesystem::path SelectFirstArchivePart(const std::vector<ManifestFile>& fi
   return files.empty() ? std::filesystem::path{} : files.front().path;
 }
 
+bool IsAsciiDecimal(std::string_view text) {
+  return !text.empty() && std::all_of(text.begin(), text.end(), [](char ch) {
+    return ch >= '0' && ch <= '9';
+  });
+}
+
 Result<Manifest> ParsePackerManifest(const JsonValue& root) {
   Manifest manifest;
   manifest.version = "modlist-manifest-chunks-v1";
@@ -252,6 +260,9 @@ Result<Manifest> ParsePackerManifest(const JsonValue& root) {
   if (manifest.extract.firstArchivePart.empty() || !IsSafeManifestRelativePath(manifest.extract.firstArchivePart)) {
     return Result<Manifest>::Error("Unable to infer a safe archive file from packer manifest");
   }
+  if (const auto selection = SelectManifestArchive(manifest); !selection.ok()) {
+    return Result<Manifest>::Error(selection.error());
+  }
   auto archiveName = ReadArchiveName(root, manifest.extract.firstArchivePart);
   if (!archiveName.ok()) {
     return Result<Manifest>::Error(archiveName.error());
@@ -264,6 +275,62 @@ Result<Manifest> ParsePackerManifest(const JsonValue& root) {
 }
 
 }  // namespace
+
+Result<ManifestArchive> SelectManifestArchive(const Manifest& manifest) {
+  using Selection = Result<ManifestArchive>;
+  const auto& firstPart = manifest.extract.firstArchivePart;
+  if (firstPart.empty()) return Selection::Error("Manifest does not select an archive");
+  const auto extension = GenericPathToUtf8(firstPart.extension());
+  auto basePath = firstPart;
+  const bool numericSuffix = extension.size() > 1 &&
+      IsAsciiDecimal(std::string_view(extension).substr(1));
+  if (numericSuffix) basePath.replace_extension();
+  const auto base = GenericPathToUtf8(basePath);
+  if (!numericSuffix || (!EndsWithInsensitive(base, ".7z") && !EndsWithInsensitive(base, ".zip"))) {
+    const auto file = std::find_if(manifest.files.begin(), manifest.files.end(), [&](const auto& entry) {
+      return entry.path == firstPart;
+    });
+    if (file == manifest.files.end()) return Selection::Error("Manifest does not list the archive file");
+    return Selection::Ok({firstPart, {&*file}});
+  }
+
+  const auto prefix = base + '.';
+  std::vector<std::pair<size_t, const ManifestFile*>> numbered;
+  for (const auto& file : manifest.files) {
+    const auto path = GenericPathToUtf8(file.path);
+    if (!path.starts_with(prefix)) continue;
+    const auto suffix = std::string_view(path).substr(prefix.size());
+    if (!IsAsciiDecimal(suffix)) continue;  // Not an archive volume (e.g. a checksum sidecar).
+    size_t number = 0;
+    const auto end = suffix.data() + suffix.size();
+    const auto parsed = std::from_chars(suffix.data(), end, number);
+    if (parsed.ec != std::errc{} || parsed.ptr != end || number == 0 ||
+        suffix.size() < 3 || (suffix.size() > 3 && suffix.front() == '0')) {
+      return Selection::Error("Invalid archive volume number: " + path);
+    }
+    numbered.emplace_back(number, &file);
+  }
+  if (numbered.empty()) return Selection::Error("Manifest does not list any archive volumes");
+  std::sort(numbered.begin(), numbered.end(), [](const auto& left, const auto& right) {
+    return left.first < right.first;
+  });
+
+  ManifestArchive selection{std::move(basePath), {}};
+  selection.volumes.reserve(numbered.size());
+  for (size_t i = 0; i < numbered.size(); ++i) {
+    const auto [number, file] = numbered[i];
+    if (i > 0 && number == numbered[i - 1].first) {
+      return Selection::Error("Duplicate archive volume number: " + GenericPathToUtf8(file->path));
+    }
+    if (number != i + 1) {
+      auto missing = std::to_string(i + 1);
+      if (missing.size() < 3) missing.insert(0, 3 - missing.size(), '0');
+      return Selection::Error("Missing archive volume in manifest: " + prefix + missing);
+    }
+    selection.volumes.push_back(file);
+  }
+  return Selection::Ok(std::move(selection));
+}
 
 Result<Manifest> ManifestLoader::LoadFromFile(const std::filesystem::path& path,
                                               std::string* manifestSha256) const {

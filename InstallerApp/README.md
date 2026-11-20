@@ -197,11 +197,12 @@ fresh work/output parents. It runs the actual install worker in direct/staged
 modes without desktop automation, then compares complete payload hashes and empty
 directories outside the worker. It does not touch real Documents/game folders.
 
-For the installer finalization regressions, run `pwsh -File .\tests\test_install_finalize.ps1`
+For the installer unpacking and finalization regressions, run `pwsh -File .\tests\test_install_finalize.ps1`
 after building `installer_workflow_tests`. The suite generates and removes its
 own small packages. It covers legitimate `.install_temp` entries on both
-extraction routes, locked empty staging directories, and refusal when files
-remain in staging.
+extraction routes, locked staging directories, final paths beyond `MAX_PATH`,
+CLI extraction from paths containing percent signs, and a 1,001-volume package
+with a late-volume corruption check.
 
 For an existing chunk-validated package, build `pipeline_smoke` and use
 `scripts\run-existing-smoke.ps1`. It resolves the first archive part through

@@ -6,6 +6,7 @@ Native Windows tools for building and installing local Skyrim modlist release pa
 
 ```text
 InstallerApp/dist/modlist-installer.exe
+InstallerApp/dist/modlist-patch-installer.exe
 PackerApp/dist/modlist-packer.exe
 ```
 
@@ -22,10 +23,10 @@ paths into the packer; it stores them in the package manifest.
 Ready-to-use versioned release archives are written to:
 
 ```text
-Release/ModlistInstaller-v0.3.10.zip
+Release/ModlistInstaller-v0.3.11.zip
 ```
 
-Download [v0.3.10](https://github.com/wallhead/ModListInstaller/releases/tag/v0.3.10), extract the ZIP, and run `modlist-packer.exe` inside its folder. The archive includes the matching installer, README, and 7-Zip license. No separate VC++ Redistributable, browser runtime, or external UI files are needed. Published older ZIPs retain their original layout; current releases use the flat layout below.
+Download [v0.3.11](https://github.com/wallhead/ModListInstaller/releases/tag/v0.3.11), extract the ZIP, and run `modlist-packer.exe` inside its folder. The archive includes both the full installer and the patch installer, plus a README and the 7-Zip license. Keep all three EXEs together so the packer can select the installer for either package mode. No separate VC++ Redistributable, browser runtime, or external UI files are needed. Published older ZIPs retain their original layout; current releases use the flat layout below.
 
 ## Installer Runtime Layout
 

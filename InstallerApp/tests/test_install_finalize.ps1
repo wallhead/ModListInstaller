@@ -32,26 +32,40 @@ function New-Package([string]$Name) {
     [pscustomobject]@{Source=$source; Package=$package; Manifest=(Join-Path $package 'manifest.json')}
 }
 
-function Build-Package($Fixture) {
+function Write-LegacyManifest($Fixture, [long]$UnpackedBytes, $Files) {
+    $legacy = [ordered]@{
+        version='1'; archive_name='Fixture'; unpacked_size=$UnpackedBytes
+        torrent=@{type='torrent';source='unused-local-fixture.torrent'}
+        extract=@{first_archive_part=$Files[0].path;use_same_disk_temp=$true}
+        files=@($Files | Select-Object path,size,sha256)
+    }
+    [IO.File]::WriteAllText($Fixture.Manifest,($legacy | ConvertTo-Json -Depth 6))
+}
+
+function Build-Package($Fixture, [string]$VolumeSize='1m') {
+    $archive = Join-Path $Fixture.Package 'Fixture.7z'
+    $options = @('-t7z','-mx=0','-y','-bsp0','-bb0')
+    if ($VolumeSize) { $options += "-v$VolumeSize" }
     Push-Location $Fixture.Source
     try {
-        $lines = & $sevenZip a (Join-Path $Fixture.Package 'Fixture.7z') '*' -t7z -mx=0 -v1m -y -bsp0 -bb0 2>&1
+        $lines = & $sevenZip a $archive '*' @options 2>&1
         if ($LASTEXITCODE -ne 0) { throw ($lines -join [Environment]::NewLine) }
     } finally { Pop-Location }
     $bytes = (Get-ChildItem -LiteralPath $Fixture.Source -Recurse -Force -File | Measure-Object Length -Sum).Sum
-    & (Join-Path $scripts 'new-smoke-manifest.ps1') -Package $Fixture.Package -ArchiveName Fixture -UnpackedBytes $bytes | Out-Null
+    if ($VolumeSize) {
+        & (Join-Path $scripts 'new-smoke-manifest.ps1') -Package $Fixture.Package -ArchiveName Fixture -UnpackedBytes $bytes | Out-Null
+    } else {
+        Write-LegacyManifest $Fixture $bytes @([pscustomobject]@{
+            path='Fixture.7z'; size=(Get-Item -LiteralPath $archive).Length
+            sha256=(Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+        })
+    }
     [IO.File]::Copy($Runner,(Join-Path $Fixture.Package 'installer_workflow_tests.exe'))
 }
 
 function Use-LegacyManifest($Fixture) {
     $chunked = Get-Content -LiteralPath $Fixture.Manifest -Raw | ConvertFrom-Json
-    $legacy = [ordered]@{
-        version='1'; archive_name=$chunked.archive_name; unpacked_size=$chunked.unpacked_size
-        torrent=@{type='torrent';source='unused-local-fixture.torrent'}
-        extract=@{first_archive_part=$chunked.files[0].path;use_same_disk_temp=$true}
-        files=@($chunked.files | Select-Object path,size,sha256)
-    }
-    [IO.File]::WriteAllText($Fixture.Manifest,($legacy | ConvertTo-Json -Depth 6))
+    Write-LegacyManifest $Fixture $chunked.unpacked_size $chunked.files
 }
 
 function Add-ListedSidecar($Fixture) {
@@ -74,7 +88,7 @@ function Test-Install([string]$Name,$Fixture,[string]$Route,[string]$Option,[str
         $expectedSuccess = [int]($Expectation -eq 'success')
         if ($code -ne 0 -or $text -notmatch "worker_success=$expectedSuccess") { throw $text }
         if ($Option -and $text -notmatch 'staging_retained=1') { throw 'Expected retained staging outcome was not observed.' }
-        $archiveParts = @(Get-ChildItem -LiteralPath $Fixture.Package -File -Filter 'Fixture.7z.*')
+        $archiveParts = @(Get-ChildItem -LiteralPath $Fixture.Package -File -Filter 'Fixture.7z*')
         $selectedBytes = ($archiveParts | Measure-Object -Property Length -Sum).Sum
         $sidecar = Join-Path $Fixture.Package 'notes.txt'
         $manifestBytes = $selectedBytes
@@ -100,6 +114,20 @@ function Test-Install([string]$Name,$Fixture,[string]$Route,[string]$Option,[str
         $failures.Add($Name)
         Write-Host "FAIL ${Name}: $($_.Exception.Message)"
     }
+}
+
+function Add-LongPathPayload($Fixture, [string]$Case, [string]$RelativeDirectory='') {
+    $staging = Join-Path $WorkRoot "$Case\Unpacking"
+    $source = $Fixture.Source
+    if ($RelativeDirectory) {
+        $staging = Join-Path $staging $RelativeDirectory
+        $source = Join-Path $source $RelativeDirectory
+        [IO.Directory]::CreateDirectory($source) | Out-Null
+    }
+    # The staged path is below MAX_PATH; the installed path is longer by 8 units.
+    $stemLength = 258 - $staging.Length - 1 - '.txt'.Length
+    if ($stemLength -lt 1 -or $stemLength -gt 251) { throw 'Use a shorter work root for the long-path fixture.' }
+    [IO.File]::WriteAllText((Join-Path $source (('x' * $stemLength) + '.txt')), 'Known long-path payload')
 }
 
 try {
@@ -129,6 +157,49 @@ try {
     Build-Package $locked
     Test-Install 'locked-empty-staging' $locked 'staged' '--lock-staged-tree'
     Test-Install 'locked-staging-with-leftover-file' $locked 'staged' '--lock-staged-tree' 'failure'
+
+    $long = New-Package 'long-path'
+    Add-LongPathPayload $long 'long-final-placement'
+    Build-Package $long
+    Test-Install 'long-final-placement' $long 'staged'
+
+    $fallback = New-Package 'long-locked'
+    Add-LongPathPayload $fallback 'long-directory-fallback' 'locked\nested'
+    Build-Package $fallback
+    Test-Install 'long-directory-fallback' $fallback 'staged' '--lock-staged-tree'
+
+    $cli = New-Package 'cli-2147483648%'
+    # Keep the CLI running long enough for its banner to reach live progress parsing.
+    for ($i = 0; $i -lt 6000; $i++) {
+        [IO.File]::WriteAllText((Join-Path $cli.Source ('payload-{0:D5}.txt' -f $i)), 'CLI progress payload')
+    }
+    Build-Package $cli ''
+    Test-Install 'cli-percent-in-path' $cli 'direct'
+
+    $split = New-Package 'split-archive'
+    $bytes = [byte[]]::new(1000000)
+    [Random]::new(610).NextBytes($bytes)
+    [IO.File]::WriteAllBytes((Join-Path $split.Source 'payload.bin'), $bytes)
+    Build-Package $split '1000b'
+    if (@(Get-ChildItem -LiteralPath $split.Package -File -Filter 'Fixture.7z.*').Count -ne 1001) {
+        throw 'Expected a 1,001-volume archive fixture.'
+    }
+    Test-Install 'split-volumes-past-999' $split 'direct'
+
+    # Change only a byte of the generated volume, after manifest creation.
+    $latePart = [IO.File]::Open((Join-Path $split.Package 'Fixture.7z.1000'), 'Open', 'ReadWrite', 'None')
+    try {
+        $firstByte = $latePart.ReadByte()
+        $latePart.Position = 0
+        $latePart.WriteByte($firstByte -bxor 1)
+    } finally { $latePart.Dispose() }
+    $corruption = & (Join-Path $split.Package 'installer_workflow_tests.exe') (Join-Path $WorkRoot 'late-split-corruption') direct failure 2>&1
+    if ($LASTEXITCODE -ne 0 -or ($corruption -join "`n") -notmatch 'SHA256 mismatch in Fixture\.7z\.1000') {
+        $failures.Add('late-split-corruption')
+        Write-Host ('FAIL late-split-corruption: ' + ($corruption -join "`n"))
+    } else {
+        Write-Host 'PASS late-split-corruption'
+    }
 } finally {
     $env:LOCALAPPDATA = $previousCache
     Assert-PlainDirectoryChain $WorkRoot
@@ -145,4 +216,4 @@ try {
     [IO.Directory]::Delete($WorkRoot)
 }
 if ($failures.Count) { throw "Finalization regressions failed: $($failures -join ', ')" }
-Write-Host 'All 18 finalization cases passed; generated payloads removed.'
+Write-Host 'All 23 unpacking and finalization cases passed; generated payloads removed.'

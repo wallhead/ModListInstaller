@@ -1,6 +1,7 @@
 #include "paths/PathValidator.h"
 #include "common/PathText.h"
 #include "manifest/Manifest.h"
+#include "paths/WindowsPath.h"
 
 #include <algorithm>
 #include <chrono>
@@ -42,15 +43,17 @@ std::optional<std::wstring> VolumeIdentity(const std::filesystem::path& path) {
     return std::nullopt;
   }
 
-  while (!std::filesystem::exists(absolute, ec)) {
+  auto ioPath = WindowsIoPath(absolute);
+  while (!std::filesystem::exists(ioPath, ec)) {
     if (ec || absolute == absolute.root_path()) {
       return std::nullopt;
     }
     absolute = absolute.parent_path();
+    ioPath = WindowsIoPath(absolute);
   }
 
   std::vector<wchar_t> volumePath(32768, L'\0');
-  if (!GetVolumePathNameW(absolute.c_str(), volumePath.data(), static_cast<DWORD>(volumePath.size()))) {
+  if (!GetVolumePathNameW(ioPath.c_str(), volumePath.data(), static_cast<DWORD>(volumePath.size()))) {
     return std::nullopt;
   }
 
@@ -286,7 +289,7 @@ PathValidationResult PathValidator::ValidateBaseFolder(const std::filesystem::pa
     return result;
   }
 
-  const auto space = std::filesystem::space(result.normalizedPath, ec);
+  const auto space = std::filesystem::space(WindowsIoPath(result.normalizedPath), ec);
   if (ec) {
     result.message = "Unable to check free disk space: " + ec.message();
     return result;

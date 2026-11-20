@@ -11,6 +11,7 @@
 #include "paths/PathValidator.h"
 #include "paths/FolderCleanup.h"
 #include "paths/WindowsFileMove.h"
+#include "paths/WindowsPath.h"
 #include "resource.h"
 #include "ui/NativeInstallerView.h"
 #include "ui/NativeStrings.h"
@@ -54,7 +55,7 @@
 namespace {
 
 constexpr const wchar_t* kUnpackFolderName = L"Unpacking";
-constexpr std::wstring_view kInstallerBuildLabel = L"Modlist Installer v0.3.10 by WallHead";
+constexpr std::wstring_view kInstallerBuildLabel = L"Modlist Installer v0.3.11 by WallHead";
 constexpr auto kPipelineLogInterval = std::chrono::seconds(60);
 
 constexpr int kDownloadEdit = 1003;
@@ -1897,8 +1898,9 @@ SpaceRequirements EstimateSpaceRequirements(const modlist::PackageDiscovery& pac
 
 uintmax_t FreeBytes(const std::filesystem::path& folder) {
   std::error_code ec;
-  std::filesystem::create_directories(folder, ec);
-  const auto space = std::filesystem::space(folder, ec);
+  const auto ioFolder = modlist::WindowsIoPath(folder);
+  std::filesystem::create_directories(ioFolder, ec);
+  const auto space = std::filesystem::space(ioFolder, ec);
   return ec ? 0 : space.available;
 }
 
@@ -2063,14 +2065,15 @@ std::optional<std::wstring> EnsureGameDocumentsFolders() {
 std::optional<std::wstring> FolderMustBeEmptyError(const std::filesystem::path& folder,
                                                    const std::wstring& label) {
   std::error_code ec;
-  if (!std::filesystem::exists(folder, ec)) {
+  const auto ioFolder = modlist::WindowsIoPath(folder);
+  if (!std::filesystem::exists(ioFolder, ec)) {
     return ec ? std::optional<std::wstring>(label + L": невозможно проверить папку - " + Widen(ec.message()))
               : std::nullopt;
   }
-  if (!std::filesystem::is_directory(folder, ec) || ec) {
+  if (!std::filesystem::is_directory(ioFolder, ec) || ec) {
     return label + L": путь не является папкой.";
   }
-  const bool empty = std::filesystem::is_empty(folder, ec);
+  const bool empty = std::filesystem::is_empty(ioFolder, ec);
   if (ec) {
     return label + L": невозможно проверить содержимое - " + Widen(ec.message());
   }
@@ -2084,9 +2087,10 @@ bool IsExistingNonEmptyDirectory(const std::filesystem::path& folder) {
   std::error_code existsEc;
   std::error_code directoryEc;
   std::error_code emptyEc;
-  return std::filesystem::exists(folder, existsEc) && !existsEc &&
-         std::filesystem::is_directory(folder, directoryEc) && !directoryEc &&
-         !std::filesystem::is_empty(folder, emptyEc) && !emptyEc;
+  const auto ioFolder = modlist::WindowsIoPath(folder);
+  return std::filesystem::exists(ioFolder, existsEc) && !existsEc &&
+         std::filesystem::is_directory(ioFolder, directoryEc) && !directoryEc &&
+         !std::filesystem::is_empty(ioFolder, emptyEc) && !emptyEc;
 }
 
 void ShowWizardPage(HWND hwnd, WizardPage page) {
@@ -2589,14 +2593,14 @@ bool ReadDirectoryEntries(const std::filesystem::path& folder,
                           std::vector<std::filesystem::path>& entries,
                           std::wstring& error) {
   std::error_code ec;
-  auto iterator = std::filesystem::directory_iterator(folder, ec);
+  auto iterator = std::filesystem::directory_iterator(modlist::WindowsIoPath(folder), ec);
   const auto end = std::filesystem::directory_iterator();
   if (ec) {
     error = L"Невозможно прочитать распакованную папку: " + Widen(ec.message());
     return false;
   }
   while (iterator != end) {
-    entries.push_back(iterator->path());
+    entries.push_back(folder / iterator->path().filename());
     iterator.increment(ec);
     if (ec) {
       error = L"Невозможно прочитать распакованную папку: " + Widen(ec.message());
@@ -2609,20 +2613,21 @@ bool ReadDirectoryEntries(const std::filesystem::path& folder,
 std::optional<uintmax_t> EstimateInstallBytes(const std::filesystem::path& path,
                                               std::wstring& error) {
   std::error_code ec;
-  if (!std::filesystem::exists(path, ec)) {
+  const auto ioPath = modlist::WindowsIoPath(path);
+  if (!std::filesystem::exists(ioPath, ec)) {
     error = ec ? L"Невозможно прочитать распакованный файл: " + Widen(ec.message())
                : L"Невозможно прочитать распакованный файл: " + PathToDisplay(path);
     return std::nullopt;
   }
-  if (std::filesystem::is_regular_file(path, ec)) {
-    const auto size = std::filesystem::file_size(path, ec);
+  if (std::filesystem::is_regular_file(ioPath, ec)) {
+    const auto size = std::filesystem::file_size(ioPath, ec);
     if (ec) {
       error = L"Невозможно прочитать распакованный файл: " + PathToDisplay(path);
       return std::nullopt;
     }
     return size;
   }
-  if (ec || !std::filesystem::is_directory(path, ec)) {
+  if (ec || !std::filesystem::is_directory(ioPath, ec)) {
     if (ec) {
       error = L"Невозможно прочитать распакованный файл: " + PathToDisplay(path);
       return std::nullopt;
@@ -2631,7 +2636,7 @@ std::optional<uintmax_t> EstimateInstallBytes(const std::filesystem::path& path,
   }
 
   uintmax_t total = 0;
-  auto iterator = std::filesystem::recursive_directory_iterator(path, ec);
+  auto iterator = std::filesystem::recursive_directory_iterator(ioPath, ec);
   const auto end = std::filesystem::recursive_directory_iterator();
   if (ec) {
     error = L"Невозможно прочитать распакованную папку: " + Widen(ec.message());
@@ -2642,12 +2647,14 @@ std::optional<uintmax_t> EstimateInstallBytes(const std::filesystem::path& path,
     if (entry.is_regular_file(ec)) {
       const auto size = entry.file_size(ec);
       if (ec) {
-        error = L"Невозможно прочитать распакованный файл: " + PathToDisplay(entry.path());
+        error = L"Невозможно прочитать распакованный файл: " +
+                PathToDisplay(path / entry.path().lexically_relative(ioPath));
         return std::nullopt;
       }
       total += size;
     } else if (ec) {
-      error = L"Невозможно прочитать распакованный файл: " + PathToDisplay(entry.path());
+      error = L"Невозможно прочитать распакованный файл: " +
+              PathToDisplay(path / entry.path().lexically_relative(ioPath));
       return std::nullopt;
     }
     iterator.increment(ec);
@@ -2707,7 +2714,7 @@ bool MoveWholeEntry(HWND hwnd,
     return false;
   }
   std::error_code ec;
-  std::filesystem::create_directories(target.parent_path(), ec);
+  std::filesystem::create_directories(modlist::WindowsIoPath(target.parent_path()), ec);
   if (ec) {
     error = L"Невозможно создать папку установки: " + Widen(ec.message());
     return false;
@@ -2764,18 +2771,20 @@ bool CopyFileWithProgress(const std::filesystem::path& source,
                           std::wstring& error) {
   constexpr size_t kBufferSize = 4 * 1024 * 1024;
   std::error_code ec;
-  std::filesystem::create_directories(target.parent_path(), ec);
+  std::filesystem::create_directories(modlist::WindowsIoPath(target.parent_path()), ec);
   if (ec) {
     error = L"Невозможно создать папку установки: " + Widen(ec.message());
     return false;
   }
 
-  std::ifstream input(source, std::ios::binary);
+  const auto ioSource = modlist::WindowsIoPath(source);
+  const auto ioTarget = modlist::WindowsIoPath(target);
+  std::ifstream input(ioSource, std::ios::binary);
   if (!input) {
     error = L"Невозможно прочитать распакованный файл: " + PathToDisplay(source);
     return false;
   }
-  std::ofstream output(target, std::ios::binary | std::ios::trunc);
+  std::ofstream output(ioTarget, std::ios::binary | std::ios::trunc);
   if (!output) {
     error = L"Невозможно записать файл: " + PathToDisplay(target);
     return false;
@@ -2808,9 +2817,9 @@ bool CopyFileWithProgress(const std::filesystem::path& source,
     error = L"Невозможно завершить запись файла: " + PathToDisplay(target);
     return false;
   }
-  const auto sourceTime = std::filesystem::last_write_time(source, ec);
+  const auto sourceTime = std::filesystem::last_write_time(ioSource, ec);
   if (!ec) {
-    std::filesystem::last_write_time(target, sourceTime, ec);
+    std::filesystem::last_write_time(ioTarget, sourceTime, ec);
   }
   return true;
 }
@@ -2827,7 +2836,8 @@ bool InstallEntry(HWND hwnd,
     return false;
   }
   std::error_code ec;
-  const bool targetExists = std::filesystem::exists(target, ec);
+  const auto ioTarget = modlist::WindowsIoPath(target);
+  const bool targetExists = std::filesystem::exists(ioTarget, ec);
   if (ec) {
     manualRecoveryRequired = true;
     error = L"Невозможно проверить папку назначения: " + Widen(ec.message());
@@ -2845,8 +2855,9 @@ bool InstallEntry(HWND hwnd,
     return true;
   }
 
-  if (std::filesystem::is_directory(source, ec) && !ec) {
-    std::filesystem::create_directories(target, ec);
+  const auto ioSource = modlist::WindowsIoPath(source);
+  if (std::filesystem::is_directory(ioSource, ec) && !ec) {
+    std::filesystem::create_directories(ioTarget, ec);
     if (ec) {
       error = L"Невозможно создать папку установки: " + Widen(ec.message());
       return false;
@@ -2865,7 +2876,7 @@ bool InstallEntry(HWND hwnd,
         return false;
       }
     }
-    std::filesystem::remove(source, ec);
+    std::filesystem::remove(ioSource, ec);
     if (ec) {
       error = L"Невозможно удалить источник установки: " + Widen(ec.message());
       return false;
@@ -2891,7 +2902,7 @@ bool InstallEntry(HWND hwnd,
     }
     return false;
   }
-  std::filesystem::remove(source, ec);
+  std::filesystem::remove(ioSource, ec);
   if (ec) {
     error = L"Невозможно удалить скопированные, распакованные файлы: " + Widen(ec.message());
     return false;
@@ -2923,7 +2934,7 @@ bool InstallExtractedFiles(HWND hwnd, const std::filesystem::path& unpackFolder,
   }
 
   std::error_code ec;
-  std::filesystem::create_directories(installFolder, ec);
+  std::filesystem::create_directories(modlist::WindowsIoPath(installFolder), ec);
   if (ec) {
     PostLog(hwnd, L"Невозможно создать папку установки: " + Widen(ec.message()));
     return false;

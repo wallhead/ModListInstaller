@@ -1,10 +1,10 @@
-ModListInstaller v0.3.10
+ModListInstaller v0.3.11
 
-Keep modlist-packer.exe and modlist-installer.exe together. Run the packer to
-create <selected release parent>\<archive name>.
+Extract the whole ZIP and keep all three EXEs together. Run modlist-packer.exe
+to create <selected release parent>\<archive name>.
 Use Relative paths. Full-path 7-Zip switches (-spf and -spf2) are not supported.
 
-The generated installer expects:
+Full packages contain:
 - modlist-installer.exe
 - manifest.json
 - archive parts
@@ -13,7 +13,7 @@ These files are all placed directly in the archive-named folder. The theme,
 text, 7-Zip tools, and license are embedded in the installer. On startup, a logs
 folder with modlist-installer.log is created beside the executable. Extracted
 tools are stored under %LOCALAPPDATA%\ModlistInstaller\<package key>.
-Neither executable requires a separate VC++ Redistributable, installed 7-Zip,
+None of the executables requires a separate VC++ Redistributable, installed 7-Zip,
 WebView2, Edge, .NET, or internet access.
 Archive names and manifest file paths are UTF-8, including non-English names.
 Cached extraction tools are verified against their embedded originals before use.
@@ -24,6 +24,14 @@ For a slow install, share logs\modlist-installer.log. The INSTALL_PERF rows
 record the source revision, manifest SHA-256, archive bytes, phase times, and
 extraction counters. Include both the slow and fast runs when comparing speed.
 An existing package can use this installer without repacking.
+
+Patch packages contain modlist-patch-installer.exe, manifest.json, and archive
+parts. In the packer, select Patch mode and use modlist-relative paths for both
+replacement files and the deletion list. Use the patch installer only on the
+newer layout where Stock Game, mods, and ModOrganizer.exe share the same root.
+Keep the patch package outside that root. Confirm the detected modlist or select
+it manually. Patch runs write modlist-patch-installer.log in the logs folder
+or in the installer cache if the package folder is not writable.
 
 The final folder is <selected install root>\<archive_name>. Before extraction,
 the installer checks all archive entry paths. If every full destination path

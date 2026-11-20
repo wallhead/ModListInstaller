@@ -6,6 +6,7 @@
 #include "common/ProgressThrottle.h"
 #include "extractor/PipelinedSevenZipExtractor.h"
 #include "extractor/SevenZipExtractor.h"
+#include "extractor/SevenZipProgressParser.h"
 #include "manifest/Json.h"
 #include "manifest/Manifest.h"
 #include "paths/WindowsFileMove.h"
@@ -14,6 +15,7 @@
 #include "verifier/Sha256.h"
 #include "verifier/Verifier.h"
 
+#include <algorithm>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -114,6 +116,23 @@ void TestProgressThrottle() {
          "Windows path comparison must handle Cyrillic case without locale dependence");
 }
 
+void TestSevenZipProgressParser() {
+  detail::SevenZipProgressParser parser;
+  Expect(parser.Consume("\r  0%\r") == 0, "The initial CLI percentage was not parsed");
+  Expect(!parser.Consume(" 4"), "A partial CLI percentage was reported");
+  Expect(!parser.Consume("2%"), "A percentage must not match the start of a filename");
+  Expect(parser.Consume(" 15 - texture-99%.dds") == 42,
+         "The leading percentage was lost across reads or replaced by filename text");
+  Expect(!parser.Consume("\r \rExtracting archive: D:\\Downloads\\2147483648%\\Pack.7z\n"),
+         "An archive path was mistaken for a progress frame");
+  Expect(!parser.Consume("101%\r-1%\r42%report.txt\r"),
+         "An out-of-range value or a filename was mistaken for progress");
+  Expect(!parser.Consume(std::string(10000, '9') + "%\r"),
+         "An oversized numeric field was reported as progress");
+  Expect(!parser.Consume("100%") && parser.Finish() == 100,
+         "The final percentage was lost when the process closed its output");
+}
+
 void TestManifestLoader() {
   ManifestLoader loader;
   auto manifest = loader.LoadFromString(ValidManifestJson(Sha256::HexDigest("abc")));
@@ -138,6 +157,58 @@ void TestPackerManifestLoader() {
          "Packer manifest chunk hash should be retained");
   Expect(manifest.value().files[0].chunkSha256[0] == Sha256::HexDigest("abc"),
          "Packer manifest chunk hash mismatch");
+}
+
+void TestManifestVolumeSelection() {
+  const auto volumeName = [](size_t number) {
+    auto suffix = std::to_string(number);
+    if (suffix.size() < 3) suffix.insert(0, 3 - suffix.size(), '0');
+    return std::filesystem::path("Pack.7z." + suffix);
+  };
+  Manifest manifest;
+  manifest.extract.firstArchivePart = "Pack.7z.001";
+  manifest.hashChunkSize = 4096;
+  manifest.files.push_back({"Pack.7z.sha256", 7, {}, {}});
+  const auto hash = Sha256::HexDigest("volume");
+  for (size_t number = 1; number <= 1001; ++number) {
+    manifest.files.push_back({volumeName(number), number, {}, {hash}});
+    if (number < 999) continue;
+
+    std::sort(manifest.files.begin(), manifest.files.end(), [](const auto& left, const auto& right) {
+      return left.path < right.path;
+    });
+    const auto selection = SelectManifestArchive(manifest);
+    Expect(selection.ok() && selection.value().volumes.size() == number,
+           "The manifest did not select every volume across the 999 boundary");
+    for (size_t index = 0; index < number; ++index) {
+      Expect(selection.value().volumes[index]->path == volumeName(index + 1),
+             "The split archive was not ordered numerically");
+    }
+    const auto info = PipelinedSevenZipExtractor::DescribeArchive(manifest);
+    Expect(info && info->volumeCount == number && info->chunkCount == number &&
+               info->bytes == (number * (number + 1)) / 2 &&
+               PipelinedSevenZipExtractor::CanUse(manifest),
+           "Pipeline admission or totals disagreed with the selected archive stream");
+  }
+
+  manifest.files.push_back(manifest.files.front());
+  Expect(!SelectManifestArchive(manifest).ok(), "Duplicate volume number was accepted");
+  manifest.files.pop_back();
+  for (const auto* suffix : {"0001", "2", "000", "184467440737095516160"}) {
+    manifest.files.push_back({std::string("Pack.7z.") + suffix, 1, {}, {}});
+    Expect(!SelectManifestArchive(manifest).ok(), "Invalid numeric volume suffix was accepted");
+    manifest.files.pop_back();
+  }
+  std::erase_if(manifest.files, [](const auto& file) { return file.path == "Pack.7z.1000"; });
+  const auto missing = SelectManifestArchive(manifest);
+  Expect(!missing.ok() && missing.error().find("Pack.7z.1000") != std::string::npos,
+         "A missing interior volume was not reported by name");
+
+  auto json = PackerManifestJson(Sha256::HexDigest("abc"));
+  json.replace(json.find(".001"), 4, ".003");
+  const auto invalidManifest = ManifestLoader().LoadFromString(json);
+  Expect(!invalidManifest.ok() && invalidManifest.error().find("MyPack.7z.001") != std::string::npos,
+         "A chunked manifest missing its first volume must fail before CLI fallback");
 }
 
 void TestUtf8ManifestArchivePaths() {
@@ -1372,8 +1443,10 @@ int main() {
 #endif
     TestSha256();
     TestProgressThrottle();
+    TestSevenZipProgressParser();
     TestManifestLoader();
     TestPackerManifestLoader();
+    TestManifestVolumeSelection();
     TestUtf8ManifestArchivePaths();
     TestExecutableCacheRepairsSameSizeTampering();
     TestPackerManifestRejectsInvalidChunks();
