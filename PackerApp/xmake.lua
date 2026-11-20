@@ -6,8 +6,8 @@ set_languages("c++20")
 
 target("modlist-packer")
     set_kind("binary")
-    add_includedirs("resources")
-    add_files("src/main.cpp")
+    add_includedirs("resources", "../InstallerApp/src", "../InstallerApp/resources")
+    add_files("src/main.cpp", "../InstallerApp/src/patch/PatchDeletePaths.cpp", "../InstallerApp/src/manifest/Json.cpp")
     if is_plat("windows") then
         add_files("resources/app.rc")
         add_cxxflags("/W4", "/permissive-", {tools = "cl"})
@@ -20,8 +20,9 @@ target_end()
 target("packer_tests")
     set_kind("binary")
     set_rundir("$(projectdir)")
-    add_includedirs("resources")
-    add_files("tests/test_main.cpp", "resources/app.rc")
+    add_includedirs("resources", "../InstallerApp/src", "../InstallerApp/resources")
+    add_files("tests/test_main.cpp", "resources/app.rc", "../InstallerApp/src/patch/PatchDeletePaths.cpp",
+              "../InstallerApp/src/manifest/Json.cpp", "../InstallerApp/resources/PatchManifestResource.rc")
     if is_plat("windows") then
         add_cxxflags("/W4", "/permissive-", {tools = "cl"})
         add_syslinks("user32", "gdi32", "comdlg32", "shell32", "ole32", "comctl32", "bcrypt", "psapi")

@@ -11,7 +11,11 @@ PackerApp/dist/modlist-packer.exe
 
 `modlist-installer.exe` is self-contained. Ship it beside `manifest.json` and the archive parts, inside a folder named after the archive.
 
-`modlist-packer.exe` is portable from `PackerApp/dist`: keep only `modlist-installer.exe` beside it. The packer creates `<selected release parent>/<archive name>` and copies the installer there.
+`modlist-packer.exe` is portable from `PackerApp/dist`. Keep the matching full or patch installer beside it. The packer creates `<selected release parent>/<archive name>` and copies the correct installer there.
+
+The [patch installer](InstallerApp/PATCHER.md) is a separate executable for
+updating the newer modlist layout. In **Patch** mode, paste plain-text deletion
+paths into the packer; it stores them in the package manifest.
 
 ## Release Package
 

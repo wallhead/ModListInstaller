@@ -4,7 +4,8 @@ Native Windows helper for building modlist release folders.
 
 It provides a focused 7-Zip-style archive settings window, runs embedded 7-Zip, tests the archive when requested, then writes a chunked SHA-256 manifest beside the archive parts.
 
-`modlist-packer.exe` is portable. Keep `modlist-installer.exe` beside it. Both
+`modlist-packer.exe` is portable. Keep `modlist-installer.exe` beside it for
+full packages and `modlist-patch-installer.exe` beside it for patches. The
 executables embed their 7-Zip tools and do not require a separately installed
 VC++ Redistributable.
 
@@ -20,6 +21,22 @@ SelectedReleaseParent\
 ```
 
 The child folder is named from the archive name field, without an added archive extension. A new package contains only the installer, manifest, and archive file(s), with no `data`, `ui`, `tools`, or log directories. Manifest archive paths are UTF-8 plain filenames relative to this child folder, including non-ASCII archive names.
+
+## Patch Mode
+
+Select **Patch** under **Package mode**, choose the folder containing the new
+or replacement files, and paste one modlist-relative deletion path per line.
+Entries like `"\mods\Old Mod"` are accepted, but full drive paths are not.
+The field can be empty. **Build Patch** packs the selected files and includes
+`modlist-patch-installer.exe` instead of the full installer. The manifest
+contains a `delete_paths` array; there is no extra deletion file.
+Use a new output folder or rebuild an existing patch folder with no unrelated
+files. Keep the matching patch installer beside the packer; older preview
+executables cannot read the inline list.
+Rebuilding leaves any existing patch installer log in place.
+
+Resize the packer from its edges or maximize it. In Patch mode, drag the
+divider to give the deletion list or the log more room.
 
 ## Manifest
 
@@ -73,15 +90,19 @@ cd PackerApp
 .\scripts\build-release.ps1
 ```
 
-The script builds and runs the packer tests, then copies the packer and the already-built `InstallerApp\dist\modlist-installer.exe` to:
+The script builds and runs the packer tests, then copies the packer and both
+already-built installers from `InstallerApp\dist` to:
 
 ```text
 PackerApp\dist\
   modlist-packer.exe
   modlist-installer.exe
+  modlist-patch-installer.exe
 ```
 
-Build the installer separately first. The packer script does not build or modify `InstallerApp`, and does not remove old `dist` files or directories.
+Build the full and patch installers first with `InstallerApp\scripts\build-release.ps1`
+and `InstallerApp\scripts\build-patch-installer.ps1`. The packer script does not
+build or modify `InstallerApp`, and does not remove old `dist` files or directories.
 
 ## Tests And Small Fixture
 

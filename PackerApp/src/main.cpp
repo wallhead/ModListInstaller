@@ -1,6 +1,7 @@
 #define NOMINMAX
 
 #include <windows.h>
+#include <windowsx.h>
 #include <commctrl.h>
 #include <shlobj.h>
 #include <shellapi.h>
@@ -9,6 +10,9 @@
 #include <psapi.h>
 
 #include "resource.h"
+#include "PatchManifestResource.h"
+#include "manifest/Json.h"
+#include "patch/PatchDeletePaths.h"
 
 #include <algorithm>
 #include <atomic>
@@ -24,6 +28,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -58,6 +63,31 @@ constexpr int kParametersEdit = 1024;
 constexpr int kPathModeCombo = 1025;
 constexpr int kTestArchiveCheck = 1026;
 constexpr int kMemoryLimitCombo = 1027;
+constexpr int kPackageModeCombo = 1028;
+constexpr int kDeletePathsEdit = 1029;
+
+constexpr int kPackerWidth = 735;
+constexpr int kPackerHeight = 710;
+constexpr int kMinClientWidth = 680;
+constexpr int kMinClientHeight = 562;
+constexpr int kWorkTop = 504;
+constexpr int kDeletePanelTop = 434;
+constexpr int kDeletePanelLeft = 10;
+constexpr int kDividerSize = 10;
+constexpr int kBottomMargin = 10;
+constexpr int kLogMargin = 14;
+
+struct SectionFrame {
+  const wchar_t* caption;
+  int top;
+  int height;
+  int captionWidth;
+};
+
+constexpr SectionFrame kFoldersFrame{L"Folders", 8, 78, 62};
+constexpr SectionFrame kArchiveFrame{L"Archive", 92, 78, 64};
+constexpr SectionFrame kCompressionFrame{L"Compression", 176, 172, 106};
+constexpr SectionFrame kManifestFrame{L"Manifest / Release", 354, 74, 138};
 
 constexpr UINT kLogMessage = WM_APP + 1;
 constexpr UINT kStatusMessage = WM_APP + 2;
@@ -65,6 +95,7 @@ constexpr UINT kProgressMessage = WM_APP + 3;
 constexpr UINT kWorkerFinishedMessage = WM_APP + 4;
 
 HINSTANCE g_instance = nullptr;
+HWND g_sourceLabel = nullptr;
 HWND g_sourceEdit = nullptr;
 HWND g_releaseEdit = nullptr;
 HWND g_archiveNameEdit = nullptr;
@@ -85,6 +116,14 @@ HWND g_parametersEdit = nullptr;
 HWND g_pathModeCombo = nullptr;
 HWND g_testArchiveCheck = nullptr;
 HWND g_memoryLimitCombo = nullptr;
+HWND g_packageModeCombo = nullptr;
+HWND g_deletePathsHeading = nullptr;
+HWND g_deletePathsEdit = nullptr;
+HWND g_deleteDivider = nullptr;
+double g_deleteShares[2]{0.54, 0.50};
+int g_dividerGrabOffset = 0;
+bool g_patchMode = false;
+std::wstring g_sourceByMode[2];
 std::atomic_bool g_workerRunning{false};
 std::atomic_bool g_cancelRequested{false};
 
@@ -108,7 +147,19 @@ struct PackerConfig {
   bool copyInstaller{true};
   bool testArchive{true};
   bool archiveFirst{true};
+  std::optional<std::wstring> patchDeleteText;
 };
+
+constexpr wchar_t kFullInstallerName[] = L"modlist-installer.exe";
+constexpr wchar_t kPatchInstallerName[] = L"modlist-patch-installer.exe";
+
+const wchar_t* InstallerName(const PackerConfig& config) {
+  return config.patchDeleteText ? kPatchInstallerName : kFullInstallerName;
+}
+
+bool IncludesInstaller(const PackerConfig& config) {
+  return config.patchDeleteText.has_value() || config.copyInstaller;
+}
 
 std::wstring Widen(const std::string& text);
 
@@ -1113,7 +1164,8 @@ bool CheckPackagePath(HWND hwnd, const std::filesystem::path& path, bool directo
 
 bool WriteManifest(HWND hwnd, const PackerConfig& config, uint64_t unpackedSize,
                    const ManifestCloser& closeManifest = CloseManifest,
-                   const std::filesystem::path& outputFolder = {}) {
+                   const std::filesystem::path& outputFolder = {},
+                   std::span<const std::filesystem::path> deletePaths = {}) {
   const auto archiveSet = SelectArchiveSet(hwnd, config);
   if (!archiveSet.has_value()) {
     PostLog(hwnd, L"No archive parts found in: " + PackageFolder(config).wstring());
@@ -1241,6 +1293,14 @@ bool WriteManifest(HWND hwnd, const PackerConfig& config, uint64_t unpackedSize,
   output << "{\n";
   output << "  \"schema\": \"modlist-manifest-chunks-v1\",\n";
   output << "  \"archive_name\": \"" << JsonEscape(Narrow(archiveSet->archiveName)) << "\",\n";
+  if (config.patchDeleteText) {
+    output << "  \"delete_paths\": [";
+    for (size_t i = 0; i < deletePaths.size(); ++i) {
+      output << (i == 0 ? "\n" : ",\n") << "    \"" << JsonEscape(Narrow(deletePaths[i].generic_wstring())) << '"';
+    }
+    if (!deletePaths.empty()) output << "\n  ";
+    output << "],\n";
+  }
   if (unpackedSize > 0) {
     output << "  \"unpacked_size\": " << unpackedSize << ",\n";
   }
@@ -1582,6 +1642,26 @@ int RunProcess(HWND hwnd,
   return static_cast<int>(exitCode);
 }
 
+bool MissingPortableInstaller(HWND hwnd, const PackerConfig& config) {
+  PostLog(hwnd, std::wstring(L"Unable to prepare setup: ") + InstallerName(config) +
+                    L" was not found beside modlist-packer.exe.");
+  return false;
+}
+
+bool CheckInlinePatchSupport(HWND hwnd, const std::filesystem::path& executable) {
+  // Open only the resources; never execute the adjacent binary to query its version.
+  const auto module = LoadLibraryExW(std::filesystem::absolute(executable).c_str(), nullptr,
+                                    LOAD_LIBRARY_AS_DATAFILE | LOAD_LIBRARY_AS_IMAGE_RESOURCE);
+  const bool supported = module && FindResourceW(module, MAKEINTRESOURCEW(IDR_INLINE_PATCH_MANIFEST),
+                                                 MAKEINTRESOURCEW(10));
+  if (module) FreeLibrary(module);
+  if (!supported) {
+    PostLog(hwnd, L"This patch installer cannot read deletion paths from a manifest. "
+                  L"Place the matching modlist-patch-installer.exe beside modlist-packer.exe.");
+  }
+  return supported;
+}
+
 bool PrepareInstallerSetup(HWND hwnd, const PackerConfig& config,
                            const std::filesystem::path& installerSourceFolder = ModuleFolder()) {
   std::error_code ec;
@@ -1591,15 +1671,14 @@ bool PrepareInstallerSetup(HWND hwnd, const PackerConfig& config,
     PostLog(hwnd, L"Unable to create package folder: " + packageFolder.wstring() + L" - " + Widen(ec.message()));
     return false;
   }
-  if (!config.copyInstaller) {
+  if (!IncludesInstaller(config)) {
     return true;
   }
 
-  const auto source = installerSourceFolder / "modlist-installer.exe";
-  const auto target = packageFolder / "modlist-installer.exe";
+  const auto source = installerSourceFolder / InstallerName(config);
+  const auto target = packageFolder / InstallerName(config);
   if (!std::filesystem::is_regular_file(source, ec) || ec) {
-    PostLog(hwnd, L"Unable to prepare setup: modlist-installer.exe was not found beside modlist-packer.exe.");
-    return false;
+    return MissingPortableInstaller(hwnd, config);
   }
   if (std::filesystem::exists(target, ec) && !ec && std::filesystem::equivalent(source, target, ec) && !ec) {
     return true;
@@ -1610,6 +1689,7 @@ bool PrepareInstallerSetup(HWND hwnd, const PackerConfig& config,
     PostLog(hwnd, L"Unable to copy installer: " + Widen(ec.message()));
     return false;
   }
+  if (config.patchDeleteText && !CheckInlinePatchSupport(hwnd, target)) return false;
   PostLog(hwnd, L"Installer copied: " + target.wstring());
   return true;
 }
@@ -1634,11 +1714,16 @@ PackerConfig ReadConfig(bool archiveFirst) {
   config.copyInstaller = true;
   config.testArchive = SendMessageW(g_testArchiveCheck, BM_GETCHECK, 0, 0) == BST_CHECKED;
   config.archiveFirst = archiveFirst;
+  if (g_patchMode) config.patchDeleteText = GetText(g_deletePathsEdit);
   return config;
 }
 
 bool ValidateConfig(HWND hwnd, const PackerConfig& config, bool createFolders = true) {
   std::error_code ec;
+  if (config.patchDeleteText && !config.archiveFirst) {
+    PostLog(hwnd, L"Use Build Patch to create a patch archive and manifest together.");
+    return false;
+  }
   if (config.releaseFolder.empty()) {
     PostLog(hwnd, L"Release folder is required.");
     return false;
@@ -1661,7 +1746,7 @@ bool ValidateConfig(HWND hwnd, const PackerConfig& config, bool createFolders = 
   }
   if (config.archiveFirst) {
     if (!std::filesystem::exists(config.sourceFolder, ec) || !std::filesystem::is_directory(config.sourceFolder, ec)) {
-      PostLog(hwnd, L"Source folder is required.");
+      PostLog(hwnd, config.patchDeleteText ? L"Patch files folder is required." : L"Source folder is required.");
       return false;
     }
     if (PathsOverlap(config.sourceFolder, config.releaseFolder) ||
@@ -1780,10 +1865,76 @@ bool CheckLivePackageDirectory(HWND hwnd, const std::filesystem::path& target) {
   return false;
 }
 
+bool IsPlainPackageFile(const std::filesystem::path& path) {
+  const auto attributes = GetFileAttributesW(path.c_str());
+  return attributes != INVALID_FILE_ATTRIBUTES &&
+      (attributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) == 0;
+}
+
+bool CheckPackageMode(HWND hwnd, const PackerConfig& config) {
+  const auto folder = PackageFolder(config);
+  const auto other = folder / (config.patchDeleteText ? kFullInstallerName : kPatchInstallerName);
+  const auto reject = [&](const std::wstring& reason) {
+    PostLog(hwnd, reason + L" Choose a different release folder or archive name: " + folder.wstring());
+    return false;
+  };
+  if (GetFileAttributesW(other.c_str()) == INVALID_FILE_ATTRIBUTES) {
+    const auto error = GetLastError();
+    if (error != ERROR_FILE_NOT_FOUND && error != ERROR_PATH_NOT_FOUND) {
+      return reject(L"Cannot check the installer type in the output folder.");
+    }
+  } else {
+    return reject(L"The output contains a different type of installer.");
+  }
+  if (!std::filesystem::exists(folder)) return true;
+  const auto manifest = folder / "manifest.json";
+  bool existingPatch = false;
+  if (std::filesystem::exists(manifest)) {
+    if (!IsPlainPackageFile(manifest)) return reject(L"The existing manifest is not an ordinary file.");
+    std::ifstream input(manifest, std::ios::binary);
+    if (!input) return reject(L"Cannot read the existing manifest.");
+    std::string json{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
+    if (json.starts_with("\xef\xbb\xbf")) json.erase(0, 3);
+    const auto parsed = modlist::ParseJson(json);
+    existingPatch = parsed.ok() && parsed.value().Find("delete_paths") != nullptr;
+  }
+  if (!config.patchDeleteText) {
+    return !existingPatch || reject(L"The existing manifest is for a patch package.");
+  }
+  if (std::filesystem::is_empty(folder)) return true;
+  if (!existingPatch || !IsPlainPackageFile(folder / kPatchInstallerName)) {
+    return reject(L"The output is not an empty folder or an existing patch package.");
+  }
+
+  std::set<std::filesystem::path> archives;
+  for (const auto* extension : {L".7z", L".zip"}) {
+    for (const auto& archive : FindArchiveOutputsAndTemps(folder, config.archiveName + extension)) {
+      archives.insert(archive);
+    }
+  }
+  for (const auto& entry : std::filesystem::directory_iterator(folder)) {
+    const auto name = Lower(entry.path().filename().wstring());
+    if (name == L"logs") {
+      const auto attributes = GetFileAttributesW(entry.path().c_str());
+      if (attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_DIRECTORY) &&
+          !(attributes & FILE_ATTRIBUTE_REPARSE_POINT) &&
+          (IsPlainPackageFile(entry.path() / L"modlist-patch-installer.log") ||
+           std::filesystem::is_empty(entry.path()))) {
+        continue;
+      }
+    }
+    if (!IsPlainPackageFile(entry.path()) ||
+        (name != L"manifest.json" && name != kPatchInstallerName && !archives.contains(entry.path()))) {
+      return reject(L"The patch output contains unrelated files.");
+    }
+  }
+  return true;
+}
+
 bool CheckWorkerPackagePaths(HWND hwnd, const PackerConfig& live) {
   const auto target = PackageFolder(live);
   if (!CheckPackagePath(hwnd, live.releaseFolder, true) || !CheckPackagePath(hwnd, target, true)) return false;
-  if (!CheckLivePackageDirectory(hwnd, target)) return false;
+  if (!CheckLivePackageDirectory(hwnd, target) || !CheckPackageMode(hwnd, live)) return false;
   const auto root = std::filesystem::weakly_canonical(live.releaseFolder) / kWorkNamePattern;
   const auto stage = root / kStagedDirectory;
   const auto replacement = stage / live.archiveName;
@@ -1796,7 +1947,7 @@ bool CheckWorkerPackagePaths(HWND hwnd, const PackerConfig& live) {
   }
   for (const auto& directory : {target, replacement, backup}) {
     if (!CheckPackagePath(hwnd, directory / "manifest.json") ||
-        (live.copyInstaller && !CheckPackagePath(hwnd, directory / "modlist-installer.exe"))) return false;
+        (IncludesInstaller(live) && !CheckPackagePath(hwnd, directory / InstallerName(live)))) return false;
   }
   if (live.archiveFirst) {
     const auto archive = live.archiveName + SelectArchiveExtension(live);
@@ -1820,12 +1971,6 @@ bool CheckWorkerPackagePaths(HWND hwnd, const PackerConfig& live) {
   return true;
 }
 
-bool IsPlainPackageFile(const std::filesystem::path& path) {
-  const auto attributes = GetFileAttributesW(path.c_str());
-  return attributes != INVALID_FILE_ATTRIBUTES &&
-      (attributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) == 0;
-}
-
 bool SameWindowsPackagePath(const std::filesystem::path& left, const std::filesystem::path& right) {
   const auto a = std::filesystem::absolute(left).lexically_normal().make_preferred().wstring();
   const auto b = std::filesystem::absolute(right).lexically_normal().make_preferred().wstring();
@@ -1835,7 +1980,7 @@ bool SameWindowsPackagePath(const std::filesystem::path& left, const std::filesy
 bool PromotePackage(HWND hwnd, const PackerConfig& live, const PackerConfig& staged,
                     PackageWorkspace& workspace, const FileRenamer& renameFile) {
   const auto target = PackageFolder(live);
-  if (!CheckLivePackageDirectory(hwnd, target)) return false;
+  if (!CheckLivePackageDirectory(hwnd, target) || !CheckPackageMode(hwnd, live)) return false;
   const auto backup = workspace.Root() / "previous";
   std::filesystem::create_directory(backup);
   struct Move {
@@ -1860,13 +2005,14 @@ bool PromotePackage(HWND hwnd, const PackerConfig& live, const PackerConfig& sta
   if (std::filesystem::exists(manifest)) addOld(manifest);
   for (const auto& entry : std::filesystem::directory_iterator(PackageFolder(staged))) {
     if (!IsPlainPackageFile(entry.path())) throw std::runtime_error("Staged output is not a plain file");
+    const bool installer = entry.path().filename() == InstallerName(live);
     if (!live.archiveFirst && entry.path().filename() != "manifest.json" &&
-        entry.path().filename() != "modlist-installer.exe") {
+        !installer) {
       throw std::runtime_error("Manifest Only cannot promote archive or unrelated files");
     }
     const auto destination = target / entry.path().filename();
     if (std::filesystem::exists(destination)) {
-      if (entry.path().filename() == "modlist-installer.exe") addOld(destination);
+      if (installer) addOld(destination);
       else if (std::none_of(oldFiles.begin(), oldFiles.end(), [&](const Move& move) { return SameWindowsPackagePath(move.from, destination); })) {
         throw std::runtime_error("Publication would overwrite an unrelated output");
       }
@@ -1949,11 +2095,29 @@ void Worker(HWND hwnd, PackerConfig config, const WorkerDependencies& dependenci
     bool ok = true;
     uint64_t unpackedSize = 0;
     if (g_cancelRequested || !ValidateConfig(hwnd, config, false) ||
-        !CheckWorkerPackagePaths(hwnd, config) || !ResolveSevenZip(hwnd, config)) return;
-    if (config.copyInstaller && !IsPlainPackageFile(dependencies.installerSourceFolder / "modlist-installer.exe")) {
-      PostLog(hwnd, L"Unable to prepare setup: modlist-installer.exe was not found beside modlist-packer.exe.");
+        !CheckWorkerPackagePaths(hwnd, config)) return;
+    std::vector<std::filesystem::path> deletePaths;
+    if (config.patchDeleteText) {
+      const auto utf8 = Narrow(*config.patchDeleteText);
+      if (Widen(utf8) != *config.patchDeleteText) {
+        PostLog(hwnd, L"The deletion paths contain invalid Unicode text.");
+        return;
+      }
+      auto parsed = modlist::patch::ParsePatchDeleteList(utf8);
+      if (!parsed.ok()) {
+        PostLog(hwnd, Widen(parsed.error()));
+        return;
+      }
+      deletePaths = std::move(parsed.value());
+      PostLog(hwnd, L"Patch deletion paths: " + std::to_wstring(deletePaths.size()));
+    }
+    const auto installerSource = dependencies.installerSourceFolder / InstallerName(config);
+    if (IncludesInstaller(config) && !IsPlainPackageFile(installerSource)) {
+      MissingPortableInstaller(hwnd, config);
       return;
     }
+    if (config.patchDeleteText && !CheckInlinePatchSupport(hwnd, installerSource)) return;
+    if (!ResolveSevenZip(hwnd, config)) return;
     const auto liveConfig = config;
     std::filesystem::create_directories(PackageFolder(config));
     std::unique_ptr<PackageWorkspace> workspace;
@@ -1964,8 +2128,7 @@ void Worker(HWND hwnd, PackerConfig config, const WorkerDependencies& dependenci
     // Manifest Only reserves metadata/installer space, without copying its live archive inputs.
     const auto available = std::filesystem::space(config.releaseFolder).available;
     const uint64_t overhead = std::max<uint64_t>(16ull * 1024 * 1024, unpackedSize / 16);
-    const uint64_t installerSize = config.copyInstaller
-        ? std::filesystem::file_size(dependencies.installerSourceFolder / "modlist-installer.exe") : 0;
+    const uint64_t installerSize = IncludesInstaller(config) ? std::filesystem::file_size(installerSource) : 0;
     if (available < overhead || installerSize > available - overhead ||
         unpackedSize > available - overhead - installerSize) {
       PostLog(hwnd, L"Insufficient free space for a replacement alongside the previous package; previous package unchanged.");
@@ -2019,7 +2182,7 @@ void Worker(HWND hwnd, PackerConfig config, const WorkerDependencies& dependenci
 
     if (ok && !g_cancelRequested) {
       const auto& manifestInput = config.archiveFirst ? config : liveConfig;
-      ok = WriteManifest(hwnd, manifestInput, unpackedSize, dependencies.closeManifest, PackageFolder(config));
+      ok = WriteManifest(hwnd, manifestInput, unpackedSize, dependencies.closeManifest, PackageFolder(config), deletePaths);
     }
     if (ok && !g_cancelRequested && workspace) {
       finished.committed = PromotePackage(hwnd, liveConfig, config, *workspace, dependencies.renameFile);
@@ -2048,19 +2211,212 @@ HWND CreateCombo(HWND parent, int id, int x, int y, int w, int h) {
                          x, y, w, h, parent, reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), g_instance, nullptr);
 }
 
-HWND CreateGroupBox(HWND parent, const wchar_t* text, int x, int y, int w, int h) {
-  return CreateWindowExW(0, L"BUTTON", text, WS_CHILD | WS_VISIBLE | BS_GROUPBOX,
-                         x, y, w, h, parent, nullptr, g_instance, nullptr);
+void CreateSectionHeading(HWND parent, const SectionFrame& section) {
+  CreateLabel(parent, section.caption, 20, section.top, section.captionWidth, 18);
 }
 
 void EnableRunningControls(HWND hwnd, bool running) {
   EnableWindow(GetDlgItem(hwnd, kBuildButton), !running);
-  EnableWindow(GetDlgItem(hwnd, kManifestButton), !running);
+  EnableWindow(GetDlgItem(hwnd, kManifestButton), !running && !g_patchMode);
   EnableWindow(GetDlgItem(hwnd, kStopButton), running);
+  for (const auto control : {g_sourceEdit, GetDlgItem(hwnd, kSourceBrowse), g_packageModeCombo, g_deletePathsEdit}) {
+    EnableWindow(control, !running);
+  }
+}
+
+struct DeletionPane {
+  bool besideLog;
+  int available;
+  int minimum;
+  int maximum;
+  int extent;
+};
+
+DeletionPane MeasureDeletionPane(const RECT& client) {
+  constexpr int minEditorHeight = 72;
+  constexpr int minLogHeight = 46;
+  const int verticalRoom = client.bottom - kWorkTop - kBottomMargin - kDividerSize;
+  const bool besideLog = verticalRoom < minEditorHeight + minLogHeight;
+  const int available = besideLog
+      ? std::max(1, static_cast<int>(client.right) - kDeletePanelLeft - kLogMargin - kDividerSize)
+      : verticalRoom;
+  const int minimum = besideLog ? 258 : minEditorHeight;
+  const int maximum = std::max(minimum, available - (besideLog ? 188 : minLogHeight));
+  const int extent = std::clamp(static_cast<int>(available * g_deleteShares[besideLog] + 0.5), minimum, maximum);
+  return {besideLog, available, minimum, maximum, extent};
+}
+
+RECT DeletionFrame(const RECT& client, const DeletionPane& pane) {
+  if (pane.besideLog) {
+    return {kDeletePanelLeft, kWorkTop, kDeletePanelLeft + pane.extent, client.bottom - kBottomMargin};
+  }
+  return {kDeletePanelLeft, kDeletePanelTop, client.right - 10, kDeletePanelTop + pane.extent};
+}
+
+void PaintPackerClient(HWND hwnd, HDC dc) {
+  RECT client{};
+  GetClientRect(hwnd, &client);
+  FillRect(dc, &client, GetSysColorBrush(COLOR_BTNFACE));
+  // Frames belong to the background; transparent child group boxes would clip its repaint.
+  const auto drawFrame = [&](RECT rect) {
+    rect.top += 9;
+    if (rect.bottom > rect.top) DrawEdge(dc, &rect, EDGE_ETCHED, BF_RECT);
+  };
+  for (const auto& section : {kFoldersFrame, kArchiveFrame, kCompressionFrame, kManifestFrame}) {
+    drawFrame({10, section.top, client.right - 10, section.top + section.height});
+  }
+  if (g_patchMode) drawFrame(DeletionFrame(client, MeasureDeletionPane(client)));
+}
+
+void LayoutSettings(HWND hwnd) {
+  RECT client{};
+  GetClientRect(hwnd, &client);
+  const int width = static_cast<int>(client.right);
+  const int browseLeft = width - 56;
+  const int folderWidth = std::max(1, browseLeft - 148);
+  MoveWindow(g_sourceEdit, 140, 26, folderWidth, 24, TRUE);
+  MoveWindow(g_releaseEdit, 140, 56, folderWidth, 24, TRUE);
+  MoveWindow(GetDlgItem(hwnd, kSourceBrowse), browseLeft, 26, 34, 24, TRUE);
+  MoveWindow(GetDlgItem(hwnd, kReleaseBrowse), browseLeft, 56, 34, 24, TRUE);
+  MoveWindow(g_parametersEdit, 536, 292, std::max(1, width - 560), 24, TRUE);
+}
+
+void LayoutWorkArea(HWND hwnd) {
+  if (!g_logEdit) return;
+  RECT client{};
+  GetClientRect(hwnd, &client);
+  const int width = static_cast<int>(client.right);
+  const int bottom = static_cast<int>(client.bottom) - kBottomMargin;
+  const auto pane = MeasureDeletionPane(client);
+  const bool compactPatch = g_patchMode && pane.besideLog;
+  const int shift = g_patchMode && !compactPatch ? pane.extent + kDividerSize : 0;
+  const int logLeft = compactPatch ? kDeletePanelLeft + pane.extent + kDividerSize : kLogMargin;
+  auto batch = BeginDeferWindowPos(9);
+  const auto place = [&](HWND control, int x, int y, int w, int h) {
+    if (batch) {
+      batch = DeferWindowPos(batch, control, nullptr, x, y, std::max(1, w), std::max(1, h),
+                             SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOCOPYBITS);
+    }
+  };
+  if (g_patchMode) {
+    const RECT panel = DeletionFrame(client, pane);
+    const int panelWidth = panel.right - panel.left;
+    const int panelHeight = panel.bottom - panel.top;
+    place(g_deletePathsHeading, 20, panel.top, 124, 18);
+    place(g_deletePathsEdit, 24, panel.top + 20, panelWidth - 28, panelHeight - 29);
+    if (compactPatch) place(g_deleteDivider, logLeft - kDividerSize, kWorkTop, kDividerSize, panelHeight);
+    else place(g_deleteDivider, kDeletePanelLeft, panel.bottom, panelWidth, kDividerSize);
+  }
+  place(GetDlgItem(hwnd, kBuildButton), 14, 438 + shift, 130, 30);
+  place(GetDlgItem(hwnd, kManifestButton), 154, 438 + shift, 130, 30);
+  place(GetDlgItem(hwnd, kStopButton), 294, 438 + shift, 90, 30);
+  place(g_progress, 400, 442 + shift, width - 424, 20);
+  place(g_statusLabel, 14, 478 + shift, width - 28, 22);
+  const int top = kWorkTop + shift;
+  place(g_logEdit, logLeft, top, width - logLeft - kLogMargin, bottom - top);
+  if (batch) EndDeferWindowPos(batch);
+  InvalidateRect(hwnd, nullptr, FALSE);
+}
+
+LRESULT CALLBACK DeletionDividerProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam,
+                                     UINT_PTR, DWORD_PTR) {
+  const auto parent = GetParent(hwnd);
+  RECT client{};
+  GetClientRect(parent, &client);
+  const auto pane = MeasureDeletionPane(client);
+  const auto resize = [&](int extent) {
+    const int next = std::clamp(extent, pane.minimum, pane.maximum);
+    g_deleteShares[pane.besideLog] = static_cast<double>(next) / pane.available;
+    LayoutWorkArea(parent);
+  };
+  switch (message) {
+    case WM_SETCURSOR:
+      SetCursor(LoadCursor(nullptr, pane.besideLog ? IDC_SIZEWE : IDC_SIZENS));
+      return TRUE;
+    case WM_LBUTTONDOWN:
+      SetFocus(hwnd);
+      SetCapture(hwnd);
+      g_dividerGrabOffset = pane.besideLog ? GET_X_LPARAM(lParam) : GET_Y_LPARAM(lParam);
+      return 0;
+    case WM_MOUSEMOVE:
+      if (GetCapture() == hwnd) {
+        POINT point{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+        MapWindowPoints(hwnd, parent, &point, 1);
+        const int position = pane.besideLog ? point.x - kDeletePanelLeft : point.y - kDeletePanelTop;
+        resize(position - g_dividerGrabOffset);
+        return 0;
+      }
+      break;
+    case WM_LBUTTONUP:
+    case WM_CANCELMODE:
+      if (GetCapture() == hwnd) ReleaseCapture();
+      return 0;
+    case WM_GETDLGCODE:
+      return DLGC_WANTARROWS;
+    case WM_KEYDOWN:
+      if (wParam == (pane.besideLog ? VK_LEFT : VK_UP)) resize(pane.extent - 12);
+      else if (wParam == (pane.besideLog ? VK_RIGHT : VK_DOWN)) resize(pane.extent + 12);
+      else break;
+      return 0;
+    case WM_SETFOCUS:
+    case WM_KILLFOCUS:
+      InvalidateRect(hwnd, nullptr, FALSE);
+      break;
+    case WM_PAINT: {
+      PAINTSTRUCT paint{};
+      const auto dc = BeginPaint(hwnd, &paint);
+      RECT area{};
+      GetClientRect(hwnd, &area);
+      FillRect(dc, &area, GetSysColorBrush(COLOR_BTNFACE));
+      const LONG x = area.right / 2;
+      const LONG y = area.bottom / 2;
+      const RECT grip = pane.besideLog ? RECT{x - 1, y - 16, x + 1, y + 16}
+                                      : RECT{x - 16, y - 1, x + 16, y + 1};
+      FillRect(dc, &grip, GetSysColorBrush(COLOR_BTNSHADOW));
+      if (GetFocus() == hwnd) DrawFocusRect(dc, &area);
+      EndPaint(hwnd, &paint);
+      return 0;
+    }
+  }
+  return DefSubclassProc(hwnd, message, wParam, lParam);
+}
+
+void FitInitialWindowToWorkArea(HWND hwnd) {
+  RECT window{};
+  GetWindowRect(hwnd, &window);
+  MONITORINFO monitor{};
+  monitor.cbSize = sizeof(monitor);
+  if (!GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &monitor)) return;
+  const auto& work = monitor.rcWork;
+  const int width = std::min(window.right - window.left, work.right - work.left);
+  const int height = std::min(window.bottom - window.top, work.bottom - work.top);
+  const int left = std::clamp(static_cast<int>(window.left), static_cast<int>(work.left),
+                              static_cast<int>(work.right) - width);
+  const int top = std::clamp(static_cast<int>(window.top), static_cast<int>(work.top),
+                             static_cast<int>(work.bottom) - height);
+  SetWindowPos(hwnd, nullptr, left, top, width, height, SWP_NOZORDER | SWP_NOACTIVATE);
+}
+
+void UpdatePackageMode(HWND hwnd) {
+  const bool patchMode = SendMessageW(g_packageModeCombo, CB_GETCURSEL, 0, 0) == 1;
+  if (patchMode != g_patchMode) {
+    g_sourceByMode[g_patchMode] = GetText(g_sourceEdit);
+    g_patchMode = patchMode;
+    SetText(g_sourceEdit, g_sourceByMode[g_patchMode]);
+  }
+  SetWindowTextW(g_sourceLabel, g_patchMode ? L"Patch files folder" : L"Source folder");
+  SetWindowTextW(GetDlgItem(hwnd, kBuildButton), g_patchMode ? L"Build Patch" : L"Build Package");
+  SetWindowTextW(g_copyInstallerCheck, g_patchMode ? L"Include modlist-patch-installer.exe"
+                                                  : L"Copy modlist-installer.exe into release folder");
+  ShowWindow(g_deletePathsHeading, g_patchMode ? SW_SHOWNA : SW_HIDE);
+  ShowWindow(g_deletePathsEdit, g_patchMode ? SW_SHOWNA : SW_HIDE);
+  ShowWindow(g_deleteDivider, g_patchMode ? SW_SHOWNA : SW_HIDE);
+  EnableRunningControls(hwnd, g_workerRunning);
+  LayoutWorkArea(hwnd);
 }
 
 void StartWork(HWND hwnd, bool archiveFirst) {
-  if (g_workerRunning) {
+  if (g_workerRunning || (g_patchMode && !archiveFirst)) {
     return;
   }
   EnableRunningControls(hwnd, true);
@@ -2123,6 +2479,10 @@ void SetDefaults(HWND hwnd) {
   AddComboItem(g_pathModeCombo, L"Relative paths");
   SelectCombo(g_pathModeCombo, 0);
 
+  AddComboItem(g_packageModeCombo, L"Full package");
+  AddComboItem(g_packageModeCombo, L"Patch");
+  SelectCombo(g_packageModeCombo, 0);
+
   SetText(g_archiveNameEdit, L"MyPack");
   SendMessageW(g_copyInstallerCheck, BM_SETCHECK, BST_CHECKED, 0);
   EnableWindow(g_copyInstallerCheck, FALSE);
@@ -2138,8 +2498,11 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
       controls.dwICC = ICC_PROGRESS_CLASS;
       InitCommonControlsEx(&controls);
 
-      CreateGroupBox(hwnd, L"Folders", 10, 8, 704, 78);
-      CreateLabel(hwnd, L"Source folder", 24, 30, 110, 20);
+      g_patchMode = false;
+      g_logEdit = nullptr;
+      for (auto& source : g_sourceByMode) source.clear();
+      CreateSectionHeading(hwnd, kFoldersFrame);
+      g_sourceLabel = CreateLabel(hwnd, L"Source folder", 24, 30, 112, 20);
       g_sourceEdit = CreateEdit(hwnd, kSourceEdit, 140, 26, 520, 24);
       CreateButton(hwnd, kSourceBrowse, L"...", 668, 26, 34, 24);
 
@@ -2147,15 +2510,17 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
       g_releaseEdit = CreateEdit(hwnd, kReleaseEdit, 140, 56, 520, 24);
       CreateButton(hwnd, kReleaseBrowse, L"...", 668, 56, 34, 24);
 
-      CreateGroupBox(hwnd, L"Archive", 10, 92, 704, 78);
+      CreateSectionHeading(hwnd, kArchiveFrame);
       CreateLabel(hwnd, L"Archive", 24, 116, 110, 20);
       g_archiveNameEdit = CreateEdit(hwnd, kArchiveNameEdit, 140, 112, 190, 24);
       CreateLabel(hwnd, L"Archive format", 350, 116, 110, 20);
       g_formatCombo = CreateCombo(hwnd, kFormatCombo, 462, 112, 92, 160);
       CreateLabel(hwnd, L"Path mode", 24, 146, 110, 20);
       g_pathModeCombo = CreateCombo(hwnd, kPathModeCombo, 140, 142, 190, 160);
+      CreateLabel(hwnd, L"Package mode", 350, 146, 110, 20);
+      g_packageModeCombo = CreateCombo(hwnd, kPackageModeCombo, 462, 142, 180, 160);
 
-      CreateGroupBox(hwnd, L"Compression", 10, 176, 704, 172);
+      CreateSectionHeading(hwnd, kCompressionFrame);
       CreateLabel(hwnd, L"Compression level", 24, 200, 130, 20);
       g_levelCombo = CreateCombo(hwnd, kLevelCombo, 164, 196, 110, 160);
       CreateLabel(hwnd, L"Compression method", 300, 200, 150, 20);
@@ -2171,14 +2536,14 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
       CreateLabel(hwnd, L"Split to volumes, bytes", 300, 264, 150, 20);
       g_volumeCombo = CreateCombo(hwnd, kVolumeCombo, 460, 260, 110, 160);
 
-      CreateLabel(hwnd, L"Number of CPU threads", 24, 296, 140, 20);
+      CreateLabel(hwnd, L"CPU threads", 24, 296, 130, 20);
       g_threadsCombo = CreateCombo(hwnd, kThreadsCombo, 164, 292, 110, 160);
       CreateLabel(hwnd, L"RAM limit", 300, 296, 70, 20);
       g_memoryLimitCombo = CreateCombo(hwnd, kMemoryLimitCombo, 370, 292, 76, 160);
       CreateLabel(hwnd, L"Parameters", 458, 296, 75, 20);
       g_parametersEdit = CreateEdit(hwnd, kParametersEdit, 536, 292, 164, 24);
 
-      CreateGroupBox(hwnd, L"Manifest / Release", 10, 354, 704, 74);
+      CreateSectionHeading(hwnd, kManifestFrame);
       CreateLabel(hwnd, L"Manifest chunk size", 24, 380, 130, 20);
       g_chunkCombo = CreateCombo(hwnd, kChunkCombo, 164, 376, 110, 160);
       g_copyInstallerCheck = CreateWindowExW(0, L"BUTTON", L"Copy modlist-installer.exe into release folder",
@@ -2190,6 +2555,17 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
                                            300, 400, 260, 24, hwnd,
                                            reinterpret_cast<HMENU>(static_cast<INT_PTR>(kTestArchiveCheck)), g_instance, nullptr);
 
+      g_deletePathsHeading = CreateLabel(hwnd, L"Deletion paths", 20, kDeletePanelTop, 124, 18);
+      g_deletePathsEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+                                         WS_CHILD | WS_TABSTOP | WS_VSCROLL | ES_MULTILINE |
+                                             ES_AUTOVSCROLL | ES_WANTRETURN,
+                                         24, 454, 676, 60, hwnd,
+                                         reinterpret_cast<HMENU>(static_cast<INT_PTR>(kDeletePathsEdit)), g_instance, nullptr);
+      SendMessageW(g_deletePathsEdit, EM_SETLIMITTEXT, 0, 0);
+      g_deleteDivider = CreateWindowExW(0, L"STATIC", L"Resize deletion paths",
+                                       WS_CHILD | SS_NOTIFY | WS_TABSTOP, 0, 0, 0, 0,
+                                       hwnd, nullptr, g_instance, nullptr);
+      if (!g_deleteDivider || !SetWindowSubclass(g_deleteDivider, DeletionDividerProc, 1, 0)) return -1;
       CreateButton(hwnd, kBuildButton, L"Build Package", 14, 438, 130, 30);
       CreateButton(hwnd, kManifestButton, L"Manifest Only", 154, 438, 130, 30);
       CreateButton(hwnd, kStopButton, L"Stop", 294, 438, 90, 30);
@@ -2207,12 +2583,41 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
       SendMessageW(g_logEdit, EM_SETLIMITTEXT, 0, 0);
       SendMessageW(g_progress, PBM_SETRANGE, 0, MAKELPARAM(0, 100));
       SetDefaults(hwnd);
+      LayoutSettings(hwnd);
+      UpdatePackageMode(hwnd);
       AppendLog(L"Modlist Packer ready.");
       return 0;
     }
+    case WM_GETMINMAXINFO: {
+      auto& limits = *reinterpret_cast<MINMAXINFO*>(lParam);
+      RECT minimum{0, 0, kMinClientWidth, kMinClientHeight};
+      AdjustWindowRectEx(&minimum, static_cast<DWORD>(GetWindowLongPtrW(hwnd, GWL_STYLE)),
+                         FALSE, static_cast<DWORD>(GetWindowLongPtrW(hwnd, GWL_EXSTYLE)));
+      limits.ptMinTrackSize = {minimum.right - minimum.left, minimum.bottom - minimum.top};
+      return 0;
+    }
+    case WM_SIZE:
+      if (wParam != SIZE_MINIMIZED && g_logEdit) {
+        LayoutSettings(hwnd);
+        LayoutWorkArea(hwnd);
+      }
+      return 0;
+    case WM_ERASEBKGND:
+      return 1;
+    case WM_PAINT: {
+      PAINTSTRUCT paint{};
+      PaintPackerClient(hwnd, BeginPaint(hwnd, &paint));
+      EndPaint(hwnd, &paint);
+      return 0;
+    }
+    case WM_PRINTCLIENT:
+      PaintPackerClient(hwnd, reinterpret_cast<HDC>(wParam));
+      return 0;
     case WM_COMMAND: {
       const int id = LOWORD(wParam);
-      if (id == kSourceBrowse) {
+      if (id == kPackageModeCombo && HIWORD(wParam) == CBN_SELCHANGE && !g_workerRunning) {
+        UpdatePackageMode(hwnd);
+      } else if (id == kSourceBrowse) {
         if (auto path = PickFolder(hwnd)) {
           SetText(g_sourceEdit, path->wstring());
         }
@@ -2272,18 +2677,18 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
   windowClass.hInstance = instance;
   windowClass.lpszClassName = className;
   windowClass.hCursor = LoadCursor(nullptr, IDC_ARROW);
-  windowClass.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_BTNFACE + 1);
   RegisterClassW(&windowClass);
 
   HWND hwnd = CreateWindowExW(0, className, L"Modlist Packer",
-                              WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
-                              CW_USEDEFAULT, CW_USEDEFAULT, 735, 710,
+                              WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
+                              CW_USEDEFAULT, CW_USEDEFAULT, kPackerWidth, kPackerHeight,
                               nullptr, nullptr, instance, nullptr);
   if (hwnd == nullptr) {
     OleUninitialize();
     return 1;
   }
 
+  FitInitialWindowToWorkArea(hwnd);
   ShowWindow(hwnd, showCommand);
   UpdateWindow(hwnd);
 

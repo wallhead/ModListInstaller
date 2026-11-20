@@ -27,6 +27,7 @@ namespace {
 
 std::filesystem::path g_fixtureRoot;
 std::filesystem::path g_installerSource;
+std::filesystem::path g_patchRunner;
 HWND g_testWindow = nullptr;
 std::vector<std::wstring> g_messages;
 std::wstring g_lastStatus;
@@ -1287,6 +1288,36 @@ LRESULT CALLBACK HiddenPackerWindowProc(HWND hwnd, UINT message, WPARAM wParam, 
   return WindowProc(hwnd, message, wParam, lParam);
 }
 
+void RequireCleanPackerSectionPaint(HWND window, int previousWidth) {
+  RECT client{};
+  GetClientRect(window, &client);
+  const auto screen = GetDC(window);
+  const auto canvas = CreateCompatibleDC(screen);
+  const auto bitmap = CreateCompatibleBitmap(screen, client.right, client.bottom);
+  ReleaseDC(window, screen);
+  if (!canvas || !bitmap) {
+    if (canvas) DeleteDC(canvas);
+    if (bitmap) DeleteObject(bitmap);
+    throw std::runtime_error("Could not create the packer paint fixture");
+  }
+  const auto previousBitmap = SelectObject(canvas, bitmap);
+  FillRect(canvas, &client, GetSysColorBrush(COLOR_BTNFACE));
+  const int previousEdge = previousWidth - 11;
+  // Seed the former section border so the new paint must actually clear it.
+  SetPixelV(canvas, previousEdge, 332, RGB(255, 0, 255));
+  SendMessageW(window, WM_PRINTCLIENT, reinterpret_cast<WPARAM>(canvas), PRF_CLIENT);
+  const auto background = GetSysColor(COLOR_BTNFACE);
+  const auto oldBorder = GetPixel(canvas, previousEdge, 332);
+  const auto newOuterBorder = GetPixel(canvas, client.right - 11, 332);
+  const auto newInnerBorder = GetPixel(canvas, client.right - 12, 332);
+  SelectObject(canvas, previousBitmap);
+  DeleteObject(bitmap);
+  DeleteDC(canvas);
+  Require(oldBorder == background, "Packer paint left the old section border behind after widening");
+  Require(newOuterBorder != background || newInnerBorder != background,
+          "The section border did not follow the new client width");
+}
+
 void PackerLogRetainsLongOutputAndDefaults() {
   g_instance = GetModuleHandleW(nullptr);
   WNDCLASSW windowClass{};
@@ -1294,7 +1325,7 @@ void PackerLogRetainsLongOutputAndDefaults() {
   windowClass.hInstance = g_instance;
   windowClass.lpszClassName = L"HiddenPackerLogTest";
   Require(RegisterClassW(&windowClass) != 0, "Unable to register hidden packer window");
-  const HWND window = CreateWindowExW(0, windowClass.lpszClassName, L"", WS_OVERLAPPED,
+  const HWND window = CreateWindowExW(0, windowClass.lpszClassName, L"", WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
                                       0, 0, 735, 710, nullptr, nullptr, g_instance, nullptr);
   Require(window != nullptr, "Unable to create hidden packer controls");
   try {
@@ -1315,6 +1346,108 @@ void PackerLogRetainsLongOutputAndDefaults() {
     Require(defaults.pathMode == L"Relative paths" &&
                 SendMessageW(g_pathModeCombo, CB_GETCOUNT, 0, 0) == 1,
             "Packer UI still offers the incompatible Full paths mode");
+    const auto visible = [](HWND control) { return (GetWindowLongPtrW(control, GWL_STYLE) & WS_VISIBLE) != 0; };
+    const auto changeMode = [&](int selection) {
+      SelectCombo(g_packageModeCombo, selection);
+      SendMessageW(window, WM_COMMAND, MAKEWPARAM(kPackageModeCombo, CBN_SELCHANGE),
+                   reinterpret_cast<LPARAM>(g_packageModeCombo));
+    };
+    const auto manifestButton = GetDlgItem(window, kManifestButton);
+    const auto buildButton = GetDlgItem(window, kBuildButton);
+    Require(!defaults.patchDeleteText && !visible(g_deletePathsEdit) && IsWindowEnabled(manifestButton),
+            "Packer did not start in Full package mode");
+    SetText(g_sourceEdit, L"D:\\Full Source");
+    changeMode(1);
+    Require(visible(g_deletePathsEdit) && !IsWindowEnabled(manifestButton) &&
+                GetText(buildButton) == L"Build Patch" && GetText(g_sourceLabel) == L"Patch files folder",
+            "Patch mode did not open the deletion editor and select the patch build action");
+    Require(ReadConfig(true).sourceFolder.empty(), "Patch mode reused the full package source");
+    SetText(g_sourceEdit, L"D:\\Patch Source");
+    const std::wstring deletion = L"\"\\mods\\Retired Mod\"\r\n\\obsolete.ini";
+    SetText(g_deletePathsEdit, deletion);
+    RECT editor{}, build{}, logRect{}, client{};
+    GetWindowRect(g_deletePathsEdit, &editor);
+    GetWindowRect(buildButton, &build);
+    GetWindowRect(g_logEdit, &logRect);
+    GetClientRect(window, &client);
+    POINT bottom{client.right, client.bottom};
+    ClientToScreen(window, &bottom);
+    Require((editor.bottom < build.top || build.bottom < editor.top) &&
+                build.bottom < logRect.top && logRect.bottom <= bottom.y,
+            "Patch controls overlap or the log is offscreen");
+    const auto bounds = [](HWND control) {
+      RECT result{};
+      Require(GetWindowRect(control, &result) != FALSE, "Could not measure packer control");
+      return result;
+    };
+    const auto width = [](const RECT& rect) { return rect.right - rect.left; };
+    const auto height = [](const RECT& rect) { return rect.bottom - rect.top; };
+    const auto sourceBefore = bounds(g_sourceEdit);
+    const auto previousClientWidth = client.right;
+    Require(SetWindowPos(window, nullptr, 0, 0, 1040, 890, SWP_NOZORDER | SWP_NOMOVE | SWP_NOACTIVATE),
+            "Could not enlarge the packer window");
+    auto wideEditor = bounds(g_deletePathsEdit);
+    auto wideLog = bounds(g_logEdit);
+    Require(width(bounds(g_sourceEdit)) > width(sourceBefore) && width(wideEditor) > width(editor) &&
+                width(wideLog) > width(logRect),
+            "Folder and text fields did not widen with the packer");
+    Require(height(wideEditor) > height(editor) && height(wideLog) > height(logRect),
+            "The additional height was not shared by the editor and log");
+    RequireCleanPackerSectionPaint(window, previousClientWidth);
+    Require(FindWindowExW(window, nullptr, L"STATIC", L"CPU threads") != nullptr,
+            "Packer kept the CPU label that wraps under display scaling");
+    const auto wideWindow = bounds(window);
+    changeMode(0);
+    Require(height(bounds(window)) == height(wideWindow), "Switching to Full reset the chosen window height");
+    changeMode(1);
+    Require(height(bounds(window)) == height(wideWindow), "Switching to Patch reset the chosen window height");
+
+    const auto divider = FindWindowExW(window, nullptr, L"STATIC", L"Resize deletion paths");
+    const auto bar = bounds(divider);
+    const int grab = height(bar) / 2;
+    const auto at = [&](int y) { return MAKELPARAM(width(bar) / 2, y); };
+    SendMessageW(divider, WM_LBUTTONDOWN, MK_LBUTTON, at(grab));
+    SendMessageW(divider, WM_MOUSEMOVE, MK_LBUTTON, at(grab + 40));
+    SendMessageW(divider, WM_LBUTTONUP, 0, 0);
+    Require(height(bounds(g_deletePathsEdit)) > height(wideEditor) &&
+                height(bounds(g_logEdit)) < height(wideLog),
+            "Dragging the divider did not give the deletion editor more height");
+    SendMessageW(divider, WM_KEYDOWN, VK_DOWN, 0);
+    Require(bounds(g_logEdit).bottom < bounds(window).bottom && height(bounds(g_logEdit)) >= 40,
+            "The divider failed to keep room for the log");
+    MINMAXINFO limits{};
+    SendMessageW(window, WM_GETMINMAXINFO, 0, reinterpret_cast<LPARAM>(&limits));
+    Require(limits.ptMinTrackSize.x >= 680 && limits.ptMinTrackSize.y >= 560,
+            "Packer can be dragged below the minimum usable size");
+
+    Require(SetWindowPos(window, nullptr, 0, 0, 735, 582, SWP_NOZORDER | SWP_NOMOVE | SWP_NOACTIVATE),
+            "Could not simulate a shorter work area");
+    GetClientRect(window, &client);
+    bottom = {client.right, client.bottom};
+    ClientToScreen(window, &bottom);
+    GetWindowRect(g_deletePathsEdit, &editor);
+    GetWindowRect(buildButton, &build);
+    GetWindowRect(g_logEdit, &logRect);
+    Require(build.bottom < editor.top && editor.right < logRect.left &&
+                editor.bottom <= bottom.y && logRect.bottom <= bottom.y,
+            "Compact Patch mode hid the actions, delete field, or log");
+    SendMessageW(divider, WM_KEYDOWN, VK_RIGHT, 0);
+    Require(width(bounds(g_deletePathsEdit)) > width(editor) && width(bounds(g_logEdit)) < width(logRect),
+            "The compact divider did not give the deletion editor more width");
+    EnableRunningControls(window, true);
+    Require(!IsWindowEnabled(g_packageModeCombo) && !IsWindowEnabled(g_deletePathsEdit),
+            "Patch settings can be changed during a build");
+    EnableRunningControls(window, false);
+    const auto patch = ReadConfig(true);
+    Require(patch.patchDeleteText == deletion && patch.sourceFolder == L"D:\\Patch Source",
+            "Patch config did not retain the entered fields");
+    changeMode(0);
+    Require(!ReadConfig(true).patchDeleteText && !visible(g_deletePathsEdit) &&
+                IsWindowEnabled(manifestButton) && GetText(g_sourceEdit) == L"D:\\Full Source",
+            "Switching back did not restore the Full package controls");
+    changeMode(1);
+    Require(ReadConfig(true).patchDeleteText == deletion && GetText(g_sourceEdit) == L"D:\\Patch Source",
+            "Toggling modes reset the patch fields");
   } catch (...) {
     DestroyWindow(window);
     throw;
@@ -1432,6 +1565,7 @@ void RealCompressionTestAndManifest() {
   Require(ReadFile(extracted / "empty.dat").empty() && std::filesystem::is_directory(extracted / "empty-directory"),
           "Archive lost an empty file/directory");
   const auto manifest = ReadFile(package / "manifest.json");
+  Require(manifest.find("\"delete_paths\"") == std::string::npos, "Full package unexpectedly declares patch deletions");
   Require(manifest.find("\"path\": \"My Pack.7z.001\"") != std::string::npos, "Manifest archive paths must be root-relative filenames");
   Require(manifest.find("\"unpacked_size\": 16407") != std::string::npos, "Worker did not retain scanned unpacked size");
   DrainMessages();
@@ -1439,6 +1573,117 @@ void RealCompressionTestAndManifest() {
           "Worker stopped applying the configured RAM limit");
   Require(std::find(g_messages.begin(), g_messages.end(), L"Archive test completed.") != g_messages.end(),
           "Worker skipped the requested integrity test");
+}
+
+std::filesystem::path PatchInstallerFixture(const std::filesystem::path& localFolder) {
+  if (!g_installerSource.empty() &&
+      std::filesystem::is_regular_file(g_installerSource / "modlist-patch-installer.exe")) return g_installerSource;
+  std::filesystem::create_directories(localFolder);
+  std::filesystem::copy_file(ModuleFolder() / "packer_tests.exe", localFolder / "modlist-patch-installer.exe");
+  return localFolder;
+}
+
+void PatchWorkerBuildsFlatPackage() {
+  auto config = Config("patch-compression");
+  config.volumeSize = L"none";
+  config.patchDeleteText =
+      L"\"\\mods\\Retired Mod\"\r\n  \"\\Stock Game\\Data\\obsolete.ini\"  \r\n\\mods\\\u041c\u043e\u0434";
+  WriteFile(config.sourceFolder / "enblocal.ini", "packed settings");
+  WriteFile(config.sourceFolder / "Stock Game" / "Data" / "patch.esp", "packed plugin");
+  WriteFile(config.sourceFolder / "mods" / "Retired Mod" / "new.txt", "packed mod");
+  const auto portable = PatchInstallerFixture(g_fixtureRoot / "patch-compression" / "portable");
+  WorkerDependencies deps;
+  deps.installerSourceFolder = portable;
+  const auto package = PackageFolder(config);
+  Worker(g_testWindow, config, deps);
+  Require(EntryNames(package) == std::set<std::wstring>{
+            L"My Pack.7z", L"manifest.json", L"modlist-patch-installer.exe"},
+          "Patch build must publish only the patch installer, archives and manifest");
+  const auto manifest = ReadFile(package / "manifest.json");
+  for (const auto& entry : {std::string("\"delete_paths\""), std::string("\"mods/Retired Mod\""),
+                           std::string("\"Stock Game/Data/obsolete.ini\""), Utf8Bytes(u8"\"mods/\u041c\u043e\u0434\"")}) {
+    Require(manifest.find(entry) != std::string::npos, "Patch manifest lacks " + entry);
+  }
+  Require(ReadFile(package / "modlist-patch-installer.exe") == ReadFile(portable / "modlist-patch-installer.exe"),
+          "Patch build bundled the wrong installer");
+
+  const auto priorLog = package / "logs" / "modlist-patch-installer.log";
+  WriteFile(priorLog, "Previous patch run");
+  config.patchDeleteText->append(L"\r\n\\not-present.txt");
+  Worker(g_testWindow, config, deps);
+  const auto replacement = ReadFile(package / "manifest.json");
+  Require(replacement.find("\"not-present.txt\"") != std::string::npos, "Rebuild did not publish updated deletions");
+  Require(EntryNames(package) == std::set<std::wstring>{
+            L"My Pack.7z", L"logs", L"manifest.json", L"modlist-patch-installer.exe"},
+          "Rebuild left unexpected files");
+  Require(ReadFile(priorLog) == "Previous patch run", "Rebuild altered the installed patch log");
+
+  for (const auto* invalid : {L"\\..\\outside", L"\"\\mods\\Mod", L"\\mods\r\nmods/Child"}) {
+    auto bad = config;
+    bad.patchDeleteText = invalid;
+    Worker(g_testWindow, bad, deps);
+    Require(ReadFile(package / "manifest.json") == replacement, "Invalid deletions modified the previous package");
+  }
+  auto wrongMode = config;
+  wrongMode.patchDeleteText.reset();
+  Worker(g_testWindow, wrongMode, deps);
+  Require(ReadFile(package / "manifest.json") == replacement, "Full build overwrote the patch package");
+  wrongMode = config;
+  wrongMode.archiveFirst = false;
+  Worker(g_testWindow, wrongMode, deps);
+  Require(!ValidateConfig(g_testWindow, wrongMode, false), "Manifest Only is not available for a patch");
+  Require(ReadFile(package / "manifest.json") == replacement, "Patch Manifest Only overwrote a package");
+  const auto patchExe = package / "modlist-patch-installer.exe";
+  const auto renamed = package / "renamed.exe";
+  std::filesystem::rename(patchExe, renamed);
+  wrongMode.patchDeleteText.reset();
+  Worker(g_testWindow, wrongMode, deps);
+  Require(ReadFile(package / "manifest.json") == replacement, "Full Manifest Only erased deletions after renaming the patch installer");
+  std::filesystem::rename(renamed, patchExe);
+  if (!g_patchRunner.empty()) {
+    const auto output = CaptureProcess(Quote(g_patchRunner) + L" --archive " + Quote(package),
+                                       g_fixtureRoot / "patch-compression" / "installer-output.txt");
+    Require(output.find("PASS real archive installed and payload verified") != std::string::npos,
+            "Patch installer did not verify the packer's generated package");
+    std::cout << "PASS: packer-generated patch applied to an isolated modlist\n";
+  }
+}
+
+void PatchWorkerKeepsFullPackageUntouched() {
+  auto config = Config("patch-full-conflict");
+  config.patchDeleteText = L"";
+  const auto package = PackageFolder(config);
+  WriteFile(package / "modlist-installer.exe", "full installer");
+  WriteFile(package / "manifest.json", "full manifest");
+  const auto portable = g_fixtureRoot / "patch-full-conflict" / "portable";
+  WriteFile(portable / "modlist-patch-installer.exe", "patch installer");
+  WorkerDependencies deps;
+  deps.installerSourceFolder = portable;
+  Worker(g_testWindow, config, deps);
+  Require(EntryNames(package) == std::set<std::wstring>{L"manifest.json", L"modlist-installer.exe"} &&
+          ReadFile(package / "manifest.json") == "full manifest" &&
+          ReadFile(package / "modlist-installer.exe") == "full installer",
+          "Patch build modified an existing full installer package");
+  std::filesystem::rename(package / "modlist-installer.exe", package / "Renamed Installer.exe");
+  Worker(g_testWindow, config, deps);
+  Require(EntryNames(package) == std::set<std::wstring>{L"manifest.json", L"Renamed Installer.exe"} &&
+          ReadFile(package / "manifest.json") == "full manifest",
+          "Patch build modified an existing full package with a renamed installer");
+  const auto newRelease = config.releaseFolder / "fresh";
+  config.releaseFolder = newRelease;
+  Worker(g_testWindow, config, deps);
+  Require(!std::filesystem::exists(PackageFolder(config)),
+          "A stale patch installer without inline manifest support was bundled");
+}
+
+void PatchWorkerSupportsNoDeletions() {
+  auto config = Config("patch-no-deletions");
+  config.patchDeleteText = L"";
+  WorkerDependencies deps;
+  deps.installerSourceFolder = PatchInstallerFixture(g_fixtureRoot / "patch-no-deletions" / "portable");
+  Worker(g_testWindow, config, deps);
+  Require(ReadFile(PackageFolder(config) / "manifest.json").find("\"delete_paths\": []") != std::string::npos,
+          "A patch with no deletions must still declare an empty array");
 }
 
 void RealSingleZipCompression() {
@@ -1570,7 +1815,8 @@ int wmain(int argc, wchar_t* argv[]) {
   std::unique_ptr<OwnedFixtureTree> fixtureTree;
   try {
     bool keepFixtures = false;
-    const std::string usage = "Usage: packer_tests [--keep-fixtures] [--installer-source <folder containing modlist-installer.exe>]";
+    const std::string usage = "Usage: packer_tests [--keep-fixtures] [--installer-source <folder>] "
+                              "[--patch-runner <patch_installer_tests.exe>]";
     for (int i = 1; i < argc; ++i) {
       const std::wstring option = argv[i];
       if (option == L"--keep-fixtures" && !keepFixtures) {
@@ -1579,6 +1825,9 @@ int wmain(int argc, wchar_t* argv[]) {
         g_installerSource = std::filesystem::absolute(argv[++i]);
         Require(std::filesystem::is_regular_file(g_installerSource / "modlist-installer.exe"),
                 "Installer source folder must contain modlist-installer.exe");
+      } else if (option == L"--patch-runner" && g_patchRunner.empty() && i + 1 < argc) {
+        g_patchRunner = std::filesystem::absolute(argv[++i]);
+        Require(std::filesystem::is_regular_file(g_patchRunner), "Patch test runner was not found");
       } else {
         throw std::runtime_error(usage);
       }
@@ -1643,6 +1892,9 @@ int wmain(int argc, wchar_t* argv[]) {
         {"Worker completion policy preserves committed success after late Stop", WorkerCompletionPolicyRespectsCommitPoint},
         {"Worker failed rollback retains recoverable previous bytes", WorkerRollbackFailureRetainsRecoverablePreviousBytes},
         {"Worker success replaces generated files only", WorkerSuccessReplacesOnlyGeneratedOutputs},
+        {"Patch build bundles the patch exe and writes normalized manifest deletions", PatchWorkerBuildsFlatPackage},
+        {"Patch build preserves full packages and rejects old patch installers", PatchWorkerKeepsFullPackageUntouched},
+        {"Patch build supports no deletions", PatchWorkerSupportsNoDeletions},
         {"Worker case-only archive names and extensions replace successfully", WorkerReplacesCaseOnlyArchiveNames},
         {"Manifest Only stages pair without mutating locked live archives", [] { WorkerManifestOnlyPreservesPairAndArchives("success"); }},
         {"Manifest Only copying disabled preserves existing installer", [] { WorkerManifestOnlyPreservesPairAndArchives("success-no-installer"); }},
@@ -1657,7 +1909,8 @@ int wmain(int argc, wchar_t* argv[]) {
         {"Worker space preflight preserves previous package", WorkerInsufficientSpacePreservesPreviousPackage},
         {"Worker cancellation during compression preserves previous package", WorkerCancellationDuringCompressionPreservesPreviousPackage},
         {"Worker cleanup refuses changed workspace ownership", WorkerDoesNotCleanAWorkspaceWithChangedOwnership},
-        {"packer log retains long output and compression defaults", PackerLogRetainsLongOutputAndDefaults},
+        {"packer controls switch modes, preserve values, and retain defaults and long logs",
+         PackerLogRetainsLongOutputAndDefaults},
         {"real compression, integrity test, extraction and manifest", RealCompressionTestAndManifest},
         {"real unsplit ZIP compression and manifest", RealSingleZipCompression},
         {"real verbose 7-Zip and numeric-percent filenames", RealSevenZipVerboseNumericFilenames},
